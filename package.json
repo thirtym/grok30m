@@ -1,11 +1,11 @@
 {
-  "name": "grok-vscode-37x",
-  "displayName": "Grok Build (37x)",
-  "description": "37x fork of the community Grok Build VS Code client — Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
-  "version": "1.5.6",
-  "publisher": "37x-local",
+  "name": "grok30m",
+  "displayName": "Grok30m",
+  "description": "Grok30m — fork of the community Grok Build VS Code client with Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
+  "version": "1.5.7",
+  "publisher": "grok30m",
   "author": {
-    "name": "37x (fork of Pawel Huryn's Grok Build client)",
+    "name": "Grok30m (fork of Pawel Huryn's Grok Build client)",
     "url": "https://github.com/phuryn/grok-build-vscode"
   },
   "license": "MIT",
