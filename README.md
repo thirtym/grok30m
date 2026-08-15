@@ -41,7 +41,7 @@ Same as upstream:
 ### From a release VSIX (recommended)
 
 1. Install and sign in to the Grok CLI (`grok /login`).
-2. Download `grok30m-*.vsix` from [Releases](https://github.com/ph30m/grok30m/releases).
+2. Download `grok30m-*.vsix` from [Releases](https://github.com/thirtym/grok30m/releases).
 3. Install in Cursor or VS Code:
 
 ```bash
@@ -58,7 +58,7 @@ Extension id: **`grok30m.grok30m`**
 ### Build from source
 
 ```bash
-git clone https://github.com/ph30m/grok30m.git
+git clone https://github.com/thirtym/grok30m.git
 cd grok30m
 git checkout grok30m
 npm install
