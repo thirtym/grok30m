@@ -5,18 +5,17 @@
   "version": "1.5.7",
   "publisher": "grok30m",
   "author": {
-    "name": "Grok30m (fork of Pawel Huryn's Grok Build client)",
-    "url": "https://github.com/phuryn/grok-build-vscode"
+    "name": "Grok30m contributors",
+    "url": "https://github.com/ph30m/grok30m"
   },
   "license": "MIT",
-  "homepage": "https://github.com/phuryn/grok-build-vscode",
+  "homepage": "https://github.com/ph30m/grok30m",
   "bugs": {
-    "url": "https://github.com/phuryn/grok-build-vscode/issues"
+    "url": "https://github.com/ph30m/grok30m/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/phuryn/grok-build-vscode",
-    "directory": "."
+    "url": "https://github.com/ph30m/grok30m.git"
   },
   "engines": {
     "vscode": "^1.94.0"
