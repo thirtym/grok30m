@@ -1,3 +1,4 @@
+import type * as vscode from "vscode";
 import { AcpClient } from "./acp";
 
 /** Live state for the dashboard dot. `cold` (no live process) is represented by
@@ -145,4 +146,7 @@ export class Session {
    * to reconstruct the view losslessly — no grok reload, no process kill.
    */
   buffer: unknown[] = [];
+
+  /** Editor-tab host for this session (panel mode — one tab per session). */
+  panel?: vscode.WebviewPanel;
 }

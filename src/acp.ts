@@ -236,9 +236,31 @@ export class AcpClient extends EventEmitter {
     this.emit("session", res);
 
     if (modelId && modelId !== this.currentModelId) {
-      await this.setModel(modelId);
+      await this.applyModelIfAvailable(modelId);
     }
     return { sessionId: res.sessionId };
+  }
+
+  /**
+   * A model id persisted in settings outlives the catalog: `grok.defaultModel` was
+   * written as "grok-build" back when that id existed, and grok now offers "grok-4.5".
+   * `session/set_model` answers an unknown id with -32602 "Invalid params", which
+   * rejected out of session start and left the CLI to be killed (exit 143) — a stale
+   * *preference* took the whole session down. Skip the call instead: grok's own current
+   * model stands, and the session opens.
+   */
+  private async applyModelIfAvailable(modelId: string): Promise<void> {
+    // An empty catalog means grok told us nothing, not that the id is bad — still try.
+    if (this.availableModels.length > 0 && !this.availableModels.some((m) => m.modelId === modelId)) {
+      this.opts.log(
+        `[acp] model "${modelId}" is not in grok's catalog ` +
+          `(${this.availableModels.map((m) => m.modelId).join(", ")}); ` +
+          `keeping "${this.currentModelId}"`,
+      );
+      this.emit("modelUnavailable", { requested: modelId, current: this.currentModelId });
+      return;
+    }
+    await this.setModel(modelId);
   }
 
   async loadSession(sessionId: string, modelId?: string): Promise<{ sessionId: string }> {
@@ -261,7 +283,7 @@ export class AcpClient extends EventEmitter {
     this.emit("session", { sessionId, ...(res ?? {}) });
     this.emit("sessionLoaded", { sessionId });
     if (modelId && modelId !== this.currentModelId) {
-      await this.setModel(modelId);
+      await this.applyModelIfAvailable(modelId);
     }
     return { sessionId };
   }

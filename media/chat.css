@@ -859,13 +859,16 @@ textarea#input,
 textarea#input {
   display: block;
   width: 100%;
-  resize: none;
+  resize: vertical;
+  min-height: 8.5em;
+  max-height: min(45vh, 320px);
   background: transparent;
   color: var(--vscode-input-foreground);
   border-radius: var(--radius);
   outline: none;
   position: relative;
   z-index: 1;
+  box-sizing: border-box;
 }
 .input-highlight {
   position: absolute;

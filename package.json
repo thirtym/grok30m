@@ -1,12 +1,12 @@
 {
-  "name": "grok-vscode-phuryn",
-  "displayName": "Grok Build for VS Code (Community)",
-  "description": "VS Code client for xAI's Grok Build CLI — review edits in a diff before approving, @-mention files, resumable history, inline image/video, and voice. Requires the Grok Build CLI plus a SuperGrok or X Premium+ subscription (or an xAI API key). MIT, open-source. Not affiliated with or endorsed by xAI.",
-  "version": "1.4.29",
-  "publisher": "PawelHuryn",
+  "name": "grok-vscode-37x",
+  "displayName": "Grok Build (37x)",
+  "description": "37x fork of the community Grok Build VS Code client — Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
+  "version": "1.5.6",
+  "publisher": "37x-local",
   "author": {
-    "name": "Paweł Huryn",
-    "url": "https://www.productcompass.pm"
+    "name": "37x (fork of Pawel Huryn's Grok Build client)",
+    "url": "https://github.com/phuryn/grok-build-vscode"
   },
   "license": "MIT",
   "homepage": "https://github.com/phuryn/grok-build-vscode",
@@ -15,7 +15,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/phuryn/grok-build-vscode"
+    "url": "https://github.com/phuryn/grok-build-vscode",
+    "directory": "."
   },
   "engines": {
     "vscode": "^1.94.0"
@@ -41,6 +42,14 @@
   ],
   "icon": "resources/grok-icon.png",
   "main": "./out/extension.js",
+  "activationEvents": [
+    "onView:grok.chat",
+    "onView:grok.sessions",
+    "onWebviewPanel:grok.panel",
+    "onCommand:grok.open",
+    "onCommand:grok.panel.open",
+    "onCommand:grok.sidebar.open"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -55,8 +64,15 @@
       "grokSidebar": [
         {
           "type": "webview",
+          "id": "grok.sessions",
+          "name": "Sessions",
+          "when": "config.grok.sessionsSidebar"
+        },
+        {
+          "type": "webview",
           "id": "grok.chat",
-          "name": "Grok"
+          "name": "Chat",
+          "when": "config.grok.preferredLocation == 'sidebar' || !config.grok.sessionsSidebar"
         }
       ]
     },
@@ -64,6 +80,14 @@
       {
         "command": "grok.open",
         "title": "Grok: Open"
+      },
+      {
+        "command": "grok.panel.open",
+        "title": "Grok: Open in Editor Tab"
+      },
+      {
+        "command": "grok.sidebar.open",
+        "title": "Grok: Open in Sidebar"
       },
       {
         "command": "grok.newSession",
@@ -197,6 +221,29 @@
           "type": "boolean",
           "default": false,
           "description": "Use Ctrl/Cmd+Enter to send (Enter inserts newline)."
+        },
+        "grok.preferredLocation": {
+          "type": "string",
+          "enum": [
+            "panel",
+            "sidebar"
+          ],
+          "enumDescriptions": [
+            "Editor tab — chat stays open while you edit files (Claude Code style)",
+            "Sidebar — original Grok layout with chat in the side panel"
+          ],
+          "default": "panel",
+          "description": "Where Grok chat opens by default."
+        },
+        "grok.sessionsSidebar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show session history in a dedicated Sessions sidebar view instead of the in-chat history dropdown."
+        },
+        "grok.hideAutoSessions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide automated sessions tagged [Auto:review], [Auto:deploy], or [Auto:robot] from session history. Toggle live in the Sessions sidebar."
         },
         "grok.showThinking": {
           "type": "boolean",

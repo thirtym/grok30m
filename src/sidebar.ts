@@ -54,11 +54,20 @@ import {
   deleteSessionDir,
   fallbackName,
   indexSessions,
+  inferStoredAutoTag,
   isEmptyPrimerSession,
   readSessionEntries,
+  repairPollutedSummaryMtimes,
   resolveGrokHome,
   sessionsDirFor,
 } from "./sessions";
+import {
+  classifyAutoTag,
+  displayNameWithAutoTag,
+  formatAutoTag,
+  shouldHideAutoSession,
+  stripAutoTag,
+} from "./session-tags";
 
 type WebviewMsg =
   | { type: "ready" }
@@ -98,7 +107,9 @@ type WebviewMsg =
   | { type: "clearAllSessions" }
   | { type: "pickFile" }
   | { type: "voiceStart" }
-  | { type: "voiceStop" };
+  | { type: "voiceStop" }
+  | { type: "sessionsReady" }
+  | { type: "setHideAutoSessions"; value: boolean };
 
 const SESSION_META_KEY = "grok.sessionMeta";
 /** globalState key for the anonymous per-install telemetry GUID (survives updates). */
@@ -165,7 +176,9 @@ function guessMediaMime(p: string): string {
 
 export class GrokSidebar implements vscode.WebviewViewProvider {
   public static readonly viewId = "grok.chat";
+  public static readonly panelType = "grok.panel";
   private view?: vscode.WebviewView;
+  private sessionsView?: vscode.WebviewView;
   /** The session currently shown in the chat — one member of {@link pool}. */
   private focused = new Session();
   /**
@@ -201,6 +214,7 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
   private reaper?: ReturnType<typeof setInterval>;
   /** Guards {@link sweepEmptyPrimerSessions} to one run per activation. */
   private sweptEmptySessions = false;
+  private lastMtimeRepairAt = 0;
   private output: vscode.OutputChannel;
   private chips: FileChip[] = [];
   private editorWatcher?: vscode.Disposable;
@@ -246,19 +260,75 @@ export class GrokSidebar implements vscode.WebviewViewProvider {
     );
   }
 
-  resolveWebviewView(view: vscode.WebviewView): void {
-    this.view = view;
+  /** Chat webview for the focused session (sidebar) or its editor tab (panel mode). */
+  private get chatWebview(): vscode.Webview | undefined {
+    return this.webviewFor(this.focused);
+  }
+
+  private usesPanelTabs(): boolean {
+    return this.preferredLocation() === "panel";
+  }
+
+  private webviewFor(session: Session): vscode.Webview | undefined {
+    if (this.usesPanelTabs()) return session.panel?.webview;
+    return session === this.focused ? this.view?.webview : undefined;
+  }
+
+  private preferredLocation(): "panel" | "sidebar" {
+    return vscode.workspace.getConfiguration("grok").get<"panel" | "sidebar">("preferredLocation", "panel");
+  }
+
+  useSessionsSidebar(): boolean {
+    return vscode.workspace.getConfiguration("grok").get<boolean>("sessionsSidebar", true);
+  }
+
+  hideAutoSessions(): boolean {
+    return vscode.workspace.getConfiguration("grok").get<boolean>("hideAutoSessions", true);
+  }
+
+  /** Open Grok using the user's preferred chat location (panel tab by default). */
+  async openPreferred(): Promise<void> {
+    if (this.usesPanelTabs()) {
+      this.ensurePanelForSession(this.focused);
+    } else {
+      await vscode.commands.executeCommand("workbench.view.extension.grokSidebar");
+      this.view?.show?.(true);
+    }
+    if (this.useSessionsSidebar()) {
+      await vscode.commands.executeCommand("workbench.view.extension.grokSidebar");
+    }
+  }
+
+  /** Open (or focus) the focused session's editor tab. */
+  openPanel(): void {
+    this.ensurePanelForSession(this.focused);
+  }
+
+  /** Open chat in the sidebar (legacy layout). */
+  async openSidebar(): Promise<void> {
+    await vscode.commands.executeCommand("workbench.view.extension.grokSidebar");
+    this.view?.show?.(true);
+  }
+
+  attachSessionsView(view: vscode.WebviewView): void {
+    this.sessionsView = view;
     view.webview.options = {
       enableScripts: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, "media"),
         vscode.Uri.joinPath(this.context.extensionUri, "resources"),
-        // grok writes generated media under ~/.grok/sessions/<cwd>/<id>/{images,videos};
-        // serving it via asWebviewUri (instead of a base64 data: URI) lets the
-        // webview stream a multi-MB video from disk — see postGeneratedMedia.
-        vscode.Uri.file(resolveGrokHome()),
       ],
     };
+    view.webview.html = this.getSessionsHtml(view.webview);
+    view.webview.onDidReceiveMessage((m: WebviewMsg) => this.onSessionsMessage(m));
+    // Always seed the list — sessionsReady also fires, but the view can mount before any
+    // live Grok client exists and the old client-gate left the sidebar empty on first open.
+    this.postSessionsList();
+  }
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    this.configureChatWebview(view.webview);
     view.webview.html = this.getHtml(view.webview);
     view.webview.onDidReceiveMessage((m: WebviewMsg) => this.onMessage(m));
     this.watchActiveEditor();
@@ -756,7 +826,7 @@ See design doc for the full state machine diagram.`;
       const mime = m.mimeType || guessMediaMime(m.path);
       // Served from disk when the file is under a localResourceRoot (grok home):
       // the webview pulls bytes lazily, so even a big video renders.
-      const webview = this.view?.webview;
+      const webview = this.chatWebview;
       if (webview && this.isServableFromDisk(m.path)) {
         const src = webview.asWebviewUri(vscode.Uri.file(m.path)).toString();
         this.emit(session, { type: "media", media: m.media, src, mimeType: mime, path: m.path });
@@ -885,6 +955,7 @@ See design doc for the full state machine diagram.`;
 
   dispose(): void {
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
+    this.disposeAllPanels();
     void this.disposePool();
     this.editorWatcher?.dispose();
     this.configWatcher?.dispose();
@@ -897,8 +968,13 @@ See design doc for the full state machine diagram.`;
   // ---------- internals ----------
 
   private async ensureClient(): Promise<AcpClient | undefined> {
-    if (this.focused.client) return this.focused.client;
-    return this.startSession();
+    return this.ensureClientFor(this.focused);
+  }
+
+  private async ensureClientFor(session: Session): Promise<AcpClient | undefined> {
+    if (session.client) return session.client;
+    if (session !== this.focused) this.focused = session;
+    return this.startSession(session.activeSessionId);
   }
 
   /** Read `grok --version` for the policy checks. Returns "" on failure (logged). */
@@ -1342,7 +1418,10 @@ See design doc for the full state machine diagram.`;
     });
     client.on("session", (res) => {
       if (gen !== session.gen) return;
-      if (res?.sessionId) session.activeSessionId = res.sessionId;
+      if (res?.sessionId) {
+        session.activeSessionId = res.sessionId;
+        this.updatePanelTitle(session);
+      }
       this.emit(session, {
         type: "session",
         sessionId: res.sessionId,
@@ -1680,13 +1759,52 @@ See design doc for the full state machine diagram.`;
     return client;
   }
 
-  private async onMessage(msg: WebviewMsg): Promise<void> {
+  private async onSessionsMessage(msg: WebviewMsg): Promise<void> {
+    switch (msg.type) {
+      case "sessionsReady":
+        this.repairSessionSummaryMtimes();
+        this.postSessionsList();
+        break;
+      case "listSessions":
+        this.postSessionsList({ offset: msg.offset, limit: msg.limit, query: msg.query });
+        break;
+      case "setHideAutoSessions":
+        void vscode.workspace.getConfiguration("grok").update("hideAutoSessions", !!msg.value, vscode.ConfigurationTarget.Global);
+        this.postSessionsList();
+        break;
+      case "resumeSession":
+        await this.openSession(msg.id);
+        this.revealChat();
+        break;
+      case "renameSession":
+        this.renameSession(msg.id, msg.name);
+        break;
+      case "deleteSession":
+        await this.deleteSession(msg.id, msg.name);
+        break;
+      case "clearAllSessions":
+        await this.clearAllSessions();
+        break;
+      case "newSession":
+        await this.newFocusedSession();
+        this.revealChat();
+        break;
+    }
+  }
+
+  private async onMessage(msg: WebviewMsg, sourceSession?: Session): Promise<void> {
+    const session = sourceSession ?? this.focused;
+    if (sourceSession && sourceSession !== this.focused) {
+      this.focused = sourceSession;
+      this.touch(sourceSession);
+      this.postSessionsList();
+    }
     switch (msg.type) {
       case "ready":
-        this.postInitialState();
+        this.onChatReady(session);
         break;
       case "send":
-        await this.handleSend(msg.text, msg.chips);
+        await this.handleSend(msg.text, msg.chips, session);
         break;
       case "newSession":
         await this.newFocusedSession();
@@ -1882,6 +2000,10 @@ See design doc for the full state machine diagram.`;
       case "listSessions":
         this.postSessionsList({ offset: msg.offset, limit: msg.limit, query: msg.query });
         break;
+      case "setHideAutoSessions":
+        void vscode.workspace.getConfiguration("grok").update("hideAutoSessions", !!msg.value, vscode.ConfigurationTarget.Global);
+        this.postSessionsList();
+        break;
       case "resumeSession":
         await this.openSession(msg.id);
         break;
@@ -1927,28 +2049,51 @@ See design doc for the full state machine diagram.`;
     const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const log = (m: string) => this.output.appendLine(m);
 
+    // Opportunistic repair (throttled) so a polluted index from a prior "tidy" run
+    // (which advanced many summary.json mtimes) does not permanently hide older
+    // history behind a ~10h cutoff in the mtime-based pagination. Repair uses the
+    // real updated_at inside each summary to put mtimes back; throttled so search
+    // keystrokes and load-more do not spam full scans.
+    const now = Date.now();
+    if (now - this.lastMtimeRepairAt > 30_000) {
+      this.repairSessionSummaryMtimes();
+      this.lastMtimeRepairAt = now;
+    }
+
     const index = indexSessions({ fs: defaultFs, grokHome, cwd, log });
     const mtimeById = new Map(index.map((e) => [e.id, e.mtimeMs]));
 
+    const hideAuto = this.hideAutoSessions();
+    const activeId = this.focused.activeSessionId;
+    const filterVisible = (entries: SessionListEntry[]) => {
+      if (!hideAuto) return entries;
+      return entries.filter(
+        (e) => e.id === activeId || !shouldHideAutoSession(e.displayName, e.autoTag),
+      );
+    };
+
     let pageEntries: SessionListEntry[];
     let total: number;
-    if (query) {
-      // Search needs names for everything, so read (cache-backed) the whole list once, then filter.
+    if (query || hideAuto) {
+      // Search and auto-filter both need the full catalog (cache-backed) before paging.
       const all = this.readEntriesCached(index.map((e) => e.id), mtimeById, overrides, cwd, grokHome, log);
+      void this.persistInferredAutoTags(all, cwd, grokHome);
       all.sort((a, b) => b.updatedAt - a.updatedAt);
-      const matched = all.filter((e) => e.displayName.toLowerCase().includes(query));
-      total = matched.length;
-      pageEntries = matched.slice(offset, offset + limit);
+      const narrowed = query
+        ? all.filter((e) => e.displayName.toLowerCase().includes(query))
+        : filterVisible(all);
+      total = narrowed.length;
+      pageEntries = narrowed.slice(offset, offset + limit);
     } else {
       total = index.length;
       const pageIds = index.slice(offset, offset + limit).map((e) => e.id);
       pageEntries = this.readEntriesCached(pageIds, mtimeById, overrides, cwd, grokHome, log);
+      void this.persistInferredAutoTags(pageEntries, cwd, grokHome);
       // mtime is an approximate sort key; re-order the loaded page by exact updated_at.
       pageEntries.sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    // hasMore is governed purely by what's on disk (load-more pages disk-only); compute it before
-    // injecting any live-only rows below so an injected entry can't be mistaken for another page.
+    // hasMore is governed by the filtered/search total; compute it before injecting live rows.
     const hasMore = offset + pageEntries.length < total;
 
     // A brand-new live session has no summary.json yet, so the disk-scan index misses it. Without
@@ -1997,7 +2142,7 @@ See design doc for the full state machine diagram.`;
         dots[s.activeSessionId] = this.dotForId(s.activeSessionId);
       }
     }
-    this.post({
+    const payload = {
       type: "sessions",
       entries: pageEntries,
       activeId: this.focused.activeSessionId,
@@ -2006,7 +2151,13 @@ See design doc for the full state machine diagram.`;
       total,
       hasMore,
       query: opts?.query ?? "",
-    });
+      hideAutoSessions: hideAuto,
+    };
+    if (this.useSessionsSidebar()) {
+      this.postToSessions(payload);
+    } else {
+      this.post(payload);
+    }
   }
 
   /** Synthesize a list entry for a live session grok hasn't written a `summary.json` for yet (a
@@ -2081,6 +2232,8 @@ See design doc for the full state machine diagram.`;
     // A rename changes displayName but not summary.json's mtime, so the mtime-keyed cache would
     // otherwise keep serving the old name. Drop it so the next read rebuilds the entry.
     this.sessionCache.delete(id);
+    const live = [...this.pool, this.focused].find((s) => s.activeSessionId === id);
+    if (live) this.updatePanelTitle(live);
     this.postSessionsList();
   }
 
@@ -2115,9 +2268,11 @@ See design doc for the full state machine diagram.`;
     const live = [...this.pool].find((s) => s.activeSessionId === id);
     if (live) {
       const wasFocused = live === this.focused;
+      this.disposePanelFor(live);
       this.disposeSession(live);
       if (wasFocused) {
         this.focused = new Session();
+        if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused, "New session");
         await this.startSession();
       }
     }
@@ -2211,7 +2366,7 @@ See design doc for the full state machine diagram.`;
   }
 
   private postFontScale(): void {
-    this.post({ type: "fontScale", value: this.chatFontScale() });
+    this.postToAllChatWebviews({ type: "fontScale", value: this.chatFontScale() });
   }
 
   /** grok.showThinking (#26) — whether grok's reasoning traces are shown. Off by
@@ -2221,7 +2376,7 @@ See design doc for the full state machine diagram.`;
   }
 
   private postShowThinking(): void {
-    this.post({ type: "showThinking", value: this.showThinking() });
+    this.postToAllChatWebviews({ type: "showThinking", value: this.showThinking() });
   }
 
   /** Anonymous, per-install GUID — generated once and kept in globalState (so it
@@ -2282,11 +2437,25 @@ See design doc for the full state machine diagram.`;
   private postVoiceConfigured(): void {
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const cfg = vscode.workspace.getConfiguration("grok");
-    this.post({
+    this.postToAllChatWebviews({
       type: "voiceConfigured",
       value: !!this.resolveVoiceApiKey(cwd),
       sendPhrase: cfg.get<string>("voiceSendPhrase", DEFAULT_SEND_PHRASE),
     });
+  }
+
+  /** Settings broadcasts reach every open chat surface (one tab per session in panel mode). */
+  private postToAllChatWebviews(message: any): void {
+    if (!this.usesPanelTabs()) {
+      this.post(message);
+      return;
+    }
+    const seen = new Set<Session>();
+    for (const s of [...this.pool, this.focused]) {
+      if (seen.has(s)) continue;
+      seen.add(s);
+      s.panel?.webview.postMessage(message);
+    }
   }
 
   /** Show actionable guidance for setting up the voice API key. */
@@ -2666,10 +2835,10 @@ See design doc for the full state machine diagram.`;
     this.postChips();
   }
 
-  private async handleSend(text: string, chips: FileChip[]): Promise<void> {
-    const client = await this.ensureClient();
+  private async handleSend(text: string, chips: FileChip[], session = this.focused): Promise<void> {
+    if (session !== this.focused) this.focused = session;
+    const client = session.client ?? await this.ensureClientFor(session);
     if (!client) return;
-    const session = this.focused;
     const gen = session.gen;
 
     const finalPrompt = buildPrompt(text, chips, {
@@ -2739,31 +2908,100 @@ See design doc for the full state machine diagram.`;
     const cleaned = first.replace(/\s+/g, " ").trim();
     if (!cleaned) return;
     const title = cleaned.length > 50 ? cleaned.slice(0, 47) + "…" : cleaned;
+    const autoTag = classifyAutoTag({ summary: title, firstQuery: cleaned });
+    const customName = autoTag ? displayNameWithAutoTag(title, autoTag) : title;
     const next: SessionMetaOverrides = {
       ...overrides,
-      [sid]: { ...(overrides[sid] ?? {}), customName: title },
+      [sid]: { ...(overrides[sid] ?? {}), customName, ...(autoTag ? { autoTag } : {}) },
     };
     void this.context.globalState.update(SESSION_META_KEY, next);
+    this.updatePanelTitle(session);
   }
 
-  private postInitialState(): void {
+  /** Best-effort: persist inferred auto-tags and mirror them into summary.json for filtering. */
+  private async persistInferredAutoTags(
+    entries: SessionListEntry[],
+    cwd: string,
+    grokHome: string,
+  ): Promise<void> {
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    let next: SessionMetaOverrides | undefined;
+    for (const e of entries) {
+      if (e.customName || overrides[e.id]?.autoTag) continue;
+      const sessDir = path.join(sessionsDirFor(grokHome, cwd), e.id);
+      const historyPath = path.join(sessDir, "chat_history.jsonl");
+      let chatHistory: string | undefined;
+      try {
+        chatHistory = fs.readFileSync(historyPath, "utf8");
+      } catch {
+        chatHistory = undefined;
+      }
+      const tag = inferStoredAutoTag(stripAutoTag(e.rawSummary), undefined, chatHistory);
+      if (!tag) continue;
+      next = next ?? { ...overrides };
+      next[e.id] = { ...(next[e.id] ?? {}), autoTag: tag };
+      e.autoTag = tag;
+      if (!e.customName) e.displayName = displayNameWithAutoTag(e.displayName, tag);
+      const summaryPath = path.join(sessDir, "summary.json");
+      try {
+        const prev = fs.statSync(summaryPath);
+        const raw = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+        const cur = typeof raw.session_summary === "string" ? raw.session_summary : "";
+        if (!cur || !/^\[Auto:/i.test(cur)) {
+          raw.session_summary = formatAutoTag(tag, stripAutoTag(cur || e.rawSummary));
+          fs.writeFileSync(summaryPath, JSON.stringify(raw, null, 2) + "\n", "utf8");
+          // Tagging rewrites summary.json in place; restore mtime so indexSessions ordering
+          // (stat-only) still reflects real last activity, not when we auto-tagged.
+          // Use the *logical* updated_at from inside the file (not the possibly-polluted
+          // prev stat mtime) as the target. This is self-healing even if a prior tagging
+          // run left mtime advanced and utimes was not effective on this FS.
+          const logical = typeof raw.updated_at === "string" ? Date.parse(raw.updated_at) : prev.mtimeMs;
+          const targetSec = (isNaN(logical) ? prev.mtimeMs : logical) / 1000;
+          fs.utimesSync(summaryPath, prev.atimeMs / 1000, targetSec);
+        }
+      } catch {
+        // best-effort — globalState tag still drives the sidebar
+      }
+    }
+    if (next) await this.context.globalState.update(SESSION_META_KEY, next);
+  }
+
+  private onChatReady(session: Session): void {
     const cfg = vscode.workspace.getConfiguration("grok");
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-    this.post({
+    this.postToWebview(session, {
       type: "initialState",
       effort: cfg.get("defaultEffort", ""),
       cwd,
       useCtrlEnter: cfg.get("useCtrlEnterToSend", false),
       extVersion: (this.context.extension.packageJSON as { version?: string })?.version ?? "",
       showThinking: cfg.get("showThinking", false),
+      sessionsSidebar: this.useSessionsSidebar(),
+      hideAutoSessions: this.hideAutoSessions(),
     });
+    if (session.client) {
+      const wv = this.webviewFor(session);
+      if (wv) {
+        wv.postMessage({ type: "clearMessages" });
+        for (const m of session.buffer) wv.postMessage(m);
+      }
+      if (session === this.focused) {
+        this.postMode();
+        this.postChips();
+      }
+      this.postVoiceConfigured();
+      this.postFontScale();
+      return;
+    }
+    if (session !== this.focused) return;
     if (cfg.get<boolean>("includeActiveFileByDefault", true)) {
       this.addActiveEditorChip();
     }
     this.postVoiceConfigured();
-    // Sweep stale empty primer sessions once the first session is live (so the
-    // newly-focused session is excluded from the sweep).
-    void this.startSession().then(() => this.sweepEmptyPrimerSessions());
+    void this.startSession().then(() => {
+      this.repairSessionSummaryMtimes();
+      this.sweepEmptyPrimerSessions();
+    });
   }
 
   private postChips(): void {
@@ -2789,9 +3027,17 @@ See design doc for the full state machine diagram.`;
   ]);
 
   private post(message: any): void {
-    if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    if (this.focused.suppressPlanReject && GrokSidebar.PLAN_REJECT_SUPPRESS.has(message.type)) return;
-    this.view?.webview.postMessage(message);
+    this.postToWebview(this.focused, message);
+  }
+
+  private postToWebview(session: Session, message: any): void {
+    if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
+    if (session.suppressPlanReject && GrokSidebar.PLAN_REJECT_SUPPRESS.has(message.type)) return;
+    this.webviewFor(session)?.postMessage(message);
+  }
+
+  private postToSessions(message: any): void {
+    this.sessionsView?.webview.postMessage(message);
   }
 
   /**
@@ -2810,7 +3056,11 @@ See design doc for the full state machine diagram.`;
     if (session.suppressPlanReject && GrokSidebar.PLAN_REJECT_SUPPRESS.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else session.buffer.push(message);
-    if (session === this.focused) this.view?.webview.postMessage(message);
+    if (this.usesPanelTabs()) {
+      this.postToWebview(session, message);
+    } else if (session === this.focused) {
+      this.webviewFor(session)?.postMessage(message);
+    }
   }
 
   // ---------- session pool ----------
@@ -2825,14 +3075,22 @@ See design doc for the full state machine diagram.`;
    * when each message was first buffered).
    */
   private focusSession(session: Session): void {
-    if (session === this.focused) return;
+    if (session === this.focused) {
+      this.revealChat();
+      return;
+    }
     this.focused = session;
     this.touch(session);
-    this.markRead(session); // opening it clears any unread (green/red) badge
-    const wv = this.view?.webview;
-    if (wv) {
-      wv.postMessage({ type: "clearMessages" });
-      for (const m of session.buffer) wv.postMessage(m);
+    this.markRead(session);
+    if (this.usesPanelTabs()) {
+      this.ensurePanelForSession(session);
+    } else {
+      const wv = this.webviewFor(session);
+      if (wv) {
+        wv.postMessage({ type: "clearMessages" });
+        for (const m of session.buffer) wv.postMessage(m);
+      }
+      this.view?.show?.(true);
     }
     this.postMode();
     this.postSessionsList();
@@ -2851,6 +3109,7 @@ See design doc for the full state machine diagram.`;
     // another): tear down its process AND delete its on-disk dir so it doesn't pile
     // up in history (#24). The next focused session becomes the single live "New
     // session"; abandoning this one removes it entirely.
+    this.disposePanelFor(cur);
     this.disposeSession(cur);
     this.removeSessionFromDisk(cur.activeSessionId);
     this.postSessionsList();
@@ -2875,6 +3134,22 @@ See design doc for the full state machine diagram.`;
       void this.context.globalState.update(SESSION_META_KEY, next);
     }
     this.sessionCache.delete(id);
+  }
+
+  /** Repair of summary.json mtimes polluted by auto-tag writes (or other in-place
+   *  rewriters). Without this, stat-only session ordering surfaces only recently-tagged
+   *  rows and pagination looks like history stops ~10h ago. Called on sessions sidebar
+   *  ready so a manual reload of the sidebar view (or window reload) recovers visibility
+   *  of older sessions after a tagging pass. */
+  private repairSessionSummaryMtimes(): void {
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const log = (m: string) => this.output.appendLine(m);
+    const n = repairPollutedSummaryMtimes({ fs: defaultFs, grokHome: resolveGrokHome(process.env), cwd, log });
+    if (n > 0) {
+      log(`[sessions] repaired ${n} polluted summary.json mtime(s)`);
+      this.sessionCache.clear();
+      this.postSessionsList();
+    }
   }
 
   /** One-shot cleanup (per activation) of empty, primer-only sessions left on disk by
@@ -2951,7 +3226,7 @@ See design doc for the full state machine diagram.`;
     session.client?.dispose();
     session.client = undefined;
     this.pool.delete(session);
-    if (id) this.post({ type: "sessionDot", id, dot: this.dotForId(id) });
+    if (id) this.pushDot(session);
   }
 
   /** Stamp a session's recency for LRU/TTL reaping (created / focused / made busy). */
@@ -3005,7 +3280,13 @@ See design doc for the full state machine diagram.`;
    *  and on reaping (where the session has left the pool but may stay green). */
   private pushDot(session: Session): void {
     const id = session.activeSessionId;
-    if (id) this.post({ type: "sessionDot", id, dot: this.dotForId(id) });
+    if (!id) return;
+    const payload = { type: "sessionDot", id, dot: this.dotForId(id) };
+    if (this.useSessionsSidebar()) {
+      this.postToSessions(payload);
+    } else {
+      this.post(payload);
+    }
   }
 
   /** The dashboard dot for a grok-session id, from live status (if it's a live pool
@@ -3063,6 +3344,7 @@ See design doc for the full state machine diagram.`;
   private async newFocusedSession(): Promise<void> {
     this.parkFocused();
     this.focused = new Session();
+    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused, "New session");
     await this.startSession();
   }
 
@@ -3080,11 +3362,21 @@ See design doc for the full state machine diagram.`;
     }
     this.parkFocused();
     this.focused = new Session();
+    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused, "Grok");
     await this.startSession(id);
-    this.markRead(this.focused); // opening a cold session clears its unread badge
+    this.markRead(this.focused);
+    if (this.usesPanelTabs()) this.updatePanelTitle(this.focused);
   }
 
   private reveal(): void {
+    this.revealChat();
+  }
+
+  private revealChat(): void {
+    if (this.usesPanelTabs()) {
+      this.ensurePanelForSession(this.focused);
+      return;
+    }
     this.view?.show?.(true);
   }
 
@@ -3143,12 +3435,156 @@ See design doc for the full state machine diagram.`;
     return env;
   }
 
+  private chatLocalResourceRoots(): vscode.Uri[] {
+    return [
+      vscode.Uri.joinPath(this.context.extensionUri, "media"),
+      vscode.Uri.joinPath(this.context.extensionUri, "resources"),
+      vscode.Uri.file(resolveGrokHome()),
+    ];
+  }
+
+  private configureChatWebview(webview: vscode.Webview): void {
+    webview.options = {
+      enableScripts: true,
+      localResourceRoots: this.chatLocalResourceRoots(),
+    };
+  }
+
+  private panelTitleFor(session: Session): string {
+    const id = session.activeSessionId;
+    const overrides = this.context.globalState.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    if (id && overrides[id]?.customName?.trim()) return overrides[id].customName!.trim();
+    if (!session.hasHistory) return "New session";
+    const first = session.firstUserMessageForTitle?.replace(/\s+/g, " ").trim();
+    if (first) return first.length > 50 ? first.slice(0, 47) + "…" : first;
+    return "Grok";
+  }
+
+  private updatePanelTitle(session: Session): void {
+    if (!session.panel) return;
+    session.panel.title = this.panelTitleFor(session);
+  }
+
+  /** One editor tab per session (Claude-style). Creates or focuses the tab. */
+  private ensurePanelForSession(session: Session, title?: string): void {
+    if (!this.usesPanelTabs()) return;
+    if (session.panel) {
+      session.panel.reveal(vscode.ViewColumn.Active);
+      this.updatePanelTitle(session);
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      GrokSidebar.panelType,
+      title ?? this.panelTitleFor(session),
+      vscode.ViewColumn.Active,
+      {
+        retainContextWhenHidden: true,
+        enableScripts: true,
+        localResourceRoots: this.chatLocalResourceRoots(),
+      },
+    );
+    panel.iconPath = {
+      light: vscode.Uri.joinPath(this.context.extensionUri, "resources", "grok-icon.png"),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, "resources", "grok-icon.png"),
+    };
+    this.bindChatPanel(panel, session);
+  }
+
+  private disposePanelFor(session: Session): void {
+    if (!session.panel) return;
+    const panel = session.panel;
+    session.panel = undefined;
+    panel.dispose();
+  }
+
+  private disposeAllPanels(): void {
+    const seen = new Set<Session>();
+    for (const s of this.pool) {
+      if (!seen.has(s)) { seen.add(s); this.disposePanelFor(s); }
+    }
+    this.disposePanelFor(this.focused);
+  }
+
+  private bindChatPanel(panel: vscode.WebviewPanel, session: Session): void {
+    session.panel = panel;
+    this.configureChatWebview(panel.webview);
+    panel.webview.html = this.getHtml(panel.webview);
+    panel.webview.onDidReceiveMessage((m: WebviewMsg) => this.onMessage(m, session));
+    panel.onDidDispose(() => {
+      if (session.panel === panel) session.panel = undefined;
+    });
+    if (!this.reaper) {
+      this.reaper = setInterval(() => this.reapPool(), GrokSidebar.REAP_INTERVAL_MS);
+    }
+    if (!this.configWatcher) {
+      this.watchActiveEditor();
+      this.configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+        if (
+          e.affectsConfiguration("grok.voiceApiKey") ||
+          e.affectsConfiguration("grok.ffmpegPath") ||
+          e.affectsConfiguration("grok.voiceSendPhrase")
+        ) {
+          this.postVoiceConfigured();
+        }
+        if (e.affectsConfiguration("grok.chatFontScale")) {
+          this.postFontScale();
+        }
+        if (e.affectsConfiguration("grok.showThinking")) {
+          this.postShowThinking();
+        }
+      });
+    }
+  }
+
+  private getSessionsHtml(webview: vscode.Webview): string {
+    const nonce = getNonce();
+    const mediaUri = (file: string) =>
+      webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", file));
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
+<link rel="stylesheet" href="${mediaUri("sessions.css")}" />
+</head>
+<body>
+  <div class="sessions-root">
+    <div class="sessions-header">
+      <span class="sessions-title">Sessions</span>
+      <button id="sessions-new-btn" class="sessions-new-btn" title="New session"></button>
+    </div>
+    <div class="sessions-search-wrap">
+      <input id="sessions-search" class="sessions-search" type="text" placeholder="Search sessions…" />
+    </div>
+    <label class="sessions-filter-auto" title="Hide [Auto:review], [Auto:Deploy], and [Auto:Robot] sessions">
+      <input id="sessions-hide-auto" type="checkbox" checked />
+      <span>Hide automated</span>
+    </label>
+    <div id="sessions-list" class="sessions-list"></div>
+    <div id="sessions-footer" class="sessions-footer" hidden>
+      <button id="sessions-clear-btn" class="sessions-clear-all" title="Delete all sessions in this workspace's history"></button>
+    </div>
+  </div>
+  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
+  <script nonce="${nonce}" src="${mediaUri("sessions.js")}"></script>
+</body>
+</html>`;
+  }
+
   private getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
     const mediaUri = (file: string) =>
       webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "media", file));
     const resourceUri = (file: string) =>
       webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, "resources", file));
+    const hideHistory = this.useSessionsSidebar();
+    const historyHeader = hideHistory
+      ? ""
+      : `    <button id="history-btn" class="toolbar-btn" title="Session history"></button>
+    <div id="history-popover" class="toolbar-popover history-popover" hidden></div>
+`;
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -3161,9 +3597,7 @@ See design doc for the full state machine diagram.`;
 <body class="${this.showThinking() ? "" : "thinking-hidden"}" style="--chat-zoom: ${this.chatFontScale()}">
 
   <header class="top-bar">
-    <button id="history-btn" class="toolbar-btn" title="Session history"></button>
-    <button id="new-btn" class="toolbar-btn" title="New session"></button>
-    <div id="history-popover" class="toolbar-popover history-popover" hidden></div>
+${historyHeader}    <button id="new-btn" class="toolbar-btn" title="New session"></button>
   </header>
 
   <main id="messages" class="messages">
@@ -3181,7 +3615,7 @@ See design doc for the full state machine diagram.`;
     <div id="attachments" class="attachments"></div>
     <div class="composer-input-wrap">
       <div id="input-highlight" class="input-highlight" aria-hidden="true"></div>
-      <textarea id="input" placeholder="Ask Grok..." rows="3"></textarea>
+      <textarea id="input" placeholder="Ask Grok..." rows="6"></textarea>
       <button id="mic-btn" class="mic-btn" title="Voice control"></button>
     </div>
     <div class="composer-toolbar">

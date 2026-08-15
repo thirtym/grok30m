@@ -13,6 +13,7 @@ import {
   isEmptyPrimerSession,
   listSessions,
   readSessionEntries,
+  repairPollutedSummaryMtimes,
   sessionsDirFor,
 } from "../src/sessions";
 
@@ -144,6 +145,11 @@ function buildFs(files: Record<string, FileEntry>): FsLike {
       const f = files[p];
       if (!f || removed.has(p)) throw new Error(`ENOENT: ${p}`);
       return { isDirectory: () => f.isDir, mtimeMs: f.mtimeMs ?? 0 };
+    },
+    utimesSync: (p, _atime, mtime) => {
+      const f = files[p];
+      if (!f || removed.has(p)) throw new Error(`ENOENT: ${p}`);
+      f.mtimeMs = Math.round(mtime * 1000);
     },
     rmSync: (p) => {
       for (const fp of Object.keys(files)) {
@@ -370,6 +376,84 @@ describe("indexSessions", () => {
   });
 });
 
+describe("repairPollutedSummaryMtimes", () => {
+  const dir = sessionsDirFor(grokHome, cwd);
+
+  it("restores mtime when it was bumped far ahead of updated_at", () => {
+    const summaryPath = path.join(dirFor("tagged"), "summary.json");
+    const updatedMs = Date.parse("2026-01-01T00:00:00Z");
+    const fs = buildFs({
+      [dir]: { isDir: true },
+      [dirFor("tagged")]: { isDir: true },
+      [summaryPath]: {
+        isDir: false,
+        mtimeMs: updatedMs + 7 * 24 * 60 * 60 * 1000,
+        content: JSON.stringify({
+          info: { id: "tagged", cwd },
+          session_summary: "[Auto:review] Old work",
+          updated_at: "2026-01-01T00:00:00Z",
+        }),
+      },
+    });
+    expect(repairPollutedSummaryMtimes({ fs, grokHome, cwd })).toBe(1);
+    expect(fs.statSync(summaryPath).mtimeMs).toBe(updatedMs);
+  });
+
+  it("leaves mtime alone when it matches updated_at", () => {
+    const summaryPath = path.join(dirFor("fresh"), "summary.json");
+    const updatedMs = Date.parse("2026-06-01T12:00:00Z");
+    const fs = buildFs({
+      [dir]: { isDir: true },
+      [dirFor("fresh")]: { isDir: true },
+      [summaryPath]: {
+        isDir: false,
+        mtimeMs: updatedMs,
+        content: JSON.stringify({
+          info: { id: "fresh", cwd },
+          session_summary: "Recent session",
+          updated_at: "2026-06-01T12:00:00Z",
+        }),
+      },
+    });
+    expect(repairPollutedSummaryMtimes({ fs, grokHome, cwd })).toBe(0);
+    expect(fs.statSync(summaryPath).mtimeMs).toBe(updatedMs);
+  });
+
+  it("reorders index after repair so old sessions are not stuck behind tag bumps", () => {
+    const stalePath = path.join(dirFor("stale"), "summary.json");
+    const freshPath = path.join(dirFor("fresh"), "summary.json");
+    const staleUpdatedMs = Date.parse("2026-01-01T00:00:00Z");
+    const freshMs = Date.parse("2026-06-01T00:00:00Z");
+    const fs = buildFs({
+      [dir]: { isDir: true },
+      [dirFor("stale")]: { isDir: true },
+      [dirFor("fresh")]: { isDir: true },
+      [stalePath]: {
+        isDir: false,
+        mtimeMs: freshMs + 60 * 60 * 1000,
+        content: JSON.stringify({
+          info: { id: "stale", cwd },
+          session_summary: "[Auto:review] Tagged later",
+          updated_at: "2026-01-01T00:00:00Z",
+        }),
+      },
+      [freshPath]: {
+        isDir: false,
+        mtimeMs: freshMs,
+        content: JSON.stringify({
+          info: { id: "fresh", cwd },
+          session_summary: "Real recent work",
+          updated_at: "2026-06-01T00:00:00Z",
+        }),
+      },
+    });
+    expect(indexSessions({ fs, grokHome, cwd }).map((e) => e.id)).toEqual(["stale", "fresh"]);
+    repairPollutedSummaryMtimes({ fs, grokHome, cwd });
+    expect(fs.statSync(stalePath).mtimeMs).toBe(staleUpdatedMs);
+    expect(indexSessions({ fs, grokHome, cwd }).map((e) => e.id)).toEqual(["fresh", "stale"]);
+  });
+});
+
 describe("readSessionEntries", () => {
   const dir = sessionsDirFor(grokHome, cwd);
 
@@ -406,7 +490,7 @@ describe("readSessionEntries", () => {
     const out = readSessionEntries({ fs, grokHome, cwd, ids: ["b"], overrides: {} });
     expect(out.map((e) => e.id)).toEqual(["b"]);
     expect(out[0].displayName).toBe("second");
-    expect(reads).toBe(1); // only the one requested id was read
+    expect(reads).toBe(2); // summary.json + chat_history.jsonl (missing file is a silent skip)
   });
 
   it("preserves the id order it was given (no internal re-sort)", () => {
@@ -429,6 +513,27 @@ describe("readSessionEntries", () => {
       [path.join(dirFor("bad"), "summary.json")]: { isDir: false, content: "{ not json" },
     });
     expect(readSessionEntries({ fs, grokHome, cwd, ids: ["bad", "gone"], overrides: {} })).toEqual([]);
+  });
+
+  it("uses the first real user query as the title when grok left a primer-derived summary", () => {
+    const chat = [PRIMER_LINE, realQuery("fix the sidebar session list")].join("\n");
+    const fs = buildFs({
+      [dir]: { isDir: true },
+      [dirFor("s")]: { isDir: true },
+      [path.join(dirFor("s"), "summary.json")]: {
+        isDir: false,
+        content: JSON.stringify({
+          session_summary: "Grok Build VSCode Primer v4 Plan Mode",
+          updated_at: "2026-07-09T12:00:00Z",
+          num_messages: 4,
+        }),
+      },
+      [path.join(dirFor("s"), "chat_history.jsonl")]: { isDir: false, content: chat },
+    });
+    const out = readSessionEntries({ fs, grokHome, cwd, ids: ["s"], overrides: {} });
+    expect(out).toHaveLength(1);
+    expect(out[0].displayName).toBe("fix the sidebar session list");
+    expect(out[0].autoTag).toBeUndefined();
   });
 });
 

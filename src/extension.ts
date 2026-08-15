@@ -1,22 +1,26 @@
 import * as vscode from "vscode";
 import { GrokSidebar } from "./sidebar";
+import { GrokSessionsView } from "./sessions-view";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Grok");
   const sidebar = new GrokSidebar(context, output);
+  const sessionsView = new GrokSessionsView(sidebar);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(GrokSidebar.viewId, sidebar, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
+    vscode.window.registerWebviewViewProvider(GrokSessionsView.viewId, sessionsView, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
     output,
     { dispose: () => sidebar.dispose() },
-    vscode.commands.registerCommand("grok.open", () =>
-      vscode.commands.executeCommand("workbench.view.extension.grokSidebar"),
-    ),
+    vscode.commands.registerCommand("grok.open", () => sidebar.openPreferred()),
+    vscode.commands.registerCommand("grok.panel.open", () => sidebar.openPanel()),
+    vscode.commands.registerCommand("grok.sidebar.open", () => sidebar.openSidebar()),
     vscode.commands.registerCommand("grok.newSession", () => sidebar.newSession()),
     vscode.commands.registerCommand("grok.compact", () => {
-      // emulated by sending the slash command as a prompt; CLI handles it
       vscode.window.showInformationMessage(
         "Type /compact in the composer to compress the conversation.",
       );
@@ -35,8 +39,6 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("grok.showLogs", () => output.show()),
     vscode.commands.registerCommand("grok.logout", () => sidebar.logout()),
-    // Internal debug helper for manually exercising the plan-review card UI
-    // (Approve / Reject / Cancel flows) without a live CLI session.
     vscode.commands.registerCommand("grok._debugDummyPlan", () => sidebar.debugShowDummyPlan()),
   );
 }

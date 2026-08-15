@@ -100,6 +100,8 @@
     sessionHasMore: false,
     sessionLoading: false,
     sessionQuery: "",
+    // When true, session history lives in the dedicated Sessions sidebar (host-driven).
+    sessionsSidebar: false,
     replaying: false,
     // Live ask_user_question tool calls (toolCallId → {questions, fromReplay}).
     // grok emits a tool_call alongside the live x.ai/ask_user_question request; we
@@ -296,7 +298,7 @@
   }
 
   newBtn.innerHTML = ICON.squarePen;
-  historyBtn.innerHTML = ICON.clock;
+  if (historyBtn) historyBtn.innerHTML = ICON.clock;
   updateSendButton(); // spinner by default — session is starting up (busy+locked)
   gearBtn.innerHTML = ICON.gear;
   addBtn.innerHTML = ICON.plus;
@@ -900,7 +902,7 @@
     modePopover.hidden = true;
     gearPopover.hidden = true;
     addPopover.hidden = true;
-    historyPopover.hidden = true;
+    if (historyPopover) historyPopover.hidden = true;
   }
 
   function positionPopover(popover, btn) {
@@ -1268,6 +1270,7 @@
   // Cheap incremental update for a single dot when a `sessionDot` arrives while the
   // popover is open — no full re-render.
   function patchSessionDot(id) {
+    if (!historyPopover) return;
     const sel = "[data-session-dot=\"" + (window.CSS && CSS.escape ? CSS.escape(id) : id) + "\"]";
     const dot = historyPopover.querySelector(sel);
     if (dot) applySessionDot(dot, state.dots[id]);
@@ -1469,6 +1472,7 @@
   }
 
   function openHistoryPopover() {
+    if (!historyPopover || !historyBtn) return;
     if (!historyPopover.hidden) { closePopovers(); return; }
     closePopovers();
     state.sessionSearch = "";
@@ -3371,6 +3375,7 @@
         state.cwd = msg.cwd || "";
         state.extVersion = msg.extVersion || "";
         if (typeof msg.showThinking === "boolean") state.showThinking = msg.showThinking;
+        if (typeof msg.sessionsSidebar === "boolean") state.sessionsSidebar = msg.sessionsSidebar;
         applyThinkingVisibility();
         break;
       case "showThinking":
@@ -3790,9 +3795,10 @@
       case "xaiNotification":
         break;
       case "sessions": {
+        if (state.sessionsSidebar) break;
         const entries = msg.entries || [];
         const offset = msg.offset || 0;
-        const open = !historyPopover.hidden;
+        const open = historyPopover && !historyPopover.hidden;
         // Sticky search: a host-driven refresh (rename/delete/new session) posts an
         // unfiltered first page. If the user has a search active, re-request with it
         // rather than clobbering their filtered view with the full list.
@@ -3826,9 +3832,10 @@
         break;
       }
       case "sessionDot":
+        if (state.sessionsSidebar) break;
         if (msg.dot && msg.dot !== "none") state.dots[msg.id] = msg.dot;
         else delete state.dots[msg.id];
-        if (!historyPopover.hidden) patchSessionDot(msg.id);
+        if (historyPopover && !historyPopover.hidden) patchSessionDot(msg.id);
         break;
     }
     // After any step grok takes mid-turn, make sure the chat still shows it's
@@ -3857,11 +3864,11 @@
   const welcomeAboutLink = $("welcome-about-link");
   if (welcomeAboutLink) welcomeAboutLink.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openAboutPanel(); };
   addBtn.onclick = (e) => { e.stopPropagation(); openAddPopover(); };
-  historyBtn.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
+  if (historyBtn) historyBtn.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
   modePopover.addEventListener("click", (e) => e.stopPropagation());
   gearPopover.addEventListener("click", (e) => e.stopPropagation());
   addPopover.addEventListener("click", (e) => e.stopPropagation());
-  historyPopover.addEventListener("click", (e) => e.stopPropagation());
+  if (historyPopover) historyPopover.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", (e) => {
     // Math / mermaid export actions (Copy source, Download as PNG/SVG, Open as PNG).
     const exprBtn = e.target.closest(".expr-btn");
@@ -4008,7 +4015,9 @@
   // otherwise leave it stale until close+reopen. Only the history dropdown is panel-width
   // dependent (the composer popovers are bottom-anchored), so just re-run its positioning.
   window.addEventListener("resize", () => {
-    if (!historyPopover.hidden) positionDropdownPopover(historyPopover, historyBtn);
+    if (historyPopover && historyBtn && !historyPopover.hidden) {
+      positionDropdownPopover(historyPopover, historyBtn);
+    }
   });
 
   // A resize can also happen while Grok is hidden (another panel tab / extension focused),

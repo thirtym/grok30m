@@ -1,6 +1,13 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { isPrimerText, isPrimerSummary } from "./grok-primer";
+import {
+  type AutoTag,
+  classifyAutoTag,
+  displayNameWithAutoTag,
+  parseAutoTag,
+  resolveAutoTag,
+} from "./session-tags";
 
 /** A session with at most this many recorded messages is cheap to confirm as empty
  *  (a primer-only session has ~4). The sweep only reads `chat_history.jsonl` for
@@ -17,10 +24,13 @@ export interface SessionListEntry {
   createdAt: number;
   numMessages: number;
   modelId?: string;
+  autoTag?: AutoTag;
 }
 
 export interface SessionMetaOverride {
   customName?: string;
+  /** Automated session kind — drives `[Auto:<tag>]` prefix and sidebar filtering. */
+  autoTag?: AutoTag;
   pinnedAt?: number;
   /** Last verdict the user gave to an exit_plan_mode card in this session, for the restore-card label. */
   lastPlanVerdict?: "approved" | "rejected" | "abandoned";
@@ -114,6 +124,20 @@ function parseTimestamp(s: unknown, fallback: number): number {
   return isNaN(t) ? fallback : t;
 }
 
+/** Pick a sidebar title: customName wins; else use the first real user query when grok left a
+ *  primer-derived summary; else fall back to summary / timestamp. */
+function displayBaseName(
+  rawSummary: string,
+  customName: string | undefined,
+  firstRealQuery: string | undefined,
+  updatedAt: number,
+): string {
+  if (customName) return customName;
+  const first = (firstRealQuery || "").trim();
+  if (first && isPrimerSummary(rawSummary)) return fallbackName(first, updatedAt);
+  return fallbackName(rawSummary, updatedAt);
+}
+
 /** Parse one already-read summary.json into a list entry, applying any customName override. */
 function buildEntry(
   dirName: string,
@@ -131,16 +155,104 @@ function buildEntry(
   const modelId = typeof raw?.current_model_id === "string" ? raw.current_model_id : undefined;
   const override = overrides[id];
   const customName = override?.customName?.trim() || undefined;
-  const displayName = customName || fallbackName(rawSummary, updatedAt);
-  return { id, cwd: sessCwd, displayName, rawSummary, customName, updatedAt, createdAt, numMessages, modelId };
+  const autoTag = resolveAutoTag(rawSummary, override?.autoTag, {
+    summary: rawSummary,
+  });
+  const baseName = displayBaseName(rawSummary, customName, undefined, updatedAt);
+  const displayName = customName
+    ? baseName
+    : displayNameWithAutoTag(baseName, autoTag);
+  return {
+    id,
+    cwd: sessCwd,
+    displayName,
+    rawSummary,
+    customName,
+    updatedAt,
+    createdAt,
+    numMessages,
+    modelId,
+    autoTag,
+  };
+}
+
+/** Like {@link buildEntry} but uses chat history for sharper automated tagging. */
+export function buildEntryWithHistory(
+  dirName: string,
+  raw: any,
+  cwd: string,
+  overrides: SessionMetaOverrides,
+  chatHistory: string | undefined,
+  fallbackNow: number,
+): SessionListEntry {
+  const id = (raw?.info?.id as string) ?? dirName;
+  const sessCwd = (raw?.info?.cwd as string) ?? cwd;
+  const rawSummary = typeof raw?.session_summary === "string" ? raw.session_summary : "";
+  const updatedAt = parseTimestamp(raw?.updated_at, fallbackNow);
+  const createdAt = parseTimestamp(raw?.created_at, updatedAt);
+  const numMessages = typeof raw?.num_messages === "number" ? raw.num_messages : 0;
+  const modelId = typeof raw?.current_model_id === "string" ? raw.current_model_id : undefined;
+  const agentName = typeof raw?.agent_name === "string" ? raw.agent_name : undefined;
+  const override = overrides[id];
+  const customName = override?.customName?.trim() || undefined;
+  const queries = chatHistory ? extractUserQueries(chatHistory) : [];
+  const realQueries = queries.filter((q) => !isPrimerText(q));
+  const autoTag = resolveAutoTag(rawSummary, override?.autoTag, {
+    summary: rawSummary,
+    firstQuery: realQueries[0],
+    agentName,
+    primerOnly: queries.some((q) => isPrimerText(q)) && realQueries.length === 0,
+  });
+  const baseName = displayBaseName(rawSummary, customName, realQueries[0], updatedAt);
+  const displayName = customName ? baseName : displayNameWithAutoTag(baseName, autoTag);
+  return {
+    id,
+    cwd: sessCwd,
+    displayName,
+    rawSummary,
+    customName,
+    updatedAt,
+    createdAt,
+    numMessages,
+    modelId,
+    autoTag,
+  };
+}
+
+/** Persistable tag for a session — skips re-classifying when summary already carries a prefix. */
+export function inferStoredAutoTag(
+  summary: string,
+  stored: AutoTag | undefined,
+  chatHistory?: string,
+  agentName?: string,
+): AutoTag | undefined {
+  if (stored) return stored;
+  if (parseAutoTag(summary)) return parseAutoTag(summary);
+  const queries = chatHistory ? extractUserQueries(chatHistory) : [];
+  const realQueries = queries.filter((q) => !isPrimerText(q));
+  return classifyAutoTag({
+    summary,
+    firstQuery: realQueries[0],
+    agentName,
+    primerOnly: queries.some((q) => isPrimerText(q)) && realQueries.length === 0,
+  });
 }
 
 export interface SessionIndexEntry {
   /** Directory name = grok session id. */
   id: string;
-  /** Modification time of the session's `summary.json` (ms). A cheap proxy for last activity —
-   *  grok rewrites that file (which also holds `updated_at`) on every turn. */
+  /** Modification time of the session's `summary.json` (ms). Used for cache invalidation and
+   *  session ordering. Must track real last activity — see {@link repairPollutedSummaryMtimes}. */
   mtimeMs: number;
+}
+
+export interface RepairMtimesDeps {
+  fs: FsLike & { utimesSync?(path: string, atime: number, mtime: number): void };
+  grokHome: string;
+  cwd: string;
+  /** Mtime more than this many ms ahead of `updated_at` is treated as an artificial bump. */
+  skewMs?: number;
+  log?: (msg: string) => void;
 }
 
 export interface IndexDeps {
@@ -183,6 +295,49 @@ export function indexSessions(deps: IndexDeps): SessionIndexEntry[] {
   return out;
 }
 
+/** Restore `summary.json` mtimes that were bumped without a matching `updated_at` change.
+ *  Tagging passes (`persistInferredAutoTags`, `tag-sessions.py`) rewrite `session_summary`
+ *  in place; that advances mtime to "now" while `updated_at` stays at the real last-turn
+ *  time, so `indexSessions`' stat-only ordering surfaces only recently-tagged sessions and
+ *  pagination looks like history stops ~10h ago. Grok's own writes advance both together,
+ *  so mtime ≈ updated_at for untouched sessions; a large skew is the pollution signal. */
+export function repairPollutedSummaryMtimes(deps: RepairMtimesDeps): number {
+  const { fs, grokHome, cwd, log } = deps;
+  const skewMs = deps.skewMs ?? 5 * 60 * 1000;
+  if (!fs.utimesSync) return 0;
+  const dir = sessionsDirFor(grokHome, cwd);
+  if (!fs.existsSync(dir)) return 0;
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch (e) {
+    log?.(`[sessions] repair: failed to read ${dir}: ${(e as Error).message}`);
+    return 0;
+  }
+  let repaired = 0;
+  for (const name of names) {
+    const summaryPath = path.join(dir, name, "summary.json");
+    let st: { mtimeMs: number };
+    let raw: any;
+    try {
+      st = fs.statSync(summaryPath);
+      raw = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+    } catch {
+      continue;
+    }
+    const updatedAt = parseTimestamp(raw?.updated_at, 0);
+    if (!updatedAt || st.mtimeMs <= updatedAt + skewMs) continue;
+    try {
+      const sec = updatedAt / 1000;
+      fs.utimesSync(summaryPath, sec, sec);
+      repaired++;
+    } catch (e) {
+      log?.(`[sessions] repair: could not utimes ${name}: ${(e as Error).message}`);
+    }
+  }
+  return repaired;
+}
+
 export interface ReadEntriesDeps {
   fs: FsLike;
   grokHome: string;
@@ -203,14 +358,25 @@ export function readSessionEntries(deps: ReadEntriesDeps): SessionListEntry[] {
   const out: SessionListEntry[] = [];
   for (const id of ids) {
     const summaryPath = path.join(dir, id, "summary.json");
+    const historyPath = path.join(dir, id, "chat_history.jsonl");
     let raw: any;
+    let chatHistory: string | undefined;
     try {
       raw = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
     } catch (e) {
       log?.(`[sessions] could not read summary.json for ${id}: ${(e as Error).message}`);
       continue;
     }
-    out.push(buildEntry(id, raw, cwd, overrides, now));
+    try {
+      chatHistory = fs.readFileSync(historyPath, "utf8");
+    } catch {
+      chatHistory = undefined;
+    }
+    out.push(
+      chatHistory
+        ? buildEntryWithHistory(id, raw, cwd, overrides, chatHistory, now)
+        : buildEntry(id, raw, cwd, overrides, now),
+    );
   }
   return out;
 }
@@ -383,11 +549,12 @@ export function clearSessions(deps: ClearDeps): string[] {
 }
 
 /** Default node fs adapter for production use. */
-export const defaultFs: FsLike = {
+export const defaultFs: FsLike & { utimesSync(path: string, atime: number, mtime: number): void } = {
   existsSync: nodeFs.existsSync,
   readdirSync: (p) => nodeFs.readdirSync(p) as string[],
   readFileSync: (p, enc) => nodeFs.readFileSync(p, enc),
   statSync: (p) => nodeFs.statSync(p),
+  utimesSync: (p, atime, mtime) => nodeFs.utimesSync(p, atime, mtime),
   rmSync: (nodeFs as any).rmSync
     ? (p, opts) => (nodeFs as any).rmSync(p, opts)
     : undefined,
