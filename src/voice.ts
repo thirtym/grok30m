@@ -29,72 +29,16 @@ export interface SttResult {
   words?: SttWord[];
 }
 
-const AUTH_EXPIRY_SKEW_MS = 60_000; // refuse a token within a minute of expiry
-
-/** Parse an `expires_at` (number, numeric-string, or ISO/date string) to epoch
- *  ms, tolerating seconds- vs ms-epoch. Null when absent or unparseable. */
-function parseAuthExpiryMs(raw: unknown): number | null {
-  if (raw == null) return null;
-  let n: number;
-  if (typeof raw === "number") n = raw;
-  else {
-    const str = String(raw).trim();
-    // A bare numeric string ("1700000000") is an epoch, NOT a date — Date.parse
-    // returns NaN for it in Node, which would read as "never expires" (#51/Codex).
-    n = /^\d+(\.\d+)?$/.test(str) ? Number(str) : Date.parse(str);
-  }
-  if (!Number.isFinite(n)) return null;
-  return n < 1e12 ? n * 1000 : n; // < ~2001 in ms ⇒ it was seconds-epoch
-}
-
-/** True when the top-level auth.json entry key (`<issuer-url>::<uuid>`) is an
- *  xAI issuer — so we never forward some unrelated `.key` to xAI's STT endpoint. */
-function isXaiIssuerKey(topKey: string): boolean {
-  const issuer = String(topKey).split("::")[0];
-  try {
-    const host = new URL(issuer).host.toLowerCase();
-    return host === "x.ai" || host.endsWith(".x.ai");
-  } catch { return false; }
-}
-
-/**
- * Pull the reusable API token the grok CLI stores after `grok login`, from the
- * text of `~/.grok/auth.json` — the same value a user can paste into the Voice
- * key field (confirmed working for STT, #51). The file is an object keyed by an
- * `<issuer-url>::<uuid>`; each entry carries a `key` (the token) and an optional
- * `expires_at`. Only xAI-issued entries are considered, and a KNOWN-expired
- * token is refused (returns undefined) so the mic doesn't look configured then
- * 401 mid-recording — a token with an absent/unparseable expiry is still used.
- * Pure; `now` is injectable for tests. Undefined on parse failure or when no
- * usable, non-expired xAI entry exists.
- */
-export function extractGrokAuthKey(authJsonText: string, now: number = Date.now()): string | undefined {
-  let obj: any;
-  try { obj = JSON.parse(authJsonText); } catch { return undefined; }
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return undefined;
-  const keyOf = (e: any): string => (e && typeof e.key === "string" ? e.key.trim() : "");
-  const notExpired = (e: any): boolean => {
-    const ms = parseAuthExpiryMs(e?.expires_at);
-    return ms == null || ms - AUTH_EXPIRY_SKEW_MS > now; // absent/unparseable ⇒ try it
-  };
-  const chosen = Object.entries(obj)
-    .filter(([topKey, e]) => isXaiIssuerKey(topKey) && keyOf(e) && notExpired(e))
-    .map(([, e]) => e)[0];
-  return chosen ? keyOf(chosen) : undefined;
-}
-
 /**
  * Resolve the xAI key used for Speech-to-Text. Order: the explicit
- * `grok.voiceApiKey` setting wins; then env vars (the caller passes a map that
- * layers workspace .env over process.env — a dedicated `GROK_VOICE_API_KEY` is
- * preferred over the generic `XAI_API_KEY`); finally `authKey`, the token the
- * CLI stored at `grok login` (`~/.grok/auth.json`, via `extractGrokAuthKey`), so
- * Voice works without a separate paid key (#51).
+ * `grok.voiceApiKey` setting wins; otherwise fall back to env vars (the caller
+ * passes a map that should layer workspace .env over process.env). A dedicated
+ * `GROK_VOICE_API_KEY` is preferred over the generic `XAI_API_KEY` so a
+ * voice-only key can be kept separate from the CLI's own key mapping.
  */
 export function resolveVoiceKey(opts: {
   setting?: string;
   env?: Record<string, string | undefined>;
-  authKey?: string;
 }): string | undefined {
   const setting = (opts.setting || "").trim();
   if (setting) return setting;
@@ -103,8 +47,6 @@ export function resolveVoiceKey(opts: {
     const v = (env[name] || "").trim();
     if (v) return v;
   }
-  const authKey = (opts.authKey || "").trim();
-  if (authKey) return authKey;
   return undefined;
 }
 
@@ -202,92 +144,9 @@ export interface SttStreamParams {
   sampleRate?: number;
   encoding?: string;
   interimResults?: boolean;
-  /** Optional language code. The streaming endpoint uses this to enable
-   *  Inverse Text Normalization; omitting it preserves spoken-form text. */
-  language?: string;
   /** Bias terms (e.g. the "grok send" send-phrase) so the model spells them
    *  right — directly fixes mishearings. Repeatable; ≤100 terms, ≤50 chars each. */
   keyterms?: string[];
-}
-
-/** The documented keyterm ceiling ("≤100 terms, ≤50 chars each"). */
-export const MAX_STT_KEYTERMS = 100;
-/** Per-term character cap, matching the SpaceXAI streaming keyterm limit. */
-export const MAX_VOICE_KEYTERM_CHARS = 50;
-
-/** Trim a send-phrase edit. Empty disables hands-free send. */
-export function sanitizeVoiceSendPhrase(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-/** Normalize a user-edited dictionary: strings only, trimmed, 50-char, unique, capped. */
-export function sanitizeVoiceKeyterms(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const item of value) {
-    if (typeof item !== "string") continue;
-    const term = item.trim().slice(0, MAX_VOICE_KEYTERM_CHARS);
-    if (!term) continue;
-    const key = term.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(term);
-    if (out.length >= MAX_STT_KEYTERMS) break;
-  }
-  return out;
-}
-
-export interface VoiceSettingInspect<T> {
-  defaultValue?: T;
-  globalValue?: T;
-  workspaceValue?: T;
-  workspaceFolderValue?: T;
-}
-
-/**
- * Write the scope that produced the displayed voice value.
- *
- * Settings show the resource-effective config (`voiceSettingForRepo`). A
- * workspace / folder override is what the user is looking at, so an edit must
- * update that override — writing User/global would leave the displayed value
- * unchanged. Repos outside the window workspace already display User/default,
- * so they stay on global even if the open window has its own override.
- */
-export function voiceSettingWriteTarget(
-  inspect: VoiceSettingInspect<unknown> | undefined,
-  repoIsInWorkspace: boolean,
-): "global" | "workspace" | "workspaceFolder" {
-  if (!repoIsInWorkspace) return "global";
-  if (inspect?.workspaceFolderValue !== undefined) return "workspaceFolder";
-  if (inspect?.workspaceValue !== undefined) return "workspace";
-  return "global";
-}
-
-/**
- * Resolve a voice setting for a session cwd. VS Code includes window-workspace
- * values even when `getConfiguration` is scoped to a resource outside that
- * workspace, so an external AFK Pilot repo must fall back to User/default
- * values instead of inheriting another repo's project vocabulary.
- */
-export function voiceSettingForRepo<T>(
-  effectiveValue: T | undefined,
-  inspected: VoiceSettingInspect<T> | undefined,
-  repoIsInWorkspace: boolean,
-  fallback: T,
-): T {
-  if (repoIsInWorkspace) return effectiveValue ?? fallback;
-  return inspected?.globalValue ?? inspected?.defaultValue ?? fallback;
-}
-
-/** Assemble recognition-bias terms in priority order. The send phrase is
- *  behavior-critical, and the built-in product term preserves existing bias;
- *  user vocabulary fills the remaining service-supported slots. */
-export function buildSttKeyterms(sendPhrase: string, userTerms: readonly string[] = []): string[] {
-  const terms = [sendPhrase, "Grok", ...userTerms]
-    .map((term) => (term || "").trim())
-    .filter(Boolean);
-  return [...new Set(terms)].slice(0, MAX_STT_KEYTERMS);
 }
 
 /** Build the streaming STT WebSocket URL. Config rides in query params (the
@@ -297,16 +156,9 @@ export function buildSttStreamUrl(params: SttStreamParams = {}): string {
   qs.set("sample_rate", String(params.sampleRate ?? 16000));
   qs.set("encoding", params.encoding ?? "pcm");
   qs.set("interim_results", params.interimResults === false ? "false" : "true");
-  const language = params.language?.trim();
-  if (language) qs.set("language", language);
-  let appended = 0;
   for (const term of params.keyterms ?? []) {
-    if (appended >= MAX_STT_KEYTERMS) break; // enforce the doc'd cap, not just state it
     const t = (term || "").trim();
-    if (t) {
-      qs.append("keyterm", t.slice(0, 50));
-      appended++;
-    }
+    if (t) qs.append("keyterm", t.slice(0, 50));
   }
   return `${STT_STREAM_ENDPOINT}?${qs.toString()}`;
 }
@@ -351,7 +203,7 @@ export function parseSttResponse(json: any): SttResult {
 /** Map an STT HTTP failure to a message worth showing the user. */
 export function classifySttError(status: number, body?: string): string {
   if (status === 401 || status === 403) {
-    return "Voice transcription was rejected (401/403): the xAI key is missing, invalid, or expired. If you're relying on your `grok login`, try signing in again (`grok logout` then `grok login`); or set grok.voiceApiKey, or GROK_VOICE_API_KEY / XAI_API_KEY in your workspace .env (get a key at console.x.ai).";
+    return "Voice transcription was rejected (401/403): the xAI API key is missing or invalid. Set grok.voiceApiKey, or GROK_VOICE_API_KEY / XAI_API_KEY in your workspace .env (get a key at console.x.ai).";
   }
   if (status === 429) return "Voice transcription is rate-limited (429). Wait a moment and try again.";
   if (status === 413) return "The recording is too large to transcribe (413). Record a shorter message.";
@@ -369,23 +221,6 @@ export function cleanTranscript(text: string): string {
 }
 
 export const DEFAULT_SEND_PHRASE = "grok send";
-
-/**
- * Identity of a `voiceConfigured` frame. Watcher noise under `~/.grok` posts
- * identical frames; destinations skip when this matches the last one they got.
- * Phrase and keyterms belong here — a prefs change must still go out.
- */
-export function voiceConfiguredFingerprint(payload: {
-  value: boolean;
-  sendPhrase?: string;
-  keyterms?: readonly string[];
-}): string {
-  return JSON.stringify({
-    value: !!payload.value,
-    sendPhrase: typeof payload.sendPhrase === "string" ? payload.sendPhrase : "",
-    keyterms: Array.isArray(payload.keyterms) ? [...payload.keyterms] : [],
-  });
-}
 
 export interface VoiceCommandResult {
   /** The transcript with a trailing send-phrase stripped off. */

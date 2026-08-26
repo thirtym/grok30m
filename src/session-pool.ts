@@ -25,12 +25,6 @@ export interface ReapCandidate {
   lastActiveAt: number;
   /** The currently-focused session — never reaped. */
   focused: boolean;
-  /** Currently rendered by at least one remote client. */
-  remoteVisible?: boolean;
-  /** Agent-less replacements and draft-bearing sessions are durable UI state,
-   * not spare idle processes. */
-  needsProvider?: boolean;
-  hasDraft?: boolean;
 }
 
 export interface ReapPolicy {
@@ -42,30 +36,9 @@ export interface ReapPolicy {
   now: number;
 }
 
-export function buildReapCandidates<T extends Pick<ReapCandidate, "status" | "lastActiveAt"> & {
-  needsProvider?: boolean;
-  strandedDraft?: string;
-  queuedSends?: readonly unknown[];
-}>(
-  sessions: Iterable<T>,
-  focused: T,
-  isRemoteVisible: (session: T) => boolean,
-): Array<ReapCandidate & { session: T }> {
-  return [...sessions].map((session) => ({
-    session,
-    status: session.status,
-    lastActiveAt: session.lastActiveAt,
-    focused: session === focused,
-    remoteVisible: isRemoteVisible(session),
-    needsProvider: session.needsProvider,
-    hasDraft: !!session.strandedDraft || !!session.queuedSends?.length,
-  }));
-}
-
 /** A session is reap-eligible only if it isn't focused and isn't mid-work. */
 function isEligible(c: ReapCandidate): boolean {
-  return !c.focused && !c.needsProvider && !c.hasDraft &&
-    (c.status === "idle" || c.status === "done" || c.status === "error");
+  return !c.focused && (c.status === "idle" || c.status === "done" || c.status === "error");
 }
 
 /**
@@ -78,8 +51,8 @@ export function selectReapable<T extends ReapCandidate>(candidates: T[], policy:
   const eligible = candidates.filter(isEligible);
   const reap = new Set<T>();
 
-  // 1. TTL: a connected remote view protects an otherwise-idle session.
-  for (const c of eligible.filter((candidate) => !candidate.remoteVisible)) {
+  // 1. TTL: anything eligible that's been idle past the window.
+  for (const c of eligible) {
     if (now - c.lastActiveAt >= idleTtlMs) reap.add(c);
   }
 
@@ -90,10 +63,7 @@ export function selectReapable<T extends ReapCandidate>(candidates: T[], policy:
   if (liveCount > maxLive) {
     const lru = eligible
       .filter((c) => !reap.has(c))
-      .sort((a, b) =>
-        Number(!!a.remoteVisible) - Number(!!b.remoteVisible) ||
-        a.lastActiveAt - b.lastActiveAt
-      );
+      .sort((a, b) => a.lastActiveAt - b.lastActiveAt);
     for (const c of lru) {
       if (liveCount <= maxLive) break;
       reap.add(c);
@@ -110,11 +80,10 @@ export function selectReapable<T extends ReapCandidate>(candidates: T[], policy:
  *   working → needs-you → unread (error? → error) → none (gray default).
  *
  * `working`/`needs-you` come from the live session's `status`; `unread`/`error`
- * come from a *persisted* flag set when a turn finishes while no local or remote
- * view owns the session, and cleared when any view opens it — so green/red survive
- * both reaping and a reload (they aren't tied to the live process). Everything
- * else — idle, already seen, cold, loaded-from-disk — collapses to `none`, a single
- * gray "at rest".
+ * come from a *persisted* flag set when a turn finishes while the session isn't
+ * focused, and cleared when it's opened — so green/red survive both reaping and a
+ * reload (they aren't tied to the live process). Everything else — idle, already
+ * read, cold, loaded-from-disk — collapses to `none`, a single gray "at rest".
  */
 export type Dot = "working" | "needs-you" | "unread" | "error" | "none";
 

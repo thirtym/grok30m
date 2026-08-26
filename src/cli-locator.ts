@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import * as path from "node:path";
@@ -35,20 +35,25 @@ export function locateGrokCli(configuredPath: string): string | undefined {
   return undefined;
 }
 
-/** Whether this activation follows a previously-recorded extension version. */
+/**
+ * Decide whether to silently auto-update the grok CLI because *our extension* was
+ * upgraded since the last run. True only when a prior version was recorded (so a
+ * fresh install never triggers an update — that's the "not-first-run" rule) and it
+ * differs from the current extension version. Pure so it's unit-testable.
+ */
 export function extensionWasUpgraded(lastSeen: string | undefined, current: string): boolean {
   return !!lastSeen && !!current && lastSeen !== current;
 }
 
 /**
- * Oldest grok CLI whose ACP behavior this extension supports. Native
- * exit_plan_mode verdicts are part of this contract, so every platform must
- * meet this floor. It is also the Windows-verified reactive recovery target.
+ * The supported grok CLI version the extension pins Windows to. The `agent stdio`
+ * #22 regression broke **0.2.61–0.2.70**; the fix landed in **0.2.71** and is now on
+ * the **stable** channel as **0.2.72** (the supported build here), verified end-to-end
+ * via the session/new probe + the live ACP gate. We pin a broken build to this. Bump
+ * it when a newer Windows-verified build ships — re-verify with the **session/new**
+ * probe, not just `initialize`.
  */
-export const GROK_REQUIRED_VERSION = "0.2.117";
-
-// Reactive Windows stdio recovery lands on the same fully-supported baseline.
-export const GROK_STDIO_DOWNGRADE_TARGET = GROK_REQUIRED_VERSION;
+export const GROK_STDIO_DOWNGRADE_TARGET = "0.2.72";
 
 /**
  * Parse a grok `--version` banner ("grok 0.2.64 (9a9ac25b10) [stable]") into a
@@ -60,230 +65,44 @@ export function parseGrokVersion(versionOutput: string): [number, number, number
   return [Number(m[1]), Number(m[2]), Number(m[3])];
 }
 
+/**
+ * grok CLI **0.2.61–0.2.70** shipped a Windows-only `agent stdio` regression: the
+ * agent didn't read stdin lines until EOF (which never comes for a live client), so an
+ * ACP startup request timed out and the process was torn down ("exited with code
+ * null"). It mutated across builds — 0.2.61–0.2.64 hung at `initialize`;
+ * 0.2.67/0.2.69/0.2.70 answered `initialize` but hung at `session/new` — and was
+ * **fixed in 0.2.71**, now on stable as **0.2.72** (`GROK_STDIO_DOWNGRADE_TARGET`),
+ * verified via the session/new probe + the live ACP gate. See issue #22 and
+ * `research/stdio-eof-regression.md`.
+ *
+ * Detect the bounded broken range **0.2.61–0.2.70** (Windows only) so the host pins
+ * those builds to the supported 0.2.72 before spawning. The fix sits *above* the broken
+ * range, so this is a closed range — not an open-ended "anything newer" check: both
+ * 0.2.71+ and <=0.2.60 are fine. A *future* still-broken build above 0.2.72 is caught
+ * reactively (`shouldReactivelyDowngrade`). Pure.
+ */
+export function isStdioBrokenGrokVersion(versionOutput: string, platform: NodeJS.Platform): boolean {
+  if (platform !== "win32") return false;
+  const v = parseGrokVersion(versionOutput);
+  if (!v) return false;
+  const [maj, min, pat] = v;
+  return maj === 0 && min === 2 && pat >= 61 && pat <= 70;
+}
+
 /** Compare two `[major, minor, patch]` tuples: <0, 0, or >0. Pure. */
 export function compareVersionTuple(a: [number, number, number], b: [number, number, number]): number {
   return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 }
 
-/** Windows grok 0.2.61-0.2.70 can hang before ACP startup completes. */
-export function isStdioBrokenGrokVersion(versionOutput: string, platform: NodeJS.Platform): boolean {
-  if (platform !== "win32") return false;
-  const version = parseGrokVersion(versionOutput);
-  if (!version) return false;
-  const [major, minor, patch] = version;
-  return major === 0 && minor === 2 && patch >= 61 && patch <= 70;
-}
-
-/** Whether a parseable installed CLI is older than the behavior baseline. */
-export function isGrokVersionBelowRequired(versionOutput: string): boolean {
-  const installed = parseGrokVersion(versionOutput);
-  const required = parseGrokVersion(GROK_REQUIRED_VERSION)!;
-  return !!installed && compareVersionTuple(installed, required) < 0;
-}
-
 /**
- * Pause between an empty/unparseable `grok --version` and one retry. A fresh
- * binary's first spawn is often the slow one (Windows AV scanning); a second
- * attempt a beat later is usually instant. Only "no answer" retries — a
- * parseable below-floor banner is a stable answer and must not be re-probed.
- */
-export const VERSION_PROBE_RETRY_BACKOFF_MS = 400;
-
-/**
- * Read version with one short retry when the first attempt yields nothing
- * parseable. `readOnce` / `sleep` are injected so unit tests stay process-free.
- */
-export async function probeVersionOutput(
-  readOnce: () => Promise<string>,
-  sleep: (ms: number) => Promise<void>,
-  backoffMs = VERSION_PROBE_RETRY_BACKOFF_MS,
-): Promise<string> {
-  const first = (await readOnce())?.trim() ?? "";
-  if (parseGrokVersion(first)) return first;
-  await sleep(backoffMs);
-  return (await readOnce())?.trim() ?? "";
-}
-
-/**
- * Last successfully parsed `grok --version` banner for one resolved CLI path.
- * `mtimeMs` + `size` are the binary's identity: a replaced file must not inherit
- * the previous verdict. Persisted under {@link CLI_VERSION_CACHE_KEY}.
- */
-export type CachedCliVersion = {
-  mtimeMs: number;
-  size: number;
-  versionOutput: string;
-};
-
-/** Resolved-path → last verified banner. Path keys are {@link cliVersionCacheKey}. */
-export type CliVersionCache = Record<string, CachedCliVersion>;
-
-export type CliBinaryIdentity = {
-  path: string;
-  mtimeMs: number;
-  size: number;
-};
-
-/** globalState key for {@link CliVersionCache}. Not in DISK_KEYS — this is a local binary. */
-export const CLI_VERSION_CACHE_KEY = "grok.cliVersionCache";
-
-/**
- * Unverified-probe copy. Names the likely cause (failed/timed-out check) and the
- * fix (pick Plan again / reload) so it does not read as a permanent "too old".
- */
-export const PLAN_MODE_UNVERIFIED_REASON =
-  `Could not verify the installed Grok CLI version, so Plan mode is unavailable. ` +
-  `The version check failed or timed out — a first run after install can be slow. ` +
-  `Pick Plan again or reload the window to retry. ` +
-  `Once verified, Plan requires ${GROK_REQUIRED_VERSION} or newer.`;
-
-/** Stable cache key for a resolved CLI path (Windows is case-insensitive). */
-export function cliVersionCacheKey(cliPath: string): string {
-  const normalized = path.normalize(cliPath);
-  return IS_WIN ? normalized.toLowerCase() : normalized;
-}
-
-function defaultCliStat(cliPath: string): { mtimeMs: number; size: number } {
-  const st = statSync(cliPath);
-  return { mtimeMs: st.mtimeMs, size: st.size };
-}
-
-/** Identity of the file at `cliPath`, or undefined when it cannot be measured. */
-export function readCliBinaryIdentity(
-  cliPath: string,
-  stat: (p: string) => { mtimeMs: number; size: number } = defaultCliStat,
-): CliBinaryIdentity | undefined {
-  if (!cliPath) return undefined;
-  try {
-    const st = stat(cliPath);
-    if (!Number.isFinite(st.mtimeMs) || !Number.isFinite(st.size) || st.size < 0) return undefined;
-    return { path: cliVersionCacheKey(cliPath), mtimeMs: st.mtimeMs, size: st.size };
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Cached banner only when the on-disk file is still the one we measured.
- * Missing identity or a mtime/size mismatch is a miss — never a guess.
- */
-export function lookupCachedCliVersion(
-  cache: CliVersionCache | undefined,
-  identity: CliBinaryIdentity | undefined,
-): string | undefined {
-  if (!cache || !identity) return undefined;
-  const entry = cache[identity.path];
-  if (!entry || typeof entry !== "object") return undefined;
-  if (entry.mtimeMs !== identity.mtimeMs || entry.size !== identity.size) return undefined;
-  if (typeof entry.versionOutput !== "string" || !parseGrokVersion(entry.versionOutput)) return undefined;
-  return entry.versionOutput;
-}
-
-/** Merge a freshly parsed banner into the store. Undefined when there is nothing to persist. */
-export function storeCachedCliVersion(
-  cache: CliVersionCache | undefined,
-  identity: CliBinaryIdentity | undefined,
-  versionOutput: string,
-): CliVersionCache | undefined {
-  if (!identity || !parseGrokVersion(versionOutput)) return undefined;
-  return {
-    ...(cache ?? {}),
-    [identity.path]: {
-      mtimeMs: identity.mtimeMs,
-      size: identity.size,
-      versionOutput,
-    },
-  };
-}
-
-/**
- * Plan-mode gate from a `grok --version` banner. Fail-closed when the banner
- * cannot be parsed (`verified:false` — re-checkable later) or when the install
- * is below the floor (`verified:true` — latched for that process). A cache
- * substitute may keep `available` but is never `verified`. Pure.
- */
-export type PlanModeAvailabilityDecision =
-  | { available: true; verified: boolean }
-  | { available: false; verified: true; installed: string; reason: string }
-  | { available: false; verified: false; reason: string };
-
-export function decidePlanModeAvailability(versionOutput: string): PlanModeAvailabilityDecision {
-  const parsed = parseGrokVersion(versionOutput);
-  if (!parsed) {
-    // Lead with "could not verify" — leading with the version floor reads as
-    // "your CLI is too old" when the probe simply did not answer (#105).
-    return {
-      available: false,
-      verified: false,
-      reason: PLAN_MODE_UNVERIFIED_REASON,
-    };
-  }
-  const installed = parsed.join(".");
-  if (isGrokVersionBelowRequired(versionOutput)) {
-    return {
-      available: false,
-      verified: true,
-      installed,
-      reason:
-        `Plan mode requires Grok CLI ${GROK_REQUIRED_VERSION} or newer; ` +
-        `installed version is ${installed}.`,
-    };
-  }
-  return { available: true, verified: true };
-}
-
-export type PlanModeAvailabilityResolution = {
-  decision: PlanModeAvailabilityDecision;
-  /** Present only after a parseable live probe, so the host can persist it. */
-  nextCache?: CliVersionCache;
-  usedCache: boolean;
-  /** Live banner, else the matching cache banner, else the unparseable probe text. */
-  versionOutput: string;
-};
-
-/**
- * Probe (one retry on empty/unparseable) then decide Plan availability.
- * A failed probe may use {@link lookupCachedCliVersion}; a successful probe
- * always wins and is what gets written back. A cache hit keeps that
- * availability but is never `verified` — the host must not latch Plan from a
- * stand-in banner. Injected I/O keeps this process-free.
- */
-export async function resolvePlanModeAvailability(opts: {
-  readOnce: () => Promise<string>;
-  sleep: (ms: number) => Promise<void>;
-  identity?: CliBinaryIdentity;
-  cache?: CliVersionCache;
-  backoffMs?: number;
-}): Promise<PlanModeAvailabilityResolution> {
-  const versionOutput = await probeVersionOutput(opts.readOnce, opts.sleep, opts.backoffMs);
-  if (parseGrokVersion(versionOutput)) {
-    return {
-      decision: decidePlanModeAvailability(versionOutput),
-      nextCache: storeCachedCliVersion(opts.cache, opts.identity, versionOutput),
-      usedCache: false,
-      versionOutput,
-    };
-  }
-  const cached = lookupCachedCliVersion(opts.cache, opts.identity);
-  if (cached) {
-    const fromBanner = decidePlanModeAvailability(cached);
-    // Cache is a substitute, not a live reading — keep availability, drop latch.
-    const decision: PlanModeAvailabilityDecision = fromBanner.available
-      ? { available: true, verified: false }
-      : { available: false, verified: false, reason: PLAN_MODE_UNVERIFIED_REASON };
-    return { decision, usedCache: true, versionOutput: cached };
-  }
-  return { decision: decidePlanModeAvailability(versionOutput), usedCache: false, versionOutput };
-}
-
-/**
- * Decision for "Update Grok Build CLI" (manual and extension-upgrade updates),
- * given the installed version + platform.
+ * Decision for the "Update Grok Build CLI" action (manual menu *and* the silent
+ * on-upgrade update), given the installed version + platform.
  *
  * The #22 Windows update pause is **lifted** now that 0.2.71 fixes the regression —
- * updates proceed normally on every platform (to `latest`). The behavior floor
- * handles old builds; reactive recovery handles a newer Windows build that
- * actually exhibits the stdio failure.
+ * updates proceed normally on every platform (to `latest`). The #22 safety net still
+ * stands behind this: the proactive pin (`isStdioBrokenGrokVersion` → 0.2.61–0.2.70)
+ * and the reactive downgrade (`shouldReactivelyDowngrade` → builds above 0.2.72)
+ * recover a session if an update ever lands on a still-broken build.
  */
 export interface GrokUpdatePolicy {
   /** May the update run at all? */
@@ -303,15 +122,19 @@ export function grokUpdatePolicy(_versionOutput: string, _platform: NodeJS.Platf
  * Should the host REACTIVELY downgrade the CLI after an *observed* `agent stdio`
  * init failure (handshake timeout / "exited code null")?
  *
- * The proactive bounded-range pin covers known-broken Windows builds before
- * spawning. This is the evidence-driven backstop for a future still-broken build
- * above the Windows-verified target. It fires on the real failure (`initialize` or
- * `session/new`), not a version guess, and restores the supported baseline.
+ * The proactive `isStdioBrokenGrokVersion` covers the known broken range
+ * (0.2.61–0.2.70) before spawning. This is the evidence-driven backstop for a *future*
+ * still-broken build **above** the supported 0.2.72 (no static range can predict it),
+ * or for cases the proactive pin couldn't run (version read failed, or the binary was
+ * locked so `grok update` couldn't rename it). It fires on the real failure
+ * (`initialize` *or* `session/new`), not a version guess, and pins back to 0.2.72.
  *
- * Windows-only (the regression is). A build at/below the target is never
- * reactively replaced; that is the loop guard once recovery lands. A later
- * manual upgrade above the target re-arms recovery. Unparseable version means
- * leave it alone. Pure.
+ * Windows-only (the regression is). A build at/below 0.2.72 is never downgraded —
+ * that's the loop guard: once the pin lands the version is exactly the target, so a
+ * subsequent failure (some other cause) can't trigger another downgrade. A later
+ * *manual* re-upgrade pushes the version back above the target, so a fresh failure
+ * re-triggers the downgrade — exactly the "they upgraded anyway, fix it again"
+ * case. Unparseable version ⇒ leave alone. Pure.
  */
 export function shouldReactivelyDowngrade(versionOutput: string, platform: NodeJS.Platform): boolean {
   if (platform !== "win32") return false;

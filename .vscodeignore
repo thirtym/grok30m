@@ -6,104 +6,11 @@ mcps/**
 research/**
 test/**
 src/**
-integration/**
-out-integration/**
-.vscode-test.mjs
-.vscode-test/**
 tsconfig.json
-# ALLOWLIST — this excludes every dependency and re-includes them one by one.
-# out/ is plain tsc output, not a bundle, so anything `require`d at runtime must
-# be named here or the extension installs and then fails to load. Adding a
-# runtime dependency means adding a line here too; nothing warns you.
 node_modules/**
 !node_modules/ws/**
-!node_modules/jpeg-js/**
-# Adapter files only. `!…/codex-acp/**` would also pack its nested
-# node_modules (diff@9, open@11 — vsce: a later exclude cannot undo a negate).
-# @openai/codex's platform binaries hoist to node_modules/@openai and are kept
-# out by the top-level node_modules/** exclude plus check-vsix-requires.mjs's
-# packed-deps allowlist. dist/index.js is a bundle; the host always sets
-# CODEX_PATH, so the declared deps are install-only, not vsix payload.
-!node_modules/@agentclientprotocol/codex-acp/package.json
-!node_modules/@agentclientprotocol/codex-acp/dist/**
-!node_modules/@agentclientprotocol/codex-acp/LICENSE
-# Claude adapter is unbundled ESM. Pack its JS tree, never the optional
-# native Anthropic platform binaries (~300MB) and never the SDK's .d.ts
-# (types-only; they do not execute).
-!node_modules/@agentclientprotocol/claude-agent-acp/package.json
-!node_modules/@agentclientprotocol/claude-agent-acp/dist/**
-!node_modules/@agentclientprotocol/claude-agent-acp/LICENSE
-!node_modules/@agentclientprotocol/sdk/package.json
-!node_modules/@agentclientprotocol/sdk/dist/**
-!node_modules/@agentclientprotocol/sdk/LICENSE-APACHE
-!node_modules/@anthropic-ai/claude-agent-sdk/package.json
-!node_modules/@anthropic-ai/claude-agent-sdk/*.mjs
-!node_modules/@anthropic-ai/claude-agent-sdk/*.js
-!node_modules/@anthropic-ai/claude-agent-sdk/LICENSE*
-!node_modules/zod/package.json
-!node_modules/zod/index.js
-!node_modules/zod/index.cjs
-!node_modules/zod/index.d.ts
-!node_modules/zod/index.d.cts
-!node_modules/zod/v3/**
-!node_modules/zod/v4/**
 .git/**
 **/*.map
 **/*.ts
-# Re-include only top-level compiled extension JS (out/*.js).
-# Do NOT use `!out/**/*.js` — that also un-ignores out/desktop/** and a later
-# `out/desktop/**` rule does not re-exclude those files under vsce's matcher.
-!out/*.js
-# Desktop Electron app — never ship in the VS Code extension vsix.
-out/desktop/**
-# …except the two modules the EXTENSION itself requires at runtime. Not a
-# convenience: out/sidebar.js requires ./desktop/desktop-policy, which requires
-# ./file-tree, and 3.2.0-3.2.5 all shipped without them. Activation threw
-# "Cannot find module './desktop/desktop-policy'" before a single command was
-# registered, so every Grok command reported "not found" and the sidebar never
-# appeared (#101).
-#
-# This list is enforced, not maintained by hand: `npm run check:vsix` resolves
-# every runtime require in the packed JS against the packed file list, so
-# another cross-boundary import without a line here fails packaging instead of
-# shipping a dead release.
-!out/desktop/desktop-policy.js
-!out/desktop/file-tree.js
-src/desktop/**
-vitest.desktop.config.ts
-scripts/run-desktop.cjs
-scripts/lifecycle-host.mjs
-electron-builder.yml
-dist-desktop/**
-# Marketplace description is README.marketplace.md via
-# `vsce package --readme-path` (see package scripts). Exclude BOTH source
-# readme files so vsce does not also pack root README.md as extension/README.md
-# and collide with the packaged extension/readme.md on case-insensitive FS.
-README.md
-README.marketplace.md
-docs/desktop.md
-docs/desktop-update-spec.md
-scripts/gen-marketplace-readme.cjs
+!out/**/*.js
 grok-session-preview.html
-# Private/untracked working docs (git-excluded via .gitignore / .git/info/exclude)
-# must never ship in the public vsix — vsce doesn't read those files.
-manual-test/**
-CLAUDE.local.md
-docs/backlog.md
-docs/POST_NOTES.md
-docs/issue-37-diagrams.md
-docs/codex-style-analysis.md
-docs/internal/macos-code-signing.md
-
-# Runtime terminal artifacts (never ship)
-terminals/**
-.verification/**
-.grok/**
-.tmp-*/**
-.tmp-*
-.tmp-shots/**
-
-# Screenshot frames from the screens checks and the live smoke. Gitignored, but
-# .vscodeignore is a separate list — they were packaged into 3.5.0 before this.
-.screens/**
-.screens-live/**

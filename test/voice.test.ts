@@ -3,7 +3,6 @@ import {
   STT_ENDPOINT,
   MAX_RECORDING_SECONDS,
   resolveVoiceKey,
-  extractGrokAuthKey,
   buildFfmpegArgs,
   buildListDevicesArgs,
   parseDshowAudioDevices,
@@ -13,12 +12,6 @@ import {
   cleanTranscript,
   parseVoiceCommand,
   DEFAULT_SEND_PHRASE,
-  buildSttKeyterms,
-  sanitizeVoiceSendPhrase,
-  sanitizeVoiceKeyterms,
-  voiceConfiguredFingerprint,
-  voiceSettingForRepo,
-  voiceSettingWriteTarget,
   buildSttStreamUrl,
   buildFfmpegStreamArgs,
   applySegment,
@@ -45,71 +38,6 @@ describe("resolveVoiceKey", () => {
   it("returns undefined when nothing is configured", () => {
     expect(resolveVoiceKey({})).toBeUndefined();
     expect(resolveVoiceKey({ setting: "   ", env: { XAI_API_KEY: "  " } })).toBeUndefined();
-  });
-
-  it("falls back to the login token (authKey) only after setting and env (#51)", () => {
-    // authKey is the LAST resort — an explicit key still wins.
-    expect(resolveVoiceKey({ setting: "explicit", authKey: "login-tok" })).toBe("explicit");
-    expect(resolveVoiceKey({ env: { XAI_API_KEY: "envk" }, authKey: "login-tok" })).toBe("envk");
-    // …but with nothing explicit, the login token is used.
-    expect(resolveVoiceKey({ authKey: "  login-tok  " })).toBe("login-tok");
-    expect(resolveVoiceKey({ authKey: "   " })).toBeUndefined();
-  });
-});
-
-describe("extractGrokAuthKey (#51 — reuse the CLI's grok-login token for Voice)", () => {
-  const NOW = 1_700_000_000_000; // fixed test clock (ms)
-  const SEC = Math.floor(NOW / 1000);
-  const xai = (id: string, entry: any) => JSON.stringify({ [`https://auth.x.ai::${id}`]: entry });
-
-  it("pulls .key from the sole xAI entry", () => {
-    expect(extractGrokAuthKey(xai("abc-123", { key: "tok-abc", email: "x@y.z" }), NOW)).toBe("tok-abc");
-  });
-
-  it("prefers a non-expired entry when several are present", () => {
-    const json = JSON.stringify({
-      "https://auth.x.ai::old": { key: "expired", expires_at: SEC - 1000 }, // seconds-epoch, past
-      "https://auth.x.ai::cur": { key: "fresh", expires_at: SEC + 1000 },
-    });
-    expect(extractGrokAuthKey(json, NOW)).toBe("fresh");
-  });
-
-  it("REFUSES a known-expired token so the mic doesn't 401 mid-recording (Codex #4)", () => {
-    expect(extractGrokAuthKey(xai("only", { key: "stale", expires_at: SEC - 1000 }), NOW)).toBeUndefined();
-  });
-
-  it("applies an expiry skew — refuses a token expiring within the minute", () => {
-    expect(extractGrokAuthKey(xai("s", { key: "soon", expires_at: SEC + 30 }), NOW)).toBeUndefined();
-    expect(extractGrokAuthKey(xai("s", { key: "later", expires_at: SEC + 300 }), NOW)).toBe("later");
-  });
-
-  it("tolerates ms-epoch, ISO, numeric-STRING, and a missing expires_at", () => {
-    expect(extractGrokAuthKey(xai("e", { key: "ms", expires_at: NOW + 300_000 }), NOW)).toBe("ms");
-    expect(extractGrokAuthKey(xai("e", { key: "iso", expires_at: "2099-01-01T00:00:00Z" }), NOW)).toBe("iso");
-    // A numeric STRING must read as epoch, not NaN-as-never-expires (Codex #4).
-    expect(extractGrokAuthKey(xai("e", { key: "numstr-old", expires_at: String(SEC - 1000) }), NOW)).toBeUndefined();
-    expect(extractGrokAuthKey(xai("e", { key: "numstr-new", expires_at: String(SEC + 1000) }), NOW)).toBe("numstr-new");
-    expect(extractGrokAuthKey(xai("e", { key: "noexp" }), NOW)).toBe("noexp");
-  });
-
-  it("ignores a NON-xAI issuer entry — never forwards an unrelated .key (Codex #5)", () => {
-    expect(extractGrokAuthKey(JSON.stringify({ "https://evil.example.com::x": { key: "nope" } }), NOW)).toBeUndefined();
-    // an xAI subdomain issuer is accepted
-    expect(extractGrokAuthKey(JSON.stringify({ "https://accounts.x.ai::y": { key: "yes" } }), NOW)).toBe("yes");
-  });
-
-  it("trims and ignores entries without a usable key", () => {
-    expect(extractGrokAuthKey(xai("e", { key: "  padded  " }), NOW)).toBe("padded");
-    const mixed = JSON.stringify({ "https://auth.x.ai::a": { email: "no key" }, "https://auth.x.ai::b": { key: "found" } });
-    expect(extractGrokAuthKey(mixed, NOW)).toBe("found");
-  });
-
-  it("returns undefined on parse failure / empty / no key / array", () => {
-    expect(extractGrokAuthKey("not json", NOW)).toBeUndefined();
-    expect(extractGrokAuthKey("", NOW)).toBeUndefined();
-    expect(extractGrokAuthKey("null", NOW)).toBeUndefined();
-    expect(extractGrokAuthKey("[]", NOW)).toBeUndefined();
-    expect(extractGrokAuthKey(xai("e", { email: "x" }), NOW)).toBeUndefined();
   });
 });
 
@@ -350,12 +278,6 @@ describe("buildSttStreamUrl", () => {
     expect((url.match(/keyterm=/g) || []).length).toBe(2);
   });
 
-  it("adds a trimmed language only when explicitly configured", () => {
-    expect(buildSttStreamUrl({ language: "  pl  " })).toContain("language=pl");
-    expect(buildSttStreamUrl({ language: "  " })).not.toContain("language=");
-    expect(buildSttStreamUrl()).not.toContain("language=");
-  });
-
   it("skips blank keyterms and clamps to 50 chars", () => {
     const long = "a".repeat(80);
     const url = buildSttStreamUrl({ keyterms: ["", "  ", long] });
@@ -363,126 +285,8 @@ describe("buildSttStreamUrl", () => {
     expect(url).toContain("keyterm=" + "a".repeat(50));
   });
 
-  it("enforces the documented 100-term cap (an oversized list must not 400 the socket)", () => {
-    const many = Array.from({ length: 150 }, (_, i) => `term${i}`);
-    const url = buildSttStreamUrl({ keyterms: many });
-    expect((url.match(/keyterm=/g) || []).length).toBe(100);
-    expect(url).toContain("keyterm=term99");
-    expect(url).not.toContain("keyterm=term100");
-  });
-
-  it("blanks don't consume cap slots", () => {
-    const terms = ["", ...Array.from({ length: 100 }, (_, i) => `t${i}`)];
-    const url = buildSttStreamUrl({ keyterms: terms });
-    expect((url.match(/keyterm=/g) || []).length).toBe(100);
-    expect(url).toContain("keyterm=t99");
-  });
-
   it("can turn interim results off", () => {
     expect(buildSttStreamUrl({ interimResults: false })).toContain("interim_results=false");
-  });
-});
-
-describe("sanitizeVoiceSendPhrase / sanitizeVoiceKeyterms", () => {
-  it("trims the send phrase and treats non-strings as empty", () => {
-    expect(sanitizeVoiceSendPhrase("  grok send  ")).toBe("grok send");
-    expect(sanitizeVoiceSendPhrase("")).toBe("");
-    expect(sanitizeVoiceSendPhrase(12)).toBe("");
-  });
-
-  it("keeps unique trimmed terms, caps length, and drops junk", () => {
-    expect(sanitizeVoiceKeyterms([" useEffect ", "useEffect", "", "x".repeat(80), 4]))
-      .toEqual(["useEffect", "x".repeat(50)]);
-    expect(sanitizeVoiceKeyterms("nope")).toEqual([]);
-  });
-});
-
-describe("buildSttKeyterms", () => {
-  it("puts the send phrase and Grok ahead of trimmed, deduplicated user terms", () => {
-    expect(buildSttKeyterms(" grok send ", [" useEffect ", "Grok", "", "useEffect"]))
-      .toEqual(["grok send", "Grok", "useEffect"]);
-  });
-
-  it("reserves the send phrase and Grok when user terms fill the 100-term cap", () => {
-    const userTerms = Array.from({ length: 100 }, (_, i) => `term${i}`);
-    const terms = buildSttKeyterms("grok send", userTerms);
-    const url = buildSttStreamUrl({ keyterms: terms });
-
-    expect(terms).toHaveLength(100);
-    expect(terms.slice(0, 3)).toEqual(["grok send", "Grok", "term0"]);
-    expect(terms.at(-1)).toBe("term97");
-    expect(url).toContain("keyterm=grok+send");
-    expect(url).toContain("keyterm=Grok");
-    expect(url).toContain("keyterm=term97");
-    expect(url).not.toContain("keyterm=term98");
-  });
-
-  it("does not reserve an empty send phrase slot", () => {
-    const userTerms = Array.from({ length: 100 }, (_, i) => `term${i}`);
-    const terms = buildSttKeyterms("", userTerms);
-
-    expect(terms).toHaveLength(100);
-    expect(terms[0]).toBe("Grok");
-    expect(terms.at(-1)).toBe("term98");
-  });
-});
-
-describe("voiceSettingForRepo", () => {
-  it("uses the resource-effective workspace value for a cwd inside the workspace", () => {
-    expect(voiceSettingForRepo(
-      ["workspace-term"],
-      { defaultValue: [], globalValue: ["user-term"] },
-      true,
-      [],
-    )).toEqual(["workspace-term"]);
-  });
-
-  it("does not substitute the open window's workspace value for an external repo", () => {
-    expect(voiceSettingForRepo(
-      ["wrong-repo-term"],
-      { defaultValue: [], globalValue: ["user-term"] },
-      false,
-      [],
-    )).toEqual(["user-term"]);
-  });
-
-  it("falls back to the extension default outside the workspace when no User value exists", () => {
-    expect(voiceSettingForRepo(
-      ["wrong-repo-term"],
-      { defaultValue: ["default-term"] },
-      false,
-      [],
-    )).toEqual(["default-term"]);
-  });
-
-  it("an unbound repo (no desktop project yet) does not inherit the desk workspace value", () => {
-    expect(voiceSettingForRepo(
-      ["desk-term"],
-      undefined,
-      false,
-      DEFAULT_SEND_PHRASE,
-    )).toBe(DEFAULT_SEND_PHRASE);
-  });
-});
-
-describe("voiceSettingWriteTarget", () => {
-  it("writes the workspace override when one exists", () => {
-    expect(voiceSettingWriteTarget({ workspaceValue: "ok send" }, true)).toBe("workspace");
-  });
-
-  it("writes the folder override when one exists", () => {
-    expect(voiceSettingWriteTarget(
-      { workspaceFolderValue: "folder", workspaceValue: "ws" },
-      true,
-    )).toBe("workspaceFolder");
-  });
-
-  it("writes global when no workspace override exists", () => {
-    expect(voiceSettingWriteTarget({ globalValue: "grok send" }, true)).toBe("global");
-  });
-
-  it("writes global for a repo outside the workspace even if the window has a workspace value", () => {
-    expect(voiceSettingWriteTarget({ workspaceValue: "ws", globalValue: "user" }, false)).toBe("global");
   });
 });
 
@@ -528,17 +332,5 @@ describe("applySegment / joinSegments (streaming transcript accumulation)", () =
   it("collapses whitespace when joining", () => {
     expect(joinSegments([{ start: 0, text: "  a  " }, { start: 1, text: " b " }])).toBe("a b");
     expect(joinSegments([])).toBe("");
-  });
-});
-
-describe("voiceConfiguredFingerprint", () => {
-  it("treats identical frames as equal and a phrase change as different", () => {
-    const a = { value: true, sendPhrase: "grok send", keyterms: ["useEffect"] };
-    expect(voiceConfiguredFingerprint(a)).toBe(voiceConfiguredFingerprint({ ...a, keyterms: ["useEffect"] }));
-    expect(voiceConfiguredFingerprint(a)).not.toBe(voiceConfiguredFingerprint({ ...a, sendPhrase: "ok send" }));
-    expect(voiceConfiguredFingerprint(a)).not.toBe(voiceConfiguredFingerprint({ ...a, value: false }));
-    expect(voiceConfiguredFingerprint({ value: false })).toBe(
-      voiceConfiguredFingerprint({ value: false, sendPhrase: "", keyterms: [] }),
-    );
   });
 });
