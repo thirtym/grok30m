@@ -1,7 +1,51 @@
 node_modules/
 out/
+out-integration/
+dist-desktop/
 *.vsix
 !releases/*.vsix
 .vscode-test/
 .DS_Store
 .env
+docs/codex-style-analysis.md
+
+# Local agent working practice — depends on Pawel's own tooling, not the project
+CLAUDE.local.md
+
+# Runtime artifacts written by agent commands during dev/testing
+terminals/
+
+# Machine-specific agent tool permissions — per-developer, never shared
+.claude/settings.local.json
+
+# Ad-hoc raw-output dirs an agent may leave behind while verifying
+.verification/
+
+# Scratch build + probe used by test/sidebar-portable.test.ts, which compiles
+# the current source to a temp dir and loads it in a child process where
+# resolving `vscode` throws — proving sidebar.ts stays loadable outside the
+# extension host. Both are removed in a `finally`; these entries only catch a
+# crashed run.
+.tmp-sidebar-portable-out/
+.tmp-sidebar-portable-probe.cjs
+
+# Ad-hoc screenshot/probe scripts an agent may leave behind
+.tmp-*
+
+# tsc emitting NEXT TO the source instead of into out/. Happens when a config
+# with its own rootDir pulls in a file from src/ — an integration tsconfig that
+# imports a shared module is enough. The stray .js then shadows nothing and
+# builds fine, so nothing notices until it is committed (it was, in a4ef390).
+src/**/*.js
+src/**/*.js.map
+
+# Screenshot frames from `npm run e2e:screens` — regenerated per run, never committed.
+.screens/
+.screens-live/
+
+# Local electron-updater feed override (see docs/desktop-update-spec.md).
+dev-app-update.yml
+
+# Release signing runbook — names the Apple Team ID, the enrolled identity and the
+# full signing pipeline. Private: this repo's docs/internal/ is otherwise public.
+docs/internal/macos-code-signing.md
