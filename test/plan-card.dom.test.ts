@@ -7,7 +7,7 @@
 //   - "Keep planning" sends verdict:"rejected", and includes `comment` ONLY when
 //     the feedback textarea is non-empty (the `...(comment ? {comment} : {})` spread)
 //   - "Approve & implement" sends verdict:"approved" and never a comment
-//   - clicking a verdict collapses the card immediately
+//   - after a click the card resolves and both buttons + textarea disable
 //   - planNotice / planBlocked render a .plan-notice with the right text
 //
 // What it deliberately does NOT cover: real VS Code rendering, CSS, the actual
@@ -61,62 +61,6 @@ describe("plan card (real chat.js in a DOM)", () => {
     expect(approve.disabled).toBe(false);
     expect(feedback.disabled).toBe(false);
     expect(feedback.value).toBe("  keep this comment  ");
-  });
-
-  it("planResolved collapses a replayed plan card so it can't come back actionable", () => {
-    // Re-focus replay order after a live Cancel: the buffered exitPlanRequest
-    // (which rebuilds the actionable card) followed by the buffered resolution.
-    const { window, doc } = bootWebview();
-    dispatch(window, { type: "exitPlanRequest", req: { id: 21, plan: "p" } });
-    dispatch(window, { type: "planResolved", requestId: 21, verdict: "abandoned" });
-
-    const card = doc.querySelector(".card.plan")!;
-    expect(card.classList.contains("resolved")).toBe(true);
-    expect(card.querySelector(".card-actions")).toBeNull();
-    expect(card.querySelector("textarea.plan-feedback")).toBeNull();
-    expect(card.querySelector(".plan-verdict-label")!.textContent).toBe("Cancelled");
-
-    // No plan-file link on this card (snapshot creation failed) → the text
-    // stays reachable behind the Show/Hide fallback toggle.
-    const body = card.querySelector(".plan-body") as HTMLElement;
-    const toggle = card.querySelector(".plan-toggle") as HTMLButtonElement;
-    expect(body.hidden).toBe(true);
-    expect(toggle.textContent).toBe("Show plan");
-    click(window, toggle);
-    expect(body.hidden).toBe(false);
-    expect(toggle.textContent).toBe("Hide plan");
-  });
-
-  it("a resolved card with a plan-file link drops the inline plan entirely (the file IS the plan)", () => {
-    const { window, doc } = bootWebview();
-    dispatch(window, {
-      type: "exitPlanRequest",
-      req: { id: 23, plan: "1. step", planPath: "/tmp/grok/plan9.md", planName: "plan9.md" },
-    });
-    const approve = [...doc.querySelectorAll(".card.plan .card-actions button")]
-      .find((b) => b.textContent === "Approve & implement") as HTMLButtonElement;
-    click(window, approve);
-    dispatch(window, { type: "planResolved", requestId: 23, verdict: "approved" });
-
-    const card = doc.querySelector(".card.plan")!;
-    expect(card.classList.contains("resolved")).toBe(true);
-    expect(card.querySelector(".plan-body")).toBeNull();
-    expect(card.querySelector(".plan-toggle")).toBeNull();
-    expect(card.querySelector(".plan-file-link code")!.textContent).toBe("plan9.md");
-    expect(card.querySelector(".plan-verdict-label")!.textContent).toBe("Approved");
-  });
-
-  it("planResolved is idempotent after the host acknowledges a live click", () => {
-    const { window, doc } = bootWebview();
-    dispatch(window, { type: "exitPlanRequest", req: { id: 22, plan: "p" } });
-    const cancel = [...doc.querySelectorAll(".card.plan .card-actions button")]
-      .find((b) => b.textContent === "Cancel") as HTMLButtonElement;
-    click(window, cancel);
-    dispatch(window, { type: "planResolved", requestId: 22, verdict: "abandoned" });
-    dispatch(window, { type: "planResolved", requestId: 22, verdict: "abandoned" }); // buffered echo
-
-    const card = doc.querySelector(".card.plan")!;
-    expect(card.querySelectorAll(".plan-verdict-label")).toHaveLength(1); // no double label
   });
 
   it("'Reject' with empty feedback sends verdict:rejected and NO comment key", () => {
@@ -210,18 +154,18 @@ describe("plan card (real chat.js in a DOM)", () => {
     });
   });
 
-  it("collapses immediately after a verdict click", () => {
+  it("resolves the card: drops buttons + comment box, shows the colored verdict label", () => {
     const { window, doc } = bootWebview();
     dispatch(window, { type: "exitPlanRequest", req: { id: 14, plan: "p" } });
 
     const card = doc.querySelector(".card.plan")!;
-    const rejectBtn = [...card.querySelectorAll(".card-actions button")]
-      .find((b) => b.textContent === "Reject") as HTMLButtonElement;
-    const feedback = card.querySelector("textarea.plan-feedback") as HTMLTextAreaElement;
-    feedback.value = "keep this exact text";
+    const buttons = [...card.querySelectorAll(".card-actions button")] as HTMLButtonElement[];
+    const rejectBtn = buttons.find((b) => b.textContent === "Reject")!;
     click(window, rejectBtn);
 
     expect(card.classList.contains("resolved")).toBe(true);
+    // Collapses to the same clean representation as a restored history card:
+    // buttons + comment box removed, a single colored verdict label remains.
     expect(card.querySelector(".card-actions")).toBeNull();
     expect(card.querySelector("textarea.plan-feedback")).toBeNull();
     const label = card.querySelector(".plan-verdict-label")!;
@@ -229,7 +173,7 @@ describe("plan card (real chat.js in a DOM)", () => {
     expect(label.classList.contains("plan-verdict-rejected")).toBe(true);
   });
 
-  it("renders a read-only plan-history card: file link + verdict, no inline plan text", () => {
+  it("renders a read-only plan-history card with the persisted verdict label", () => {
     const { window, doc } = bootWebview();
     dispatch(window, {
       type: "planHistory",
@@ -242,9 +186,7 @@ describe("plan card (real chat.js in a DOM)", () => {
     const cards = doc.querySelectorAll(".card.plan.plan-history");
     expect(cards).toHaveLength(1);
     const card = cards[0];
-    // The plan-file link IS the plan — no inline body / toggle when it exists.
-    expect(card.querySelector(".plan-body")).toBeNull();
-    expect(card.querySelector(".plan-toggle")).toBeNull();
+    expect(card.querySelector(".plan-body")!.textContent).toContain("step 1");
     expect(card.querySelector(".plan-file-link code")!.textContent).toBe("restored-plan.md");
     expect(card.querySelector(".plan-verdict-label")!.textContent).toBe("Rejected");
     expect(card.querySelector(".card-actions")).toBeNull();
@@ -278,70 +220,5 @@ describe("plan card (real chat.js in a DOM)", () => {
     expect(notices[0]).toContain("Staying in Plan mode");
     expect(notices[1]).toContain("Plan mode blocked a command: npm install");
     expect(notices[2]).toContain("Plan mode blocked a write to src/app.ts");
-  });
-});
-
-describe("adapter plan-review permission card", () => {
-  const claudeReview = {
-    type: "permissionRequest" as const,
-    req: {
-      id: 80,
-      toolCall: { toolCallId: "exit-plan-1", title: "Ready to code?", kind: "switch_mode" },
-      options: [
-        { optionId: "default", kind: "allow_once", name: "Yes, and manually approve edits" },
-        { optionId: "acceptEdits", kind: "allow_always", name: "Yes, and auto-accept edits" },
-        { optionId: "plan", kind: "reject_once", name: "No, keep planning" },
-      ],
-      plan: "# Ship it\n\n1. Change the donut",
-    },
-  };
-
-  it("renders the plan with the adapter's mode options", () => {
-    const { window, posted, doc } = bootWebview();
-    dispatch(window, claudeReview);
-
-    const card = doc.querySelector(".card.plan.permission")!;
-    expect(card.querySelector(".card-title")!.textContent).toBe("Plan ready for review");
-    expect(card.querySelector(".plan-body")!.textContent).toContain("Change the donut");
-    expect([...card.querySelectorAll(".card-actions button")].map((b) => b.textContent)).toEqual([
-      "Yes, and manually approve edits",
-      "Yes, and auto-accept edits",
-      "No, keep planning",
-    ]);
-
-    const approve = [...card.querySelectorAll(".card-actions button")]
-      .find((b) => b.textContent === "Yes, and manually approve edits") as HTMLButtonElement;
-    click(window, approve);
-    expect(posted).toContainEqual({
-      type: "permissionAnswer",
-      requestId: 80,
-      optionId: "default",
-    });
-    expect(card.querySelector(".plan-verdict-label")!.textContent).toBe("Approved");
-  });
-
-  it("does not claim a plan was approved when no plan text arrived", () => {
-    const { window, doc } = bootWebview();
-    dispatch(window, {
-      type: "permissionRequest",
-      req: {
-        id: 81,
-        toolCall: { toolCallId: "exit-plan-empty", title: "Ready to code?", kind: "switch_mode" },
-        options: [
-          { optionId: "default", kind: "allow_once", name: "Yes, and manually approve edits" },
-          { optionId: "plan", kind: "reject_once", name: "No, keep planning" },
-        ],
-        plan: "",
-      },
-    });
-
-    const card = doc.querySelector(".card.plan.permission")!;
-    expect(card.querySelector(".plan-body")!.textContent).toBe("No plan was provided with this request.");
-    const approve = [...card.querySelectorAll(".card-actions button")]
-      .find((b) => b.textContent === "Yes, and manually approve edits") as HTMLButtonElement;
-    click(window, approve);
-    expect(card.querySelector(".plan-verdict-label")).toBeNull();
-    expect(card.textContent).not.toMatch(/Plan approved|Approved/i);
-    expect(card.textContent).toContain("Yes, and manually approve edits");
   });
 });

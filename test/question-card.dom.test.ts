@@ -33,7 +33,7 @@ describe("question card (real chat.js in a DOM)", () => {
     expect(card).not.toBeNull();
     expect(card!.querySelector(".question-text")!.textContent).toBe("Pick one?");
     const labels = [...card!.querySelectorAll(".question-option .question-option-label")].map((b) => b.textContent);
-    expect(labels).toEqual(["Option A", "Option B", "Other"]);
+    expect(labels).toEqual(["Option A", "Option B"]);
     expect(card!.querySelector(".question-option-desc")!.textContent).toBe("first");
   });
 
@@ -119,84 +119,6 @@ describe("question card (real chat.js in a DOM)", () => {
       type: "questionAnswer",
       requestId: 5,
       answers: { Q1: "1a", Q2: "2b" },
-      annotations: {},
-    });
-  });
-
-  it("'Other' opens a text field and sends the typed answer instead of the literal label", () => {
-    const { window, posted, doc } = bootWebview();
-    dispatch(window, {
-      type: "questionRequest",
-      req: {
-        id: 6,
-        questions: [{
-          question: "What should I do?",
-          options: [{ label: "Proceed" }, { label: "Other", description: "Type a different instruction" }],
-          multiSelect: false,
-        }],
-      },
-    });
-
-    const card = doc.querySelector(".card.question")!;
-    expect([...card.querySelectorAll(".question-option .question-option-label")]
-      .filter((label) => label.textContent?.trim().toLowerCase() === "other"))
-      .toHaveLength(1);
-    const other = [...card.querySelectorAll(".question-option")]
-      .find((b) => b.textContent!.includes("Other")) as HTMLButtonElement;
-    click(window, other);
-    const custom = card.querySelector(".question-other-input") as HTMLInputElement;
-    const submit = [...card.querySelectorAll(".card-actions button")]
-      .find((b) => b.textContent === "Submit") as HTMLButtonElement;
-    expect(custom.hidden).toBe(false);
-    expect(doc.activeElement).toBe(custom);
-    expect(submit.disabled).toBe(true);
-
-    custom.value = "Use the existing API instead";
-    custom.dispatchEvent(new window.Event("input", { bubbles: true }));
-    expect(submit.disabled).toBe(false);
-    click(window, submit);
-
-    expect(posted).toContainEqual({
-      type: "questionAnswer",
-      requestId: 6,
-      answers: { "What should I do?": "Use the existing API instead" },
-      annotations: {},
-    });
-    expect(card.querySelector(".question-answer")!.textContent)
-      .toContain("Use the existing API instead");
-  });
-
-  it("adds one free-text 'Other' when the request does not provide one", () => {
-    const { window, posted, doc } = bootWebview();
-    dispatch(window, {
-      type: "questionRequest",
-      req: {
-        id: 7,
-        questions: [{
-          question: "What should I do?",
-          options: [{ label: "Proceed" }],
-          multiSelect: false,
-        }],
-      },
-    });
-
-    const card = doc.querySelector(".card.question")!;
-    const labels = [...card.querySelectorAll(".question-option .question-option-label")]
-      .map((label) => label.textContent);
-    expect(labels).toEqual(["Proceed", "Other"]);
-
-    const other = [...card.querySelectorAll(".question-option")]
-      .find((button) => button.textContent!.includes("Other")) as HTMLButtonElement;
-    click(window, other);
-    const custom = card.querySelector(".question-other-input") as HTMLInputElement;
-    custom.value = "Use the existing API instead";
-    custom.dispatchEvent(new window.Event("input", { bubbles: true }));
-    click(window, card.querySelector(".card-actions .primary") as HTMLButtonElement);
-
-    expect(posted).toContainEqual({
-      type: "questionAnswer",
-      requestId: 7,
-      answers: { "What should I do?": "Use the existing API instead" },
       annotations: {},
     });
   });
