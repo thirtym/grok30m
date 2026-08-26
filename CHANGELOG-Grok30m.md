@@ -5,6 +5,15 @@ Upstream base at fork time: [`56d2b4f`](https://github.com/phuryn/grok-build-vsc
 
 Full upstream history: [README.upstream.md](README.upstream.md) and the [upstream repo](https://github.com/phuryn/grok-build-vscode).
 
+## 2.0.2
+
+- Restores the 1.5.7 workflow (editor-tab chat, Sessions sidebar, hide automation). 2.0.1 had pulled in community 3.18.0 and dropped those.
+- Welcome screen: **Grok30m**, 30m fork of Grok Build (Community), linking to [thirtym/grok30m](https://github.com/thirtym/grok30m).
+
+## 2.0.1
+
+- Retracted. Synced community 3.18.0 by mistake; chat/sessions no longer matched Grok30m.
+
 ## 1.5.7
 
 - Public release under **Grok30m** branding.

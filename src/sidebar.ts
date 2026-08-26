@@ -3603,8 +3603,8 @@ ${historyHeader}    <button id="new-btn" class="toolbar-btn" title="New session"
   <main id="messages" class="messages">
     <div class="welcome" id="welcome">
       <span class="welcome-mark" role="img" aria-label="Grok" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
-      <h2>Grok Build (Community)</h2>
-      <p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>
+      <h2>Grok30m</h2>
+      <p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>
       <p id="welcome-version" class="muted loading-dots">Starting</p>
       <div id="welcome-onboarding"></div>
     </div>

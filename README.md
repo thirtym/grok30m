@@ -45,9 +45,9 @@ Same as upstream:
 3. Install in Cursor or VS Code:
 
 ```bash
-cursor --install-extension grok30m-1.5.7.vsix
+cursor --install-extension grok30m-2.0.2.vsix
 # or
-code --install-extension grok30m-1.5.7.vsix
+code --install-extension grok30m-2.0.2.vsix
 ```
 
 4. **Uninstall** the marketplace extension if present (`PawelHuryn.grok-vscode-phuryn`) — both register `Cmd+;`.
