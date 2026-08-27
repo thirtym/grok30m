@@ -68,6 +68,7 @@ import {
   shouldHideAutoSession,
   stripAutoTag,
 } from "./session-tags";
+import { peekExtensionUpdate, runHostMaintenance } from "./host-update";
 
 type WebviewMsg =
   | { type: "ready" }
@@ -99,6 +100,8 @@ type WebviewMsg =
   | { type: "logout" }
   | { type: "checkGrokUpdate" }
   | { type: "updateGrok" }
+  | { type: "checkExtUpdate" }
+  | { type: "updateExt" }
   | { type: "recheckConnection" }
   | { type: "listSessions"; offset?: number; limit?: number; query?: string }
   | { type: "resumeSession"; id: string }
@@ -1111,6 +1114,7 @@ See design doc for the full state machine diagram.`;
     );
     if (!cliPath) {
       this.post({ type: "grokUpdateStatus", error: "grok CLI not found" });
+      await this.checkExtUpdate();
       return;
     }
     // Compute the update policy from the installed version (issue #22) so the menu
@@ -1131,6 +1135,24 @@ See design doc for the full state machine diagram.`;
       this.output.appendLine(`grok update --check failed: ${(e as Error).message}`);
       this.post({ type: "grokUpdateStatus", error: (e as Error).message, policy });
     }
+    await this.checkExtUpdate();
+  }
+
+  /** About-panel peek at GitHub Releases for a newer Grok30m vsix. Does not install. */
+  private async checkExtUpdate(): Promise<void> {
+    const current = String((this.context.extension.packageJSON as { version?: string }).version ?? "");
+    const status = await peekExtensionUpdate(current);
+    this.post({
+      type: "extUpdateStatus",
+      current,
+      latest: status.latest ?? null,
+      updateAvailable: !!status.updateAvailable,
+      error: status.error || null,
+    });
+  }
+
+  private async updateExtOnDemand(): Promise<void> {
+    await runHostMaintenance(this.context, this.output, { forceCheck: true, notifyIfCurrent: true });
   }
 
   /**
@@ -1996,6 +2018,12 @@ See design doc for the full state machine diagram.`;
         break;
       case "updateGrok":
         await this.updateGrokCliOnDemand();
+        break;
+      case "checkExtUpdate":
+        await this.checkExtUpdate();
+        break;
+      case "updateExt":
+        await this.updateExtOnDemand();
         break;
       case "listSessions":
         this.postSessionsList({ offset: msg.offset, limit: msg.limit, query: msg.query });

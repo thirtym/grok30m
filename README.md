@@ -38,22 +38,37 @@ Same as upstream:
 
 ## Install
 
-### From a release VSIX (recommended)
+One central source: [GitHub Releases](https://github.com/thirtym/grok30m/releases/latest). Each computer *and* each SSH remote has its own copy of the extension — Cursor does not copy a sideloaded VSIX across machines. Run this once per host (your laptop, and once in a terminal on the remote). After that, Grok30m updates itself.
 
-1. Install and sign in to the Grok CLI (`grok /login`).
-2. Download `grok30m-*.vsix` from [Releases](https://github.com/thirtym/grok30m/releases).
-3. Install in Cursor or VS Code:
+### Anyone's machine (recommended)
+
+macOS / Linux / WSL / SSH remote:
 
 ```bash
-cursor --install-extension grok30m-2.0.2.vsix
-# or
-code --install-extension grok30m-2.0.2.vsix
+curl -fsSL https://raw.githubusercontent.com/thirtym/grok30m/grok30m/scripts/bootstrap.sh | bash
 ```
 
-4. **Uninstall** the marketplace extension if present (`PawelHuryn.grok-vscode-phuryn`) — both register `Cmd+;`.
-5. Reload the window (`Developer: Reload Window`).
+Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/thirtym/grok30m/grok30m/scripts/bootstrap.ps1 | iex
+```
+
+Then **Developer: Reload Window** in every already-open Cursor/VS Code window on that host.
+
+The script:
+
+- Downloads the latest `grok30m-*.vsix` from GitHub Releases
+- Installs into Cursor, VS Code, *and* `~/.cursor-server` (SSH remotes)
+- Removes the community marketplace extension (`PawelHuryn.grok-vscode-phuryn`) and the old `grok-tabs` workaround, which steal the same shortcut and hide Grok30m's views
 
 Extension id: **`grok30m.grok30m`**
+
+### Stay current
+
+Grok30m checks GitHub Releases on startup (this computer or this SSH remote) and installs a newer vsix when one exists. You'll get a **Reload** prompt. Turn that off with `grok.autoUpdate`, or run **Grok30m: Check for Updates** any time.
+
+If chat or the Sessions sidebar looks like the stock community client after you switch project windows, that window is on a different host that never ran bootstrap — run the one-liner there once.
 
 ### Build from source
 
@@ -63,8 +78,7 @@ cd grok30m
 git checkout grok30m
 npm install
 npm test
-npm run package
-cursor --install-extension grok30m-*.vsix --force
+./scripts/install.sh
 ```
 
 ---
@@ -76,6 +90,7 @@ cursor --install-extension grok30m-*.vsix --force
 | `grok.preferredLocation` | `"panel"` | `"panel"` = editor tab; `"sidebar"` = original side chat |
 | `grok.sessionsSidebar` | `true` | Dedicated Sessions view in the activity bar |
 | `grok.hideAutoSessions` | `true` | Hide tagged automated sessions (toggle live in Sessions sidebar) |
+| `grok.autoUpdate` | `true` | Install newer Grok30m vsixes from GitHub Releases on this host |
 
 Per-project overrides go in `.vscode/settings.json`.
 
@@ -86,6 +101,7 @@ Per-project overrides go in `.vscode/settings.json`.
 | `Grok: Open` | Open using preferred location; reveals Sessions sidebar |
 | `Grok: Open in Editor Tab` | Force panel tab |
 | `Grok: Open in Sidebar` | Force sidebar chat |
+| `Grok30m: Check for Updates` | Fetch the latest vsix from GitHub Releases and install it on this host |
 
 Default keybinding: **`Cmd+;`** (Mac) / **`Ctrl+;`** (Windows/Linux).
 

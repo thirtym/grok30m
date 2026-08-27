@@ -794,6 +794,31 @@ describe("gear menu — Other group + About / Config & debug sub-views", () => {
     expect(text).not.toContain("—");
   });
 
+  it("About offers Update Grok30m when GitHub has a newer vsix", () => {
+    const h = boot();
+    click(h.window, $(h.doc, "gear-btn"));
+    click(h.window, itemByText(h.doc, "Version & about"));
+    dispatch(h.window, { type: "extUpdateStatus", current: "2.0.1", latest: "2.0.3", updateAvailable: true });
+
+    expect(gear(h.doc).textContent).toContain("Grok30m update");
+    expect(gear(h.doc).textContent).toContain("v2.0.3");
+    const btn = itemByText(h.doc, "Update Grok30m");
+    expect(btn).toBeTruthy();
+    h.posted.length = 0;
+    click(h.window, btn);
+    expect(types(h.posted)).toContain("updateExt");
+  });
+
+  it("About says Grok30m is up to date when the GitHub release matches", () => {
+    const h = boot();
+    click(h.window, $(h.doc, "gear-btn"));
+    click(h.window, itemByText(h.doc, "Version & about"));
+    dispatch(h.window, { type: "extUpdateStatus", current: "2.0.3", latest: "2.0.3", updateAvailable: false });
+
+    expect(gear(h.doc).textContent).toContain("Grok30m is up to date");
+    expect(itemByText(h.doc, "Update Grok30m")).toBeUndefined();
+  });
+
   it("the About back row returns to the main menu", () => {
     const h = boot();
     click(h.window, $(h.doc, "gear-btn"));

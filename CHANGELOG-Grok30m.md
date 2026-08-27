@@ -5,6 +5,13 @@ Upstream base at fork time: [`56d2b4f`](https://github.com/phuryn/grok-build-vsc
 
 Full upstream history: [README.upstream.md](README.upstream.md) and the [upstream repo](https://github.com/phuryn/grok-build-vscode).
 
+## 2.0.3
+
+- **One install per host, then it stays current.** Grok30m fetches [GitHub Releases](https://github.com/thirtym/grok30m/releases/latest) on startup (this computer *and* SSH remotes) and installs a newer vsix when one exists. Prompt to reload; `grok.autoUpdate` / **Grok30m: Check for Updates** to control it.
+- **One-command install** for anyone's machine, including Cursor SSH remotes: `curl -fsSL https://raw.githubusercontent.com/thirtym/grok30m/grok30m/scripts/bootstrap.sh | bash` (Windows: `scripts/bootstrap.ps1`).
+- Removes leftover copies that hide Grok30m's views: the community marketplace extension (`PawelHuryn.grok-vscode-phuryn`) and `paul-local.grok-tabs`.
+- Activates on startup so the update check runs even if the Sessions view didn't load.
+
 ## 2.0.2
 
 - Restores the 1.5.7 workflow (editor-tab chat, Sessions sidebar, hide automation). 2.0.1 had pulled in community 3.18.0 and dropped those.

@@ -1,41 +1,42 @@
 #!/usr/bin/env bash
-# Install the Grok VS Code extension on macOS / Linux / WSL.
+# Build this clone and install it into every Cursor/VS Code/SSH-remote CLI
+# on this host. For "just give me the current release" use bootstrap.sh instead.
 # Usage:  ./scripts/install.sh [path/to/file.vsix]
-# Picks the first .vsix in the repo root, or builds one if none exists.
 
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=find-editor-clis.sh
+. "$repo_root/scripts/find-editor-clis.sh"
 
-find_code_cli() {
-    for name in code code-insiders; do
-        if command -v "$name" >/dev/null 2>&1; then
-            echo "$name"; return 0
-        fi
-    done
-    # macOS install paths
-    for path in \
-        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
-        "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders" \
-    ; do
-        [ -x "$path" ] && { echo "$path"; return 0; }
-    done
-    echo "Could not find VS Code CLI. Install VS Code or add 'code' to PATH." >&2
-    return 1
-}
+ID="grok30m.grok30m"
+CONFLICTS=(PawelHuryn.grok-vscode-phuryn paul-local.grok-tabs)
 
 vsix="${1-}"
 if [ -z "$vsix" ]; then
-    # Always rebuild so the installed extension is never stale
     cd "$repo_root"
     [ -d node_modules ] || npm install
     npm run package
-    vsix=$(ls -t "$repo_root"/*.vsix | head -n1)
+    vsix=$(ls -t "$repo_root"/grok30m-*.vsix | head -n1)
 fi
 [ -f "$vsix" ] || { echo "vsix not found: $vsix" >&2; exit 1; }
 
-code=$(find_code_cli)
-echo "Installing $vsix via $code"
-# --force so a same-version reinstall actually overwrites the installed files
-"$code" --install-extension "$vsix" --force
+clis=()
+while IFS= read -r line; do
+    clis+=("$line")
+done < <(find_editor_clis)
+if [ "${#clis[@]}" -eq 0 ]; then
+    echo "Could not find Cursor or VS Code CLI (including ~/.cursor-server remote-cli)." >&2
+    exit 1
+fi
+
+for cli in "${clis[@]}"; do
+    echo "Installing $vsix via $cli"
+    for id in "$ID" "${CONFLICTS[@]}"; do
+        "$cli" --uninstall-extension "$id" >/dev/null 2>&1 || true
+    done
+    "$cli" --install-extension "$vsix" --force
+done
+
 echo
-echo "Done. Reload VS Code (Ctrl+Shift+P -> 'Developer: Reload Window') and click the Grok icon."
+echo "Done. Reload every open window (Developer: Reload Window)."
+echo "Grok30m will then keep itself current from GitHub Releases."

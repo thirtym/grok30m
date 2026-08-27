@@ -2,7 +2,7 @@
   "name": "grok30m",
   "displayName": "Grok30m",
   "description": "Grok30m — fork of the community Grok Build VS Code client with Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "publisher": "grok30m",
   "author": {
     "name": "Grok30m contributors",
@@ -41,13 +41,18 @@
   ],
   "icon": "resources/grok-icon.png",
   "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
   "activationEvents": [
+    "onStartupFinished",
     "onView:grok.chat",
     "onView:grok.sessions",
     "onWebviewPanel:grok.panel",
     "onCommand:grok.open",
     "onCommand:grok.panel.open",
-    "onCommand:grok.sidebar.open"
+    "onCommand:grok.sidebar.open",
+    "onCommand:grok.checkForUpdates"
   ],
   "contributes": {
     "viewsContainers": {
@@ -125,6 +130,10 @@
         "title": "Grok: Log Out"
       },
       {
+        "command": "grok.checkForUpdates",
+        "title": "Grok30m: Check for Updates"
+      },
+      {
         "command": "grok._debugDummyPlan",
         "title": "Grok: Debug — Show dummy plan card (for testing Approve/Reject/Cancel)"
       }
@@ -171,6 +180,11 @@
           "type": "string",
           "default": "",
           "description": "Path to the grok binary. Empty = auto-discover (~/.grok/bin/grok, then PATH)."
+        },
+        "grok.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Keep Grok30m current from the public GitHub Releases feed ([thirtym/grok30m](https://github.com/thirtym/grok30m/releases/latest)). Checks on this computer *and* on SSH remotes (each host has its own install). Turn off to only update when you run **Grok30m: Check for Updates**."
         },
         "grok.defaultModel": {
           "type": "string",

@@ -158,6 +158,8 @@
     // Latest `grok update --check` result for the About panel: { checking } while
     // in flight, then { current, latest, updateAvailable, error }.
     grokUpdate: null,
+    // Latest GitHub-release check for *this extension* (not the CLI).
+    extUpdate: null,
     // While replaying, suppress everything from the start of the current user
     // message (a primer turn) through the end of grok's response to it — until
     // the next user message starts. Keeps the chat clean of our session-start
@@ -1053,9 +1055,11 @@
     state.gearView = "about";
     if (check) {
       state.grokUpdate = { checking: true };
+      state.extUpdate = { checking: true };
       vscode.postMessage({ type: "checkGrokUpdate" });
     }
     const u = state.grokUpdate || {};
+    const ext = state.extUpdate || {};
     gearPopover.innerHTML = "";
     addGearItem('<span class="popover-back">← Version &amp; about</span>', renderGearMain);
 
@@ -1071,6 +1075,20 @@
 
     // ── Versions + update status ─────────────────────────────────────────
     addGearInfo(`<span>This extension</span><span class="popover-ver">v${escapeHtml(state.extVersion || "?")}</span>`);
+    if (ext.checking) {
+      addGearInfo('<span class="loading-dots">Checking GitHub Releases</span>');
+    } else if (ext.error) {
+      addGearInfo(`<span class="popover-warn">Couldn’t check Grok30m — ${escapeHtml(ext.error)}</span>`);
+    } else if (ext.updateAvailable) {
+      addGearInfo(`<span class="popover-update-avail">Grok30m update · v${escapeHtml(ext.latest || "")}</span>`);
+      const extBtn = document.createElement("div");
+      extBtn.className = "toolbar-popover-item popover-action";
+      extBtn.innerHTML = "<span>Update Grok30m</span>";
+      extBtn.onclick = (e) => { e.stopPropagation(); vscode.postMessage({ type: "updateExt" }); closePopovers(); };
+      gearPopover.appendChild(extBtn);
+    } else if (ext.latest || state.extVersion) {
+      addGearInfo('<span class="popover-ver">Grok30m is up to date</span>');
+    }
     // The CLI version comes from the ACP `initialize` handshake, but the native
     // Windows build doesn't report one there — so fall back to the version the
     // update check returns (its `currentVersion`), which is always populated.
@@ -3403,6 +3421,13 @@
           policy: msg.policy || null,
         };
         if (msg.current) state.cliVersion = msg.current;
+        if (!gearPopover.hidden && state.gearView === "about") renderAboutPanel(false);
+        break;
+      case "extUpdateStatus":
+        state.extUpdate = {
+          current: msg.current, latest: msg.latest,
+          updateAvailable: !!msg.updateAvailable, error: msg.error || null,
+        };
         if (!gearPopover.hidden && state.gearView === "about") renderAboutPanel(false);
         break;
       case "initialized": {

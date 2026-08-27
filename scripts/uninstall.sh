@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Uninstall the Grok VS Code extension on macOS / Linux / WSL.
-# Usage:  ./scripts/uninstall.sh
-
+# Uninstall Grok30m (and leftover community/grok-tabs copies) on this host.
 set -euo pipefail
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=find-editor-clis.sh
+. "$repo_root/scripts/find-editor-clis.sh"
 
-find_code_cli() {
-    for name in code code-insiders; do
-        if command -v "$name" >/dev/null 2>&1; then
-            echo "$name"; return 0
-        fi
-    done
-    for path in \
-        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
-        "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders" \
-    ; do
-        [ -x "$path" ] && { echo "$path"; return 0; }
-    done
-    echo "Could not find VS Code CLI." >&2
-    return 1
-}
+IDS=(grok30m.grok30m PawelHuryn.grok-vscode-phuryn paul-local.grok-tabs)
 
-code=$(find_code_cli)
-echo "Uninstalling PawelHuryn.grok-vscode-phuryn via $code"
-"$code" --uninstall-extension PawelHuryn.grok-vscode-phuryn
+clis=()
+while IFS= read -r line; do
+    clis+=("$line")
+done < <(find_editor_clis)
+if [ "${#clis[@]}" -eq 0 ]; then
+    echo "Could not find Cursor or VS Code CLI." >&2
+    exit 1
+fi
+
+for cli in "${clis[@]}"; do
+    echo "Uninstalling via $cli"
+    for id in "${IDS[@]}"; do
+        "$cli" --uninstall-extension "$id" >/dev/null 2>&1 || true
+    done
+done
+
 echo
-echo "Done. Reload VS Code to drop the sidebar."
+echo "Done. Reload every open window to drop the Grok views."

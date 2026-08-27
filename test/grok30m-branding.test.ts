@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import * as path from "node:path";
 import { describe, it, expect } from "vitest";
 
@@ -10,9 +11,12 @@ describe("Grok30m identity", () => {
     name: string;
     publisher: string;
     displayName: string;
+    activationEvents?: string[];
+    extensionKind?: string[];
     contributes: {
       configuration: { properties: Record<string, { default?: unknown }> };
       viewsContainers?: Record<string, unknown>;
+      commands?: { command: string }[];
     };
   };
 
@@ -38,5 +42,31 @@ describe("Grok30m identity", () => {
       expect.objectContaining({ activitybar: expect.any(Array) }),
     );
     expect(pkg.contributes.viewsContainers).not.toHaveProperty("secondarySidebar");
+  });
+
+  it("activates on startup so GitHub-release updates run on every host, including SSH remotes", () => {
+    expect(pkg.activationEvents).toContain("onStartupFinished");
+    expect(pkg.extensionKind).toEqual(["workspace"]);
+    expect(pkg.contributes.configuration.properties["grok.autoUpdate"].default).toBe(true);
+    expect(pkg.contributes.commands?.some((c) => c.command === "grok.checkForUpdates")).toBe(true);
+  });
+});
+
+describe("Grok30m bootstrap", () => {
+  const bootstrap = readFileSync(path.join(root, "scripts", "bootstrap.sh"), "utf8");
+
+  it("bash can parse bootstrap.sh", () => {
+    execFileSync("bash", ["-n", path.join(root, "scripts", "bootstrap.sh")]);
+  });
+
+  it("installs from GitHub Releases onto Cursor, VS Code, and cursor-server remotes", () => {
+    expect(bootstrap).toContain('API="https://api.github.com/repos/${REPO}/releases/latest"');
+    expect(bootstrap).toContain('REPO="thirtym/grok30m"');
+    expect(bootstrap).toContain("cursor");
+    expect(bootstrap).toContain(".cursor-server/bin/");
+    expect(bootstrap).toContain("remote-cli/cursor");
+    expect(bootstrap).toContain("grok30m.grok30m");
+    expect(bootstrap).toContain("PawelHuryn.grok-vscode-phuryn");
+    expect(bootstrap).toContain("paul-local.grok-tabs");
   });
 });
