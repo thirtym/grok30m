@@ -22,14 +22,21 @@ find_editor_clis() {
   add "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
   add "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code-insiders"
 
+  # Cursor/VS Code SSH remotes: ~/.cursor-server/bin/<platform>/<commit>/bin/remote-cli/cursor
   local d
-  for d in "${HOME}/.cursor-server/bin/"*/bin/remote-cli/cursor; do
-    add "$d"
-  done
-  for d in "${HOME}/.vscode-server/bin/"*/bin/remote-cli/code; do
-    add "$d"
-  done
-  for d in "${HOME}/.vscode-server-insiders/bin/"*/bin/remote-cli/code-insiders; do
-    add "$d"
-  done
+  if [ -d "${HOME}/.cursor-server/bin" ]; then
+    while IFS= read -r d; do add "$d"; done < <(
+      find "${HOME}/.cursor-server/bin" -path '*/bin/remote-cli/cursor' \( -type f -o -type l \) 2>/dev/null
+    )
+  fi
+  if [ -d "${HOME}/.vscode-server/bin" ]; then
+    while IFS= read -r d; do add "$d"; done < <(
+      find "${HOME}/.vscode-server/bin" -path '*/bin/remote-cli/code' \( -type f -o -type l \) 2>/dev/null
+    )
+  fi
+  if [ -d "${HOME}/.vscode-server-insiders/bin" ]; then
+    while IFS= read -r d; do add "$d"; done < <(
+      find "${HOME}/.vscode-server-insiders/bin" -path '*/bin/remote-cli/code-insiders' \( -type f -o -type l \) 2>/dev/null
+    )
+  fi
 }

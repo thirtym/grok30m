@@ -63,8 +63,8 @@ describe("Grok30m bootstrap", () => {
     expect(bootstrap).toContain('API="https://api.github.com/repos/${REPO}/releases/latest"');
     expect(bootstrap).toContain('REPO="thirtym/grok30m"');
     expect(bootstrap).toContain("cursor");
-    expect(bootstrap).toContain(".cursor-server/bin/");
-    expect(bootstrap).toContain("remote-cli/cursor");
+    expect(bootstrap).toContain(".cursor-server/bin");
+    expect(bootstrap).toContain("*/bin/remote-cli/cursor");
     expect(bootstrap).toContain("grok30m.grok30m");
     expect(bootstrap).toContain("PawelHuryn.grok-vscode-phuryn");
     expect(bootstrap).toContain("paul-local.grok-tabs");

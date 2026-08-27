@@ -38,10 +38,12 @@ function Find-EditorClis {
     Add-Cli "$la\Programs\Microsoft VS Code\bin\code.cmd"
     Add-Cli "$la\Programs\Microsoft VS Code Insiders\bin\code-insiders.cmd"
 
-    Get-ChildItem -Path "$env:USERPROFILE\.cursor-server\bin" -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Add-Cli (Join-Path $_.FullName "bin\remote-cli\cursor.cmd") }
-    Get-ChildItem -Path "$env:USERPROFILE\.vscode-server\bin" -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Add-Cli (Join-Path $_.FullName "bin\remote-cli\code.cmd") }
+    Get-ChildItem -Path "$env:USERPROFILE\.cursor-server\bin" -Recurse -Filter cursor.cmd -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\bin\\remote-cli\\cursor\.cmd$' } |
+        ForEach-Object { Add-Cli $_.FullName }
+    Get-ChildItem -Path "$env:USERPROFILE\.vscode-server\bin" -Recurse -Filter code.cmd -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\bin\\remote-cli\\code\.cmd$' } |
+        ForEach-Object { Add-Cli $_.FullName }
 
     return $found
 }
