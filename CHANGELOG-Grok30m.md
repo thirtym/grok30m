@@ -5,6 +5,13 @@ Upstream base at fork time: [`56d2b4f`](https://github.com/phuryn/grok-build-vsc
 
 Full upstream history: [README.upstream.md](README.upstream.md) and the [upstream repo](https://github.com/phuryn/grok-build-vscode).
 
+## 2.1.0
+
+- **Merge community 4.5.2** (Changes view, prompt-cache fix, Codex steer, model/effort chip, CLI updates from Settings, cloud/phone sign-in).
+- **Grok30m UX kept:** editor-tab chat, Sessions sidebar, hide automated sessions.
+- **Chrome says Grok30m** (activity bar, command palette, Settings, About). Community is only listed as the upstream this build is based on.
+- **About and Check for Updates show community status.** Settings → About fetches the latest community release and says up to date or behind. Check for Updates always includes that line. Startup still toasts once when community pulls ahead.
+
 ## 2.0.3
 
 - **One install per host, then it stays current.** Grok30m fetches [GitHub Releases](https://github.com/thirtym/grok30m/releases/latest) on startup (this computer *and* SSH remotes) and installs a newer vsix when one exists. Prompt to reload; `grok.autoUpdate` / **Grok30m: Check for Updates** to control it.

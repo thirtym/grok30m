@@ -1,0 +1,154 @@
+/**
+ * What a signed-out agent looks like in the real webview.
+ *
+ * Driven through the shipped `media/chat.js` so the assertions are about the
+ * rendered popover, not about the intent behind it: the picker must never offer
+ * a row that reads as a selectable model for an account that cannot answer, and
+ * the Accounts cluster must offer signing in rather than signing out of
+ * credentials that are already being refused.
+ */
+import { describe, expect, it } from "vitest";
+import { bootWebview, click, dispatch, type Posted } from "./webview-harness";
+
+const $ = (doc: Document, id: string) => doc.getElementById(id) as HTMLElement;
+const modelBtn = (doc: Document) => doc.querySelector(".model-picker-row") as HTMLButtonElement;
+const popoverText = (doc: Document) => doc.getElementById("gear-popover")!.textContent || "";
+const items = (doc: Document) => [...doc.querySelectorAll("#gear-popover .toolbar-popover-item")];
+const types = (posted: Posted[]) => posted.map((p) => p.type);
+
+function bootSignedOutCodex(opts: { remote?: boolean } = {}) {
+  const h = bootWebview({ remote: opts.remote, beforeScripts: (w) => {
+    const rail = w.document.createElement("aside"); rail.id = "projects-rail";
+    rail.innerHTML = '<div id="rail-scroll"></div><div class="rail-foot"></div>';
+    w.document.body.appendChild(rail);
+  } });
+  dispatch(h.window, { type: "initialState", capabilities: {} });
+  dispatch(h.window, {
+    type: "providerState",
+    providers: [{ id: "codex", connected: true, needsLogin: true }],
+  });
+  dispatch(h.window, {
+    type: "session",
+    sessionId: "s1",
+    provider: "codex",
+    currentModelId: "gpt-5.6-sol",
+    models: [
+      // A model remembered from when the account still worked, plus the
+      // synthesized default-model placeholder the field report showed. Neither
+      // is something this account can honour right now.
+      { provider: "codex", modelId: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+      { provider: "codex", modelId: "", name: "Codex default", defaultImplied: true },
+    ],
+  });
+  dispatch(h.window, { type: "repos", entries: [], selectedCwd: "/repo", activeCwd: "/repo" });
+  h.posted.length = 0;
+  return h;
+}
+
+// "Not connected => Not visible" (owner, 2026-08-17). A provider that cannot
+// answer is absent from the picker entirely — no models, no heading, no
+// sign-in row. It used to put an agent you cannot choose in the middle of the
+// menu for choosing one, and on a phone that row could not even be actioned,
+// because the host refuses `runGrokLogin` from a remote. Manage providers at the
+// bottom is the single way back, for every provider and every surface.
+describe("model picker for an agent that needs a sign-in", () => {
+  it("opens while signed out and keeps Manage providers actionable", () => {
+    const h = bootSignedOutCodex();
+    click(h.window, $(h.doc, "gear-btn"));
+    expect($(h.doc, "gear-popover").hidden).toBe(false);
+    expect(h.doc.querySelectorAll(".model-picker-row")).toHaveLength(0);
+    const manage = h.doc.querySelector(".model-manage-providers") as HTMLButtonElement;
+    expect(manage.disabled).toBe(false);
+    click(h.window, manage);
+    expect(h.doc.querySelector('[data-category="providers"].active')).toBeTruthy();
+  });
+
+  it("keeps a healthy agent's models and drops the signed-out one's heading", () => {
+    const h = bootWebview();
+    dispatch(h.window, {
+      type: "providerState",
+      providers: [
+        { id: "grok", connected: true },
+        { id: "codex", connected: true, needsLogin: true },
+      ],
+    });
+    dispatch(h.window, {
+      type: "session",
+      sessionId: "fresh",
+      provider: "grok",
+      currentModelId: "grok-build",
+      models: [
+        { provider: "grok", modelId: "grok-build", name: "Grok Build" },
+        { provider: "codex", modelId: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+      ],
+    });
+    click(h.window, $(h.doc, "gear-btn"));
+
+    expect(popoverText(h.doc)).toContain("Grok Build");
+    expect(popoverText(h.doc)).not.toContain("GPT-5.6 Sol");
+    // Codex contributes nothing at all now, so its heading goes with its rows.
+    expect([...h.doc.querySelectorAll(".model-provider-heading")].map((el) => el.textContent))
+      .toEqual(["Grok"]);
+    expect(popoverText(h.doc)).not.toContain("Sign in to load models");
+  });
+
+  it("shows a remote the same absence, never a button the host would refuse", () => {
+    const h = bootSignedOutCodex({ remote: true });
+    click(h.window, $(h.doc, "gear-btn"));
+
+    expect(popoverText(h.doc)).not.toContain("Sign in at the desk to load models");
+    // `runGrokLogin` is host-local; the host would refuse it, so the phone must
+    // not send it in the first place.
+    expect(types(h.posted)).not.toContain("runGrokLogin");
+  });
+});
+
+describe("the Accounts cluster for an agent that needs a sign-in", () => {
+  // The verb is Connect, same as a provider that was never linked. "Sign in
+  // again" described OUR bookkeeping — linked once, credentials lapsed — and to
+  // the user both rows meant the same thing: this one does not work, press here.
+  // Owner's call, 2026-08-17. The row keeps its warning styling, so the stale
+  // state is still visible without a second word for one action.
+  it("offers Connect, not signing out, and never says Sign in again", () => {
+    const h = bootSignedOutCodex();
+    click(h.window, $(h.doc, "rail-gear-btn"));
+
+    expect(popoverText(h.doc)).toContain("Connect");
+    expect(popoverText(h.doc)).not.toContain("Sign in again");
+    expect(popoverText(h.doc)).not.toContain("Sign out");
+    const row = items(h.doc).find((el) => el.textContent?.includes("Connect")) as HTMLElement;
+    click(h.window, row);
+    expect(h.posted).toContainEqual({ type: "runGrokLogin", provider: "codex" });
+    expect(types(h.posted)).not.toContain("logout");
+  });
+
+  it("keeps sign-out for a healthy account in Settings, not the gear", () => {
+    const h = bootWebview();
+    dispatch(h.window, {
+      type: "providerState",
+      providers: [{ id: "codex", connected: true }],
+    });
+    click(h.window, $(h.doc, "gear-btn"));
+    expect(popoverText(h.doc)).not.toContain("Sign out");
+    click(h.window, h.doc.querySelector(".model-manage-providers")!);
+    expect(h.doc.querySelector('[data-id="providerCodex"]')!.textContent).toContain("Sign out");
+    expect(h.doc.querySelector('[data-id="providerCodex"]')!.textContent).not.toContain("Connect");
+  });
+});
+
+describe("remote missing-provider guidance", () => {
+  it.each([
+    ["missing-cli", "grok"],
+    ["missing-codex", "codex"],
+  ] as const)("keeps the remote %s screen guidance-only", (state, provider) => {
+    const h = bootWebview({ remote: true });
+    dispatch(h.window, { type: "onboarding", state, platform: "linux", provider });
+    const onboarding = $(h.doc, "welcome-onboarding");
+    expect(onboarding.textContent).toContain("missing at the desk");
+    expect(onboarding.textContent).toContain("refresh this remote view");
+    expect(onboarding.querySelector('[data-act="installCodex"]')).toBeNull();
+    expect(onboarding.querySelector('[data-act="runInstall"]')).toBeNull();
+    expect(onboarding.querySelector('[data-act="retryProvider"]')).toBeNull();
+    expect(types(h.posted)).not.toContain("retryProviderSession");
+  });
+});

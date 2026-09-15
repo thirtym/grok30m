@@ -1,389 +1,1262 @@
 # Changelog
 
-## 1.4.29 — 2026-07-05
+## 4.5.2 — 2026-09-13
+
+**If your project had its own setting for reasoning effort, the picker could not move it.** You dragged the strip, the new level showed while the popover was open, and about a second after you closed it the level went back — to the same one every time, whatever you picked. Reported as "can't set effort level; goes back to 'low'" (#162), and invisible to anyone without such a setting, which is why it took a screen recording to see.
 
 ### Fixed
 
-- **A permission request that's only an edit is now reviewable, and its diff survives a VS Code restart.** A standalone edit collapsed to a bare one-line row with no way to open the diff — while a read+edit batch stayed expandable — and on restore the diff was lost entirely. A lone edit now keeps the same collapsible tool group (chevron, "N → M lines", "open diff →") as a multi-tool batch, in both the live and resumed orderings. ([media/chat.js](media/chat.js)) (#30)
+- **The effort you pick is the effort the conversation runs at.** Your choice was written to your user settings while the next session read the value that actually applies here — and a project-level setting outranks a user one. So every change was recorded faithfully somewhere nothing would ever read, the conversation restarted at the project's level, and the strip reconciled to that. The picker now moves the setting wherever it lives, so what you pick is what the conversation gets. The model and mode pickers were written the same way and are fixed with it.
 
-## 1.4.28 — 2026-07-01
+- **One level is called one thing.** The effort strip's header said "Extra high" while the tip directly beneath it said "XHigh", because the tips were spelled out separately from the name. They share it now, and the descriptions in Settings match.
 
-### Fixed
+## 4.5.1 — 2026-09-13
 
-- **The mode switch (Agent / Plan / Auto-accept) is now disabled while the session is starting.** Picking a mode before the session existed called `setMode` too early and surfaced *"Couldn't switch mode: no session."* The mode button is greyed out and unclickable until the session is ready — like the send button — and the toggle-mode command is guarded server-side too. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css), [src/sidebar.ts](src/sidebar.ts))
-
-## 1.4.27 — 2026-07-01
+**The control under the message box stops being an anonymous cog.** It says which model is answering and how hard it is thinking, right there on the button, and opens the picker rather than a menu you then navigate. Effort became a strip you can drag instead of five dots with no scale attached. The picker now stays open while you change your mind — pick a model, then pick an effort, one visit — and both changes leave together when you close it. Alongside that, three things that were plainly wrong on a phone: effort changes that appeared not to save, a picker that went half-transparent for the length of a turn, and a context breakdown that broke numbers in half.
 
 ### Added
 
-- **Context files now tell Grok how they got there.** A file you explicitly attach is listed as **"Attached file(s)"** (strong intent); the file that's auto-included because it's open in your editor is listed separately as **"Currently open in the editor (for context)"** (weaker, ambient) — so Grok doesn't treat a file you're just looking at as one you asked it to act on. ([src/prompt-builder.ts](src/prompt-builder.ts))
-- **Uploaded attachments now have their own row above the input**, each with a remove (×) button. The active-editor file stays in the bottom toolbar as before. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css), [src/sidebar.ts](src/sidebar.ts))
+- **A composer chip that names what it holds.** Which model is answering and what effort it is running at, on the face of the button, where it used to take a click and a menu to find out. Clicking it opens the model picker directly. The mode button beside it is unchanged.
 
-### Fixed
+- **Effort is a strip, and you can drag it.** Five dots are a quantity with no scale attached; this is a rail with a gradient and a knob, and the stops come from what the model you are on actually advertises — so the ladder matches the model rather than a fixed list. Drag it with a finger or a mouse, or tap a stop. One effort is one colour on every surface: the same four anchors are declared in the extension, the desktop app and the web client.
 
-- **grok-build now shows its real name and 512K context window.** grok resolves a `set_model("grok-build")` to a *versioned* id (`grok-build-0.1`) that isn't in the model list, so the toolbar showed the raw id and the context donut fell back to the 200K default (percentage read ~2.5× too high). The id is now normalized back to the list entry, and the window recomputes on every model change. ([src/acp.ts](src/acp.ts), [src/acp-dispatch.ts](src/acp-dispatch.ts), [media/chat.js](media/chat.js))
-- **The voice/mic button no longer jumps when attachments appear.** It's now anchored to the input box instead of the composer, so the new attachments row above the input doesn't shove it out of place. ([media/chat.css](media/chat.css), [src/sidebar.ts](src/sidebar.ts))
-- **Attachment chips show just the filename** — in the composer, the sent-message bubble, *and* restored sessions — for files outside the workspace (Windows absolute paths were previously shown in full); the full path stays on the hover tooltip, and Grok still receives the full path. The file-path context is sent in a machine-readable `<vscode-context>` envelope so the webview can parse it back deterministically on restore instead of showing the raw replayed paths. ([media/chat.js](media/chat.js), [media/webview-helpers.js](media/webview-helpers.js), [src/prompt-builder.ts](src/prompt-builder.ts))
-- **Code blocks no longer render with a doubled blank line around them.** A fenced code block was wrapped in `<br><br>` on top of its own margin (the model sends just one blank line), so it looked double-spaced; code blocks are now emitted as their own block, like tables and math. ([media/chat.js](media/chat.js))
-
-## 1.4.26 — 2026-06-30
-
-### Fixed
-
-- **Updating the Grok Build CLI no longer fails with "cannot rename locked executable."** The update tore the session pool down but didn't *wait* for the grok processes to actually exit, so `grok update` raced the still-held Windows lock on `grok.exe` (`Access is denied. (os error 5)`). Teardown now resolves only once each process has truly exited, kills the whole process **tree** on Windows (`taskkill /T /F`, so grok's backgrounded subagent/command children don't keep the binary locked), and the update retries once if a lingering lock slips through. ([src/acp.ts](src/acp.ts), [src/sidebar.ts](src/sidebar.ts), [src/cli-locator.ts](src/cli-locator.ts))
+- **The microphone moved out of the message box.** It sat inside the text area, so every line of a long prompt was indented around a button that only matters at the start. It is in the toolbar now, and the text takes the full width.
 
 ### Changed
 
-- **Directory listings show the full relative path with a trailing slash** — `List docs/` and `List docs/screenshots/` instead of the basename-only `List screenshots`. ([media/chat.js](media/chat.js))
+- **The picker stays open when you pick a model.** Choosing one used to close it, so "this model at that effort" cost two visits — and the second could not start until the first had finished restarting the conversation. Now the chip and the strip update the moment you tap, the popover stays up, and the change is committed once when you close it. Reopen it before it has landed and you see what you picked, not the value being replaced.
 
-## 1.4.25 — 2026-06-30
+- **Model and effort leave as one message, and cost at most one restart.** When a single visit changes both, they travel together rather than racing each other, and if the model change has to restart the conversation the effort rides that restart instead of asking for a second one. Pressing **Send** with the picker still open commits it first, so the prompt runs on the model you just chose and not the one you replaced — and a send waits for the change to land. If applying it needs a restart and the app asks you about it, the send stops waiting and goes to the conversation you are in, because a question on screen must never quietly swallow what you typed.
+
+- **The context ledger says thousands as thousands.** `1.48K`, `10.28K`, `499K`, `1.2M` — two decimals below a hundred thousand and none above it, with the exact figure still in the donut's own tooltip. Numbers under a thousand are short enough to say outright and are left alone.
 
 ### Fixed
 
-- **Empty primer-only sessions are cleaned up even when large.** A hidden-primer turn can balloon to dozens of agentic tool/reasoning messages with no real user message; the startup sweep skipped those (`num_messages` over the gate) so they lingered in history with a primer-derived title. The chat-history content check is now authoritative regardless of message count — a session with our primer and zero real user queries is swept (real and renamed sessions are still never touched). ([src/sessions.ts](src/sessions.ts), [src/sidebar.ts](src/sidebar.ts))
-- **The send button now shows the spinner from the moment the panel opens.** During the initial session spin-up it briefly showed neither the send arrow nor the spinner; it now defaults to the disabled spinner until the session is live. ([media/chat.js](media/chat.js))
-- **Tool rows now show the detail again for List / Search / Fetch.** A directory listing shows the folder (`List docs`), a read shows the file and line range (`Read README.md lines 1-30`), a search shows the pattern, and a web fetch shows the page URL — these had regressed to a bare verb because the rawInput field names (`target_directory`, `url`) weren't being read. Verified against real on-disk sessions. ([media/chat.js](media/chat.js))
+- **An effort change sticks instead of silently snapping back.** Reported on a phone as "starts saving, refreshes, then nothing happens", with the control unmovable a second time. Two causes under one symptom: on a conversation with no history the app restarts the session to change effort, which locked the control mid-gesture and swallowed every correction after the first — the strip now previews while it is open and commits once, at the end, on the level you actually landed on, which is also one restart rather than one per stop your finger crossed. And on Codex the conversation announced the CLI's own configured default a moment before the requested level applied, so the strip redrew at whatever `~/.codex/config.toml` says and stayed there.
 
-### Changed
+- **The picker stops going half-transparent while an answer streams.** Selection is locked for the length of a turn, and that was being said with opacity — over a transcript on a phone it read as a half-erased panel rather than a locked one, and it washed out the effort gradient, whose colour is the whole readout. Locked is a text colour now.
 
-- **The diff-preview edit row is now a single line** — `Edit chat.js  9 → 10 lines  open diff →` instead of three stacked lines. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **Table cells no longer break mid-word.** Long header/cell words were chopped between letters, making columns look cramped and arbitrarily narrow; cells now wrap only at spaces and hyphens (an unbreakable run falls back to the table's horizontal scroll). ([media/chat.css](media/chat.css))
-- **The Grokking indicator spins the other way.** ([media/chat.css](media/chat.css))
-- **The scroll-to-bottom button sits slightly higher**, so its gap above the composer's top border matches the border-to-textarea gap. ([media/chat.css](media/chat.css))
-- **Trimmed the README privacy section** to a short privacy-by-design summary; the full detail moved to [docs/privacy.md](docs/privacy.md). ([README.md](README.md), [docs/privacy.md](docs/privacy.md))
+- **The context breakdown stops breaking numbers in half on a phone.** `10,284` was arriving as "10,28" and then "4" on the next line. The popover is shrink-to-fit, and the rule that lets long version strings wrap in the same rows had collapsed it toward the width of a single character; it now asks for the width its contents want, and a figure is one word whatever its label does.
 
-## 1.4.24 — 2026-06-29
+## 4.5.0 — 2026-09-11
 
-> Privacy-first, opt-out anonymous usage telemetry.
+**Steer stops being a Grok feature, and every installer starts aiming at the version this app tells you to be on.** Codex hears a mid-turn correction now, attachments and all. Both ACP adapters moved — Codex ten minors, Claude seven — behind a new gate that drives the real adapters against your own CLIs instead of a stand-in. And a chain of small dishonesty around CLI versions is gone: the Providers row named a version, every installer fetched whatever was newest instead, and pressing **Update** stopped every session on that provider to install something already on disk.
 
 ### Added
 
-- **Anonymous usage telemetry (Aptabase).** One `session_start` event per session — fired on the **first real user message** (never the primer or empty/abandoned sessions) — carrying only an anonymous install id (a random GUID, no account or grok-login identity) plus the chosen **mode / model / effort**. **No message content, code, or file paths are ever sent;** country is derived by Aptabase from the request IP and the IP is then discarded. **On by default but fully gated** — it sends only when VS Code's global `telemetry.telemetryLevel` is enabled *and* the new `grok.telemetry.enabled` setting is on; either off stops everything. The event is built synchronously (capturing the right session's mode/model/effort) but **fired asynchronously off the send path** and any error is **swallowed silently**, so telemetry can never slow, surface to, or break a turn — a failure (offline, a wrong/typo'd key → a harmless 404, a malformed event) just means nothing lands. Thin, dependency-free client (no SDK). ([src/telemetry.ts](src/telemetry.ts), [src/sidebar.ts](src/sidebar.ts), [package.json](package.json))
+- **Steer works with OpenAI Codex.** A message sent while an agent is working has always had two outcomes — queue it, or **Steer** it into the running turn without cancelling anything or losing the tool work in flight. That second one was Grok-only, and not because Codex could not do it: its adapter registers mid-turn steering and advertises it at startup, and the button was being drawn off a provider name instead. Your correction now reaches the turn you are watching, with attached files and images along with it. Claude Code has no mid-turn interject at any version, so there the button stays absent and a message you send while it works queues, which is what it always did.
 
-### Tests — 609
+- **Edit the config file each CLI actually reads.** Gear → **Provider config files** opens `~/.grok/config.toml`, `~/.codex/config.toml` and `~/.claude/settings.json` in the same editor the file panel already uses — from a phone as readily as at the desk. Those three files are the whole list; the credentials that sit beside them are not reachable from here. A CLI reads its config at startup, so the panel offers to restart the conversation you have open once you save, and says plainly that other running sessions keep the settings they started with.
 
-- New: the telemetry helpers — `aptabaseHost` (region from app key), `osNameFromPlatform`, the `shouldSendTelemetry` two-gate check, distinct prod/dev keys, `buildSessionStartEvent` (install id + mode/model/effort as props, no content), and that `postEvent` **never throws** (a circular/malformed event or a no-region key is a silent no-op) ([test/telemetry.test.ts](test/telemetry.test.ts)). The unit suite stays network-free; a separate `npm run telemetry:probe` ([scripts/telemetry-probe.cjs](scripts/telemetry-probe.cjs), with an `APTABASE_KEY` override to fire a wrong key) sends real events to a **dev** Aptabase project (the published extension always reports to prod).
+- **Changes wherever there is a repository.** The Changes view was gated on Coding purpose. It now appears whenever the conversation has a repository, because cloning one and reading what changed in it is not a coding-only thing to do. The Changed-files card at the end of a turn stays Coding-only — it belongs to the turn that made the edits, not to the repository.
 
-## 1.4.23 — 2026-06-29
+### Changed
 
-> Hidden-by-default thinking traces with an always-on progress indicator, a scroll-to-bottom button, a remembered mode preference, and the YOLO → Auto accept rename.
+- **The Codex and Claude adapters moved to the versions people actually run** — `@agentclientprotocol/codex-acp` to 1.11.0 (ten minors) and `claude-agent-acp` to 0.76.0 (seven). An adapter bump moves streaming shape, tool-call framing, permission parameters and session resume at once, and until now nothing in the test suite drove a real one. `npm run smoke:acp` does: it takes both real adapters against your own Codex and Claude CLIs and reports pass or fail per capability — initialize, session, streaming, a tool call, a permission request, mid-turn cancellation, resume, and steering — so a bump that breaks one provider is dropped alone instead of shipping.
+
+- **Update installs the version the app names.** The Providers row reports the version this release is built against and offers to move you to it, and then every installer fetched "latest" instead — so a machine that had just been updated could still be told it was behind. npm installs, the CLIs' own updaters and the cloud machines' boot script now all take the exact version. Codex's own updater is the one deliberate exception: we never measured a version-capable form of it, and guessing one turns a working update into a failing one.
+
+- **Update stops tearing your sessions down for nothing.** The row that enables the button can be minutes old, and you may have updated in a terminal since — or another window may have done it already. The version is re-read at the moment you press, and a CLI that is already current simply says so, instead of stopping every conversation on that provider for a few minutes to install what was already there. A version that cannot be read is not treated as current: that is not evidence of anything, and refusing on it would strand you on a broken binary.
+
+### Fixed
+
+- **A returning machine reconnects in seconds instead of half a minute.** A laptop or cloud machine that suspends leaves its connection frozen open at the relay, so the same host coming back was told the device was taken — and then doubled its own retry delay on every refusal: 2, 4, 8, 16, 30 seconds. Measured on a real machine rather than reasoned about, eight of those ladders over three days. The service now asks the connection it is holding whether it is still alive the moment somebody knocks, and the returning host waits that check out instead of spending a full backoff step on it.
+
+- **Waking a cloud machine from a phone says what is happening, and offers something to press.** The page used to infer the machine's state from how long it had been quiet, which is how a machine that was already awake could look asleep, and one that would never answer could look busy indefinitely. It now reports what is actually known — checking, waking, waiting for the host, reachable, failed — and a wake that fails ends in a **Retry** rather than a spinner.
+
+- **A correction Codex refuses no longer takes the answer you were reading with it.** Codex can refuse a steer in-band, as a perfectly successful response that carries a failure inside it, and the first version of this feature read that as a dead connection — dropping the reply that was streaming at the time. A refusal now queues your text, tells you it did, and leaves the running answer and the Steer button alone. A refused correction sent from a phone is no longer billed twice, either.
+
+- **Copy image works for pictures the agent generated, in the desktop app.** Copying at original resolution needs a handle to the file on disk, and generated images never got one, so the button was disabled with an honest message and no way forward. It works now, and a phone keeps the picture it already has rather than fetching it again.
+
+- **A connector whose server we watched fail is no longer handed to the agent.** A connector with a valid token whose proxy cannot reach its server used to go to the agent anyway: the agent called a tool on it and the call hung, which on a phone is a dead end. That outcome is now remembered, and only a proxy that exited with a terminal connection error counts — a timeout, a spawn failure, a registry lookup or a successful transport fallback all withhold nothing, because a false positive silently removes a connector that works.
+
+## 4.4.0 - 2026-09-09
+
+**Is my work safe to walk away from?** The panel now answers that without leaving the conversation: a **Changes** view that says where things stand in one sentence and carries one button for the whole promise, a **Changed N files** card at the end of every coding turn, and a refused push that names the next move instead of quoting git at you. Alongside it, a design pass over the file panel's strip: one selected thing, one palette for "changed", and a folder icon that means "project" and nothing else.
 
 ### Added
 
-- **Thinking traces are hidden by default (#26).** Grok's reasoning no longer fills the chat — a muted **Thinking…** stand-in (brain icon) shows while it reasons. Turn traces back on from gear → **Config & debug → Show thinking traces** (a live switch backed by `grok.showThinking`); it reveals them on already-loaded sessions too. When shown, a thinking row now matches the tool rows — same font size, a leading **brain icon**, and the shared chevron + hover (it was a smaller 11px and icon-less). ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css), [src/sidebar.ts](src/sidebar.ts), [package.json](package.json))
-- **The chat always shows live progress during a turn.** While a turn is in flight, one of **Grokking / a running tool / Thinking…** is guaranteed on screen — no dead frames, even with traces hidden. ([media/chat.js](media/chat.js))
-- **Scroll to bottom (#28).** A floating button appears above the composer once you scroll up off the bottom; click it for an animated jump back down. It's anchored to the chat input area, so it stays correctly placed at any `chatFontScale` zoom. ([src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **New sessions remember your last mode (#25).** The last switch between **Agent** and **Auto accept** is reapplied on new sessions (Plan is deliberately never remembered), mirroring how model & effort already persist. It's applied up-front, so the toolbar shows the right mode from the first paint — no Agent → Auto accept flash while the session primes. Backed by `grok.defaultMode`. ([src/sidebar.ts](src/sidebar.ts), [package.json](package.json))
+- **A Changes view, reachable from a phone.** The file panel's branch button carries a badge of not-committed files and opens a view that answers the question you actually have — conflicts, then uncommitted work, then unpushed commits, then clean — in one sentence, with the size of the change beside it. **Commit** and **Commit and push** share one row, unpushed commits get **Push N commits**, and **Move to a new branch…** takes the whole batch aside. It is every changed file or none: to leave one out, discard it from inside its diff, because an irreversible action should require having looked. Each file opens into the same diff the chat renders under a tool call. It never runs `git fetch`, so *behind* is as of your last one and the line says so. Coding purpose only, and it reads and works the same from a phone as at the desk.
+
+- **A refused push says what to do next.** When GitHub will not let you push, the notice reads **Push needs GitHub. Connect it in Settings.** with a **Connect GitHub** button that takes you there. When the remote has commits you do not have, it says so and offers **Ask the agent to pull**. A protected branch, a repository that is not there, a remote that cannot be reached and hosts other than GitHub each get one plain sentence, with git's own line underneath for those who want it. **Ask agent to pull** also sits on the branch line at all times; it puts the request into the message box and leaves sending to you.
+
+- **A "Changed N files" card at the end of every coding turn** ([#82](https://github.com/phuryn/grok-build-vscode/issues/82), [PR #83](https://github.com/phuryn/grok-build-vscode/pull/83)). Every path the turn touched with its `+N −M`, git's own M / A / D letters in front, and **Open Changes** one tap away. Tap a row for that file's diff, or the header to fold and unfold the card. **Expand diff card** (Settings → General) chooses whether cards start open; on a phone the choice is per device. Built by @datvm.
 
 ### Changed
 
-- **The progress indicators now share one look.** *Grokking*, the *Thinking…* stand-in, and a running tool all use the editor font size, a 15px leading icon, and the same muted color + spacing — a running tool no longer brightens to look hovered. Motion is per-indicator: *Grokking* spins a lucide **orbit** icon (it's a generic wait), while *Thinking* and tools use the **three blinking dots** (discrete progress) — both replacing the old morphing "…" pills. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **Renamed the "YOLO" mode to "Auto accept."** The mode picker and the bottom-toolbar button now read **Auto accept**; "YOLO" survives only in the picker's one-line description. The internal mode id (`yolo`) and `autoApprove` flag are unchanged. ([media/chat.js](media/chat.js))
-- **A user message's copy + timestamp now appear on hover** (the bubble or the row beneath it), matching grok messages — they used to always show. ([media/chat.css](media/chat.css))
-- **Trimmed the README feature descriptions** that already carry a screenshot, cutting the redundant "what it looks like" prose. ([README.md](README.md))
+- **One selected thing in the file panel's strip.** The project folder, the file tabs and the Changes button used to mark "where am I" three different ways, and entering Changes lit two at once. Now one underline, on whichever of the three is showing. Every named tab closes itself, and so does every row of the overflow menu, so shutting five files on a phone no longer means opening five files first.
 
-### Tests — 599
+- **One palette for "changed".** The yellow that means "modified, not committed" marks the dot on a tab, the M beside a file, the count badges, and a small dot on every changed file and every folder above it — so a closed folder that hides a change now says so. Added is teal and deleted is coral on the tree, the card and the diff alike, with darker relatives on a light theme.
 
-- New: the Auto accept label, the thinking-traces toggle (hidden-by-default body class, live flip, the **Thinking…** stand-in vs. a visible trace, the Config & debug switch), the Grokking orbit indicator, the scroll-to-bottom visibility threshold + click, and a **step-by-step turn simulation** asserting a live progress indicator after every mid-turn event with traces hidden *and* shown ([test/webview-ui.dom.test.ts](test/webview-ui.dom.test.ts), [test/webview-harness.ts](test/webview-harness.ts)); the remembered-mode policy `modeToRemember`/`startsInYolo` — Plan never persisted, applied to new sessions only (#25) ([test/mode-prefs.test.ts](test/mode-prefs.test.ts)).
+- **A folder icon means a project.** Tree rows lost their folder glyphs; the strip title wears the open-folder outline and stays muted until it is the selected thing; the projects rail draws its folders in outline too. The count badge is a circle. Refresh lives beside the tree's filter and only there — Changes re-reads on its own.
 
-## 1.4.22 — 2026-06-29
+## 4.3.0 - 2026-09-08
 
-> Single-home the sidebar so it can be moved in Cursor, and stop forcing whole-file reads on attachments.
-
-### Fixed
-
-- **The view can be relocated again (Cursor).** We declared the `grokSidebar` container in **two** places at once (`activitybar` + `secondarySideBar`); `secondarySideBar` only exists in VS Code ≥ 1.106, so on older bases (incl. current Cursor) the stray declaration is parsed-but-unsupported — it pinned the view to the left and could even shift *other* extensions' views. The container is now single-homed to `activitybar`; relocate it with right-click the **Grok** title → **Move To → Secondary Side Bar** (it persists). ([package.json](package.json))
-- **Attached files are handed to grok as paths, not `@`-reads.** A file chip used to become `@relPath`, grok's "read this whole file" convention — which slurped large files (a big CSV/log) into context and *failed outright on binaries*: an attached image or video triggered `read_file` → *"Cannot read binary file"* (grok has no vision). Chips now render as a plain **"Attached file(s):"** path list, so grok decides how to consume each — grep/range-read big text, pass image/video paths to its media tools, read small files in full. Selected-range chips still inline the exact lines you picked. ([src/prompt-builder.ts](src/prompt-builder.ts))
-- **Corrected the subscription requirement.** The sign-in screen claimed *SuperGrok **Heavy*** was required for Grok Build — wrong on two counts: it's **any SuperGrok *or* X Premium+** subscription, and naming the $300/mo Heavy tier scared off eligible users. Fixed in the onboarding, README, and Marketplace description (and clarified that Grok's free tier doesn't include the CLI agent). ([media/chat.js](media/chat.js), [README.md](README.md), [package.json](package.json))
-
-### Changed
-
-- **Renamed the "Voice input" feature to "Voice control"** across the UI and docs. ([README.md](README.md), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
-- **Welcome byline reads "(The Product Compass)"** again (dropped the "Newsletter" suffix). ([src/sidebar.ts](src/sidebar.ts))
-
-## 1.4.21 — 2026-06-29
-
-> Documentation-only patch: the README screenshots now match the current (v1.4.20) UI.
-
-### Changed
-
-- **README screenshots refreshed.** New hero image, plus shots for **session history**, the redesigned **tool-call rows**, and the **permission diff-preview** card; the tool-calls description now matches the categorized/icon design. The old v1.2.0 sidebar screenshot is removed. ([README.md](README.md), [docs/screenshots/](docs/screenshots/))
-
-## 1.4.20 — 2026-06-28
-
-> A chat-readability overhaul plus housekeeping: tool and thinking rows get Codex-style category icons and a muted-until-hover look, failed tools finally show *why*, each narration sits above the tools it describes, and the empty "primer" sessions stop cluttering history (#24). Also renamed **Unofficial → Community**.
-
-### Changed
-
-- **Tool-call summaries are categorized by what the tool actually did.** Reads, globs, and greps were all rolled up as "Ran N commands"; they're now bucketed by ACP kind into "Explored N items" / "Edited N files" / "Deleted N files" / "searched web" / "Ran N commands" — so a turn that read five files reads "Explored 5 items", not "Ran 5 commands". Works on resumed sessions too: when the wire form omits `kind`, the category is recovered from the tool's title. ([media/chat.js](media/chat.js))
-- **A turn's narration now interleaves with its tool groups instead of piling above them.** grok narrates each step then runs its tools (narrate → tools → narrate → tools); the narration used to coalesce into one bubble with the tool summaries stacked consecutively below it, so the summaries looked arbitrary. Each narration sentence now renders directly above the tool group it introduced, preserving grok's actual order. ([media/chat.js](media/chat.js))
-- **Tool and thinking rows restyled (Codex-aligned).** Each tool row (single or group) now leads with one **lucide category icon** — `file` (read) / `folder-search` (search) / `pencil` (edit) / `square-terminal` (command, and the catch-all), picked by the strongest action in a group. Rows are flush-left in the standard font, **muted by default and brighten on hover** (no background highlight); a running group stays "active" until it completes. Expanded bodies use a thin secondary border (not blue). Thinking blocks now share the tool rows' chevron — same glyph, on the **right**, after the label — and the same expand border. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **Generated images/videos align with the message text** — dropped the extra horizontal inset they carried. ([media/chat.css](media/chat.css))
-- **Renamed "Unofficial" → "Community".** The chat header, extension title, and README now read **Grok Build (Community)** / **Grok Build for VS Code (Community)**; the About fine print still notes it's unofficial, community-built, and not affiliated with xAI. ([package.json](package.json), [README.md](README.md), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
-
-### Fixed
-
-- **Tool-call labels no longer leak raw regex/glob patterns.** A search tool used to render its bare pattern (e.g. `image_edit|/imagine`) as the whole label; it now shows `Search <pattern>`, and any tool we didn't predict falls back to grok's own formatted title instead of scraping arbitrary raw input. ([media/chat.js](media/chat.js))
-- **Failed tool calls now show their reason instead of being silently dropped.** A `status: "failed"` tool update (e.g. *"Tool `image_to_video` failed: image reference not readable: …"* — grok occasionally malforms an image argument) used to render as nothing, so grok just looked like it gave up. The row now goes error-colored with the failure message beneath it (and a collapsed group with a failed child tints its icon red). ([media/webview-helpers.js](media/webview-helpers.js), [media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **Empty "primer" sessions stop piling up in history (#24).** Each time the extension opened it left behind an empty, primer-only session (the ones titled "… Primer v4 Plan Mode …"). Now abandoning an empty session — New Session, or switching to another — deletes it on the spot, so at most one untitled **New session** ever exists; and a one-shot startup sweep clears the empties earlier runs left behind, each confirmed primer-only by **reading its chat history** so a real or non-extension session is never touched. Detection is content-based and agent-agnostic — it counts both `<user_query>`-wrapped prompts and the **unwrapped** ones grok/composer sends for slash commands like `/imagine` (so a real composer session is never mistaken for empty) — verified against real on-disk sessions from both the `grok-build` and `cursor` (composer) agents. The live untitled session always shows as **New session**, never grok's primer-derived title. ([src/sidebar.ts](src/sidebar.ts), [src/sessions.ts](src/sessions.ts), [src/grok-primer.ts](src/grok-primer.ts))
-
-### Tests — 582
-
-- New: tool-call categorization rebuilt from real Grok + Composer transcripts, the raw-pattern-leak fix, the unpredicted-tool fallback, narration↔tool-group interleaving, plan/permission cards landing below the interleaved lead-up, the per-row **category icons** (strongest-action pick), and **failed-tool surfacing**, driving the real `media/chat.js` ([test/tool-summary.dom.test.ts](test/tool-summary.dom.test.ts)); the thinking↔tool **chevron unification** ([test/webview-ui.dom.test.ts](test/webview-ui.dom.test.ts)); empty-primer-session detection incl. unwrapped composer prompts — `extractUserQueries` / `classifyUserQueries` / `isEmptyPrimerSession` ([test/sessions.test.ts](test/sessions.test.ts)) and `isPrimerSummary` ([test/grok-primer.test.ts](test/grok-primer.test.ts)).
-
-## 1.4.19 — 2026-06-28
-
-> Card-UX polish from a live image-generation session: permission cards read in order and minimize once answered, restored plans start collapsed, and background-task notices stop polluting the chat.
-
-### Fixed
-
-- **Grok's reply after a permission prompt now renders *below* the card, not above it.** A permission request arrives mid-turn, so streaming kept appending to the agent bubble already on screen *above* the new card — only a fresh user turn pushed the conversation past it. The card now finalizes the in-flight turn first (the `commitAgentTurn()` the plan card already used), so everything after the answer lands beneath it, in order. ([media/chat.js](media/chat.js))
-- **Answered permission cards no longer reappear *active* when you re-focus a backgrounded session.** Re-focusing replays the session's post buffer, but the answer (a webview-only collapse) was never in it, so an already-decided card came back fully expanded with live buttons. The host now records a `permissionResolved` marker in the buffer on answer, so the replayed card comes back collapsed. ([src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
+**A long conversation stops paying twice for the context it already sent.** An outside contributor benchmarked multi-turn conversations and found prompt caching never engaging at all — input climbing turn after turn while nothing was ever read back from cache. Five separate causes, each fixed where it started. Alongside that: copying a picture out of a conversation, an experimental button that walks back through your own prompts, and dragging files in from the Explorer finally doing what it looks like it does.
 
 ### Added
 
-- **Answered permission cards now persist across a full reload.** The CLI doesn't replay `session/request_permission` on `session/load`, so resumed sessions used to lose every approval you'd made. The extension now persists each answered card (title + allowed/rejected + the gated tool-call id) and replays it as a **collapsed** card **anchored to the exact tool it gated** — by tool-call id, or by the tool's title when no id was captured (the card title *is* the tool's title) — so it lands where you answered it, mid-turn, not at the turn boundary (with a user-message-position fallback if the tool never replays). ([src/sidebar.ts](src/sidebar.ts), [src/session.ts](src/session.ts), [src/sessions.ts](src/sessions.ts), [src/acp-dispatch.ts](src/acp-dispatch.ts), [media/chat.js](media/chat.js))
+- **Copy a picture out of a conversation** ([#150](https://github.com/phuryn/grok-build-vscode/issues/150)). Click an image in the transcript to enlarge it, and **Copy image** puts it on your clipboard at its original resolution — not the preview you are looking at, which is scaled to fit. It works from a phone or a browser as well as at the desk. A host older than this release cannot supply the original, and there the button is simply absent rather than quietly handing you a smaller picture than you asked for. Requested by @Emma-Walker.
 
-### Changed
+- **A button that jumps back to your previous prompt** ([#150](https://github.com/phuryn/grok-build-vscode/issues/150)). Off by default, under **Settings → Advanced → "Experimental: Previous prompt button"**. A circle sits above the message box and walks backwards through your own prompts, marking the one it lands on so you can see which it means — including while an answer is still streaming, which is exactly when "what did I ask?" comes up. Pressed from inside an answer it takes you to the prompt that answer started from, and it stops at the first prompt rather than wrapping. The setting is per device, so a phone and a desk can disagree. Experimental because the shape of it is still an open question with the person who asked for it. Requested by @Emma-Walker.
 
-- **Answered permission cards collapse to one muted line.** Picking an option used to leave the full card with greyed-out buttons and a "you chose: …" note in the transcript. It now minimizes to a single non-interactive line — a colored `Allowed` / `Rejected` verb plus what it applied to — matching the resolved question/plan cards, with the "Grokking…" indicator underneath until grok resumes. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **Restored plan cards start collapsed.** Resuming a long session no longer dumps full plan text — each restored plan shows its title, verdict, and a `Show plan` / `Hide plan` toggle (the body stays in the DOM, just hidden). ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **Background-task completion is a one-shot toast, not a chat bubble.** When grok backgrounds a long command (e.g. a nested `grok -p …` image/video job), the CLI emits a structured `task_completed` update *and* feeds the result back as a `user_message_chunk` wrapped in `<system-reminder>…`. The extension now routes `task_backgrounded` / `task_completed` to their own events, pops a single `showInformationMessage` (with **Show Logs**) on completion — skipped during session replay — and drops the replayed `<system-reminder>` turn so it never surfaces as a fake user bubble on restore. ([src/acp-dispatch.ts](src/acp-dispatch.ts), [src/acp.ts](src/acp.ts), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
+- **The Explorer's context menu attaches everything you selected.** **Add to Grok chat** attached only the file you right-clicked, so highlighting five files and choosing it attached one. It now attaches the whole selection, and a file outside the conversation's project is refused once rather than once per file.
 
-### Tests — 545
-
-- New: `task_backgrounded` / `task_completed` routing, `summarizeBackgroundCommand`, and `permissionOutcomeFor` ([test/acp-dispatch.test.ts](test/acp-dispatch.test.ts)); permission-card ordering + collapse + re-focus survival + restored-collapsed-card interleaving, restored-plan collapse toggle, and `<system-reminder>` suppression on restore, driving the real `media/chat.js` ([test/card-collapse-tasks.dom.test.ts](test/card-collapse-tasks.dom.test.ts)).
-
-## 1.4.18 — 2026-06-28
-
-> Grok CLI fixed the #22 Windows session-start regression (0.2.71, now on stable as 0.2.72) — adopt it and re-enable updates.
+- **Two more tips on an empty conversation**, both about gestures that already worked and that nothing told you about: how to drag files in from the Explorer, and pasting a screenshot straight into the message box. The paste tip is withheld on a phone, which cannot do it.
 
 ### Fixed
 
-- **Sessions start on the latest Grok CLI again, and Windows updates are no longer paused (#22).** xAI fixed the `agent stdio` regression that hung session start on Windows across 0.2.61–0.2.70 (initialize on 0.2.61–0.2.64, then `session/new` on 0.2.67–0.2.70). The fix landed in **0.2.71** and is now on the **stable** channel as **0.2.72**. Verified end-to-end on native Windows — the `session/new` stdin-open probe passes and the full live ACP gate is green (handshake, prompt round-trip, session restore, plan-mode, subagent). The extension now treats **0.2.72 as the supported build**: it pins the bounded broken range **0.2.61–0.2.70** up to 0.2.72 before starting, and the gear → **Update Grok Build CLI** action (and the silent on-upgrade update) work normally again on Windows. The reactive downgrade-on-failure remains a backstop for any *future* still-broken build above 0.2.72. ([src/cli-locator.ts](src/cli-locator.ts), [src/sidebar.ts](src/sidebar.ts))
+- **A conversation stops re-sending context it has already sent** ([#151](https://github.com/phuryn/grok-build-vscode/issues/151)). Prompt caching never engaged, so every turn re-paid for the whole conversation: input grew 6.6k → 21.5k → 28.5k tokens over three turns with nothing read from cache. Reported with measurements and tested diffs by @zfzfg.
 
-## 1.4.17 — 2026-06-27
+- **A large editor selection is sent as a reference instead of a copy of the file.** A big selection re-injected around 102,000 characters into every single turn. Over 400 lines or 20,000 characters it now becomes the file's path and the line range. Older conversations still restore correctly.
 
-> Pin Windows to the last working Grok CLI for *any* newer build — 0.2.61–0.2.69 all break session start (#22).
+- **Steering an agent no longer re-sends whatever files happen to be open.** An interjection was quietly appending the ambient editor chips, so each one re-sent the current editor on top of what you typed.
+
+- **Each agent remembers its own effort level.** A single Grok-scoped setting was being used as the default for Codex and Claude Code too, so choosing an effort for one agent leaked to the others.
+
+- **An exhausted quota costs one turn instead of two.** A 403 that was not a credential problem re-sent the whole prompt against the same ceiling before giving up, and reported the second failure rather than the real one.
+
+- **No more command windows flashing on Windows.** Finding an agent's CLI shelled out to `where`; it now reads `PATH` directly, and falls back to a shell only when it has to — with the window suppressed.
+
+- **Dragging files out of the Explorer works** ([#136](https://github.com/phuryn/grok-build-vscode/issues/136)). It read as doing nothing, and was two bugs stacked. VS Code blocks its own drags from reaching any panel unless Shift is held, so the Explorer — the drag everyone tries first — never arrived. Shift was also *our* modifier for pasting a file's text inline, so the drops that did land silently became whole-file inline attachments and dragged images skipped image import entirely. Shift now means "inline" only for a drag that came from outside the editor. Reported by @rj-au.
+
+- **The context popover opens on the figure you clicked it for.** Reading one number unrolled two full ledgers and a list of restatements over it. Those fold now, each remembering whether you left it open, and the marker sits next to the word it opens instead of adrift at the far edge of the row.
+
+## 4.2.0 — 2026-09-07
+
+**Keep an agent's CLI current without leaving the app, and connect an app from your phone.** Two things that used to need a terminal — updating the CLI an agent runs on, and finishing a connector's sign-in — now work from wherever you are, including a cloud machine where there is no terminal to reach.
+
+### Added
+
+- **Update Codex's and Claude Code's CLI from Settings → Providers.** When the CLI on your machine is older than the version this release is built against, its row offers to update it — installed the way *you* installed it (npm, Homebrew, or the vendor's own installer), never quietly switching you to a different one. The row names the version you have and the one available, and appears only when there is actually something to take. Running sessions stop while it happens and the conversations you had open reopen when it finishes. **Refresh** re-reads the installed version, so a CLI you changed in a terminal is noticed without restarting anything — which is the only way to notice it on a cloud machine, where there is no window to reload. Codex also says so on an empty conversation, because an old CLI there costs you the newer models.
+
+- **Connect an app from a phone, and from a cloud machine.** A connector's sign-in used to end with a failed `http://127.0.0.1:…` address you had to copy out of your phone's browser and paste back into the app. The sign-in now lands on a real page that tells you to return to AFK Pilot, and the app collects the code over the network and finishes the exchange itself — there is nothing left to copy. (GitHub is unchanged: it takes a token you paste, because that is what GitHub issues.) Connectors are offered on cloud machines too, which previously had no way to reach them at all.
+
+- **Archive a project.** Projects you are done with fold away on every surface — desk, browser and phone — including the one you are currently standing in. Archived is a property of the project rather than of the window you happen to be looking at, so it no longer differs between surfaces.
+
+### Fixed
+
+- **Plumbing that lost a race is not an error in your conversation.** A connector whose server was slow to answer left a red `mcp__…__startup` row sitting in the transcript, with nothing you could do about it. Those rows never enter the conversation now; a genuine failure is written to the host log where it belongs.
+
+- **An empty conversation is no longer "could not be reopened" after a CLI update.** Reopening a conversation you never typed in asked the CLI for a session it had never saved, so the update finished by reporting a failure that had not happened. An untouched conversation simply starts fresh.
+
+- **"Update completed" stops greeting every new conversation.** The result of an update stayed on screen indefinitely and reappeared on each new conversation. It is cleared when you start one.
+
+- **An update is not reported as completed over a red conversation**, and a session start you did not ask for no longer announces itself in your transcript.
+
+- **A connector keeps the registration that owns its tokens.** A refresh could pair a connector's tokens with a different registration, after which the connector could not be used until it was signed in again.
+
+- **A provider's models are re-read when its CLI changes underneath the app**, instead of offering the list the old CLI had.
+
+- **A connector sign-in belongs to the workspace, not to the tab that opened it** — so closing that tab, or switching to another, no longer strands a sign-in half-finished.
+
+- **Archiving every project no longer takes the controls with it**, leaving a page with nothing on it and no way back.
+
+- **A connector waiting for your consent no longer spends the session's startup budget**, which could make the whole conversation fail to start rather than just that connector.
 
 ### Changed
 
-- **The #22 Windows guard now pins *any* Grok CLI build above 0.2.60 back to 0.2.60 before starting**, instead of tracking a fixed broken range. 0.2.61–0.2.64 hang at `initialize`; 0.2.67 (stable) and 0.2.69 (alpha) answer `initialize` but hang at `session/new` — the bug has persisted on every build above 0.2.60, with no fix on either channel. Rather than widen a range per build (and eat a ~120s reactive hang on each new one), the extension treats everything newer than the supported 0.2.60 as broken on Windows. When xAI ships a build that passes the `session/new` check, raising the supported version one line adopts it; the reactive downgrade-on-failure stays as a backstop. ([src/cli-locator.ts](src/cli-locator.ts))
+- **Anonymous usage telemetry can now tell remote and cloud use apart.** Cloud machines reported as the desktop app, and a conversation started at a desk and continued from a phone counted as a desk conversation, so remote use was undercounted by an unknown amount. Two small events — opening the remote portal, and the first remote message of a conversation — and a third value for the host kind fix both. No content is involved, the opt-out is unchanged, and every field is listed in [docs/privacy.md](docs/privacy.md).
 
-## 1.4.16 — 2026-06-26
+## 4.1.8 — 2026-09-05
 
-> Clearer listing and docs; lighter changelog.
+**Opening a conversation no longer freezes the app when you have a lot of them.** One shortcut on the way *out* of an untouched conversation was doing two expensive things nobody asked for, and both got worse the more conversations you had on disk.
+
+### Fixed
+
+- **The window stops locking up when you open or switch conversations** ([#131](https://github.com/phuryn/grok-build-vscode/issues/131), [#133](https://github.com/phuryn/grok-build-vscode/issues/133)). Opening an existing conversation first leaves the untouched **New session** you were on, and leaving it rebuilt the entire history list by reading every conversation directory in the project, then started a second agent process purely to delete that one empty conversation. With 3000 conversations present the app stopped responding for most of a second on every open, and the cost grew with the store. The abandoned conversation is now announced on its own, and the delete reuses the process already attached to it — no directory walk at all, and no second process. Reported by @RudyParengal and @leriksen71LJR.
+
+## 4.1.7 — 2026-09-05
+
+**A new cloud machine offers to connect an agent straight away, and the composer's menus close each other.** Two visible papercuts, and two quieter fixes: the buttons of a sign-in started from Settings did nothing, and approving an Edit or a Rewind long after asking for it could discard work done in the meantime.
+
+### Fixed
+
+- **One menu at a time in the composer** ([#148](https://github.com/phuryn/grok-build-vscode/issues/148)). Opening Settings left the context-usage popover on screen underneath it, and the same held for every pair among the add, settings, context-usage and mode menus. Each now closes the others, and still closes on its own button. Reported by @HubKing.
+
+- **A brand-new cloud machine shows "Connect an agent" without a refresh.** On the first look at a machine that had just been created, the panel offering the three agents was painted and then hidden again a moment later, leaving an empty page with the model picker locked until you reloaded. An account that is configured but signed out no longer counts as one that has answered the offer.
+
+- **"Re-check connection" and "Cancel" do something in Settings.** Both buttons of an agent sign-in started from the settings page were dead, and said nothing when pressed. GitHub's Re-check happened to work, which made the difference impossible to spot.
+
+- **Approving an Edit or a Rewind late no longer reverts newer work.** With the confirmation waiting on one device, you could start and finish another turn somewhere else; approving afterwards rewound that newer turn's files too. An approval is now refused if the conversation moved on while it waited.
+
+## 4.1.6 — 2026-09-04
+
+**Connect GitHub from anywhere, and clone by picking a repository.** Private repositories were out of reach on a cloud machine, because signing in needed a terminal that machine does not have. GitHub is now a connection with a home in Settings, and cloning starts from a list of your repositories instead of a URL you have to remember.
+
+### Added
+
+- **GitHub in Settings, beside the agents.** It says whether you are connected and as whom, connects, and signs out — which had no home at all before, so a machine handed on or a wrong account connected could not be undone from a browser. Connecting is two steps: choose how, then a code and a button that opens the sign-in page. A fine-grained token is offered as the advanced path, scoped to one repository rather than everything the account can reach.
+
+- **Clone by choosing a repository.** One field: type to filter the repositories that account can see, or type any URL or `owner/repo`. Cloning is offered in Knowledge work too, not only Coding.
+
+### Fixed
+
+- **Claude Code now reaches Connected on Windows** ([#146](https://github.com/phuryn/grok-build-vscode/issues/146)). Its model-cache warm-up doubles as the credential check, and cleaning up a temporary directory afterwards could fail on Windows and take the whole check down with it — so a working account read as a broken one, on every attempt. Reported with a diagnosis that was essentially correct, by @zfzfg.
+
+- **Code spans keep their asterisks** ([#143](https://github.com/phuryn/grok-build-vscode/issues/143)). `` `1*2` and `3*4` `` rendered as one italic run. Reported by @SimonEast.
+
+- **More room to write** ([#144](https://github.com/phuryn/grok-build-vscode/issues/144)). The composer grows to ten lines instead of five — six on a phone, where the keyboard already owns half the screen — and a question's "Other" answer takes more than one line. Reported by @SimonEast.
+
+- **A running search says what it is looking for** ([#145](https://github.com/phuryn/grok-build-vscode/issues/145)) rather than a bare "Searching". Reported by @padixa.
+
+## 4.1.5 — 2026-09-03
+
+**Deleting a conversation now deletes it.** The one you are looking at used to disappear and come straight back as an identical empty row, so it looked as though nothing had happened. Along with it: the small print in a message footer is readable on a phone, and the Delete button's label is white instead of near-black on red.
+
+### Fixed
+
+- **Deleting the conversation you have open removes it and moves you to the next one.** It used to be replaced immediately by a fresh empty conversation, which looked identical to the one just deleted — and because the new one sorted to the top, the list appeared to jump under your selection. You now land on the neighbouring row, and a new conversation is created only when the project has none left. If you had typed a follow-up while the agent was working, deleting no longer leaves the conversation behind as a row that returns.
+
+- **Two identical “New session” rows stop appearing.** Creating a blank conversation now reuses an unused empty one in that project instead of adding a second, which is where the duplicates came from.
+
+- **A machine that keeps losing its connection settles down instead of hammering.** Reconnect delay was reset the moment a socket opened, so a host that connected and immediately dropped retried once a second indefinitely. It now waits for a connection that lasted. Most visible on cloud machines, which lose their connection every time they suspend.
+
+- **Two browser tabs can no longer end up in one conversation.** Deleting from one tab could move it onto the conversation another tab was already using, and returning from a disconnect could do the same — in both cases the next message went into somebody else's tab. Each tab now gets a conversation of its own.
+
+- **A conversation that will not open says so in plain words** rather than repeating the agent's wording and an internal identifier.
+
+### Readability
+
+- **The Delete button's label is white.** It was near-black on red — about 2.3:1 against the darker reds light themes use, under the 4.5:1 needed to read comfortably.
+
+- **The timestamp and icons under a message are legible on a phone.** They rested at 40% of an already-muted colour, which compounds to roughly 1.7:1; on touch there is no hover, so that faint state was the permanent one. The row is still quiet, just no longer twice-quietened. The copy icon also stopped reading darker than the time beside it.
+
+## 4.1.4 — 2026-09-03
+
+**A machine that could not settle, and an error message that blamed you for it.** One fix stops a host retrying a failed connection every second for ever; the other stops a conversation that simply would not open from reading like a fault in your installation.
+
+### Fixed
+
+- **A host that keeps losing its connection now backs off instead of hammering.** The retry delay was reset the moment a socket opened, which sounds right and is not: it meant the delay could only grow while connections FAILED, and never against one that connected and immediately dropped — which is the situation it exists for. A machine in that state retried once a second indefinitely. It now waits for a connection that actually lasted before treating the way as clear, so a flapping machine settles down while a healthy one still reconnects immediately. Most visible on cloud machines, which suspend when idle and lose their connection every time they do.
+
+- **A conversation that will not open says so in plain words.** It used to answer with the agent's own wording and an internal identifier — “Failed to start Claude: Resource not found: 85730a78-9918-43d7-a6c6-91a058348d89” — for something that is often entirely ordinary: a conversation whose first message never finished recording. The message now names what may have happened and what to do about it, and deliberately claims nothing more, because that same signal is also raised when the agent simply did not finish starting.
+
+## 4.1.3 — 2026-09-03
+
+**Two ways a conversation could get stuck, both of them on the way out.** Deleting one you had just started could kill it instead, and on a cloud machine the app could insist somebody else was looking at it — on a machine nobody is ever sitting at.
+
+### Fixed
+
+- **Deleting a conversation you have not used yet no longer breaks it.** On Codex and Claude, starting a session and deleting it while open answered “Internal error” — and left that conversation permanently unable to send, so the failed delete was how it died. Both providers write a conversation down only once a turn has actually run, so there was nothing there to delete and the refusal was right; the damage was the host abandoning its own cleanup after hearing it. The row now goes either way, and “there was nothing there” is no longer reported to you as a failure of your system. Grok never showed this, because it removes a folder and a missing folder is harmless — that difference is what named the cause.
+
+- **A conversation on a cloud machine is no longer “open in another tab or the VS Code view”.** There is no tab and no editor on a cloud machine, but the host still kept a pointer at whatever it had opened last and counted that pointer as a person. Once you moved elsewhere the conversation stayed locked to it for good, naming two surfaces that do not exist there. The giveaway was the missing button to take it back: that appears whenever a real second device holds a conversation, and there was no second device. A second phone or browser tab still protects a conversation, exactly as before.
+
+## 4.1.2 — 2026-09-02
+
+**Things that quietly did nothing now do something, or say why.** A click on a sleeping cloud machine, a Clone that vanished, a Hide that was never going to work, a project telling you to update software that was already current — four different silences, one release.
+
+### Fixed
+
+- **A click wakes a sleeping cloud machine.** Two things woke one: attaching a browser, and the connection dropping while you were marked present. Presence lapses while you READ — reading is not interacting — so if you came back to the page and clicked, nothing was going to wake anything, and the click bounced into silence. Refreshing cured it only because attaching is a wake trigger and clicking was not. A send that finds no machine now wakes it: the send is the strongest evidence there is that somebody wants it.
+
+- **A control action that cannot be delivered says so.** Clone, Hide, rename, delete, new session and the rest were posted and, if the connection was between sockets, discarded without a word — no progress, no error, nothing. They now either reach your machine or tell you they did not, once, with nothing changed. They are deliberately not queued for later: a clone that lands minutes afterwards moves the tab of somebody who has since gone elsewhere.
+
+- **A project's conversations stop accusing your installation of being out of date.** One project could show “Sessions need a newer Grok Build” on a host running the newest release; reloading did not help and opening the project cured it. The message was never a version check — it was an eight-second silence being turned into a claim about your software. Underneath were two real faults: on a page with a remembered conversation the request never left the browser at all, and a preview whose entries included a worktree was thrown away whole on the way back. Both are fixed, the request always gets an answer, and silence now reads as “couldn't load these” with a Retry.
+
+- **“Hide project” is no longer offered where it cannot work.** On a phone or a cloud machine the menu item drew, posted, and was refused by the host in silence. It was gated on the capability for ADDING a project, which stopped meaning what it said once creating and cloning became things a browser could do. It now asks for the capability it actually needs, and confirms before it acts — the editor's rail always did, the chat rail did not.
+
+- **Host names in error messages.** Four places said “open VS Code on that machine” for a host that may be Cursor, Antigravity, Grok Build Desktop, or a cloud machine with no editor anywhere near it.
+
+## 4.1.1 — 2026-09-02
+
+**A clone that lands where you are standing, and one icon scale you can read.** Cloning a private repository from a phone worked and then left the tab looking at the project it started from — the files were there, just not on the screen that had asked for them. And the icons on that screen came in several sizes depending on which panel they happened to belong to. Both are settled here, along with the rail's own small dishonesties.
+
+### Fixed
+
+- **A clone now enters the project for the tab that asked.** Cloning onto a cloud machine from a phone cloned the repository and put it in the rail, and then the file explorer was empty and New Session did nothing — two symptoms with one cause: a browser tab carries its own selected repository, and the clone only ever told the host. Creating a project had the identical defect and no report against it, because nobody had made one from a browser yet. A network change mid-clone no longer turns a successful clone into a reported failure, and a brand-new user's very first clone — the case with no project open at all — is no longer skipped by the guard meant to protect it.
+
+- **The context donut did nothing in knowledge work,** which is the default mode. Hiding the technical breakdown there also skipped the two lines that open the popover, so clicking the number opened nothing at all: no usage, no Compact. The breakdown stays hidden in that mode on purpose — somebody writing a document is not asking what the tool definitions cost — and the popover opens.
+
+- **Switching project no longer reports your message as failed.** Leaving a conversation on purpose — switching repository, starting a new session, opening a row in another project — cleared the same remembered identity that a genuine loss clears, so the app announced "1 queued action was not sent" for something you had just chosen to do. The text still returns to the composer; the sentence now says where it went instead of announcing a failure.
+
+### Icons and spacing
+
+- **Two scales, split by panel, instead of one scale and an outlier.** The file explorer's controls were 20px while the rail's were 12–13px on the same screen, which is what made the rail read as a lesser control. Chat chrome stays at 20; the rail, the row above the messages and the file panel meet at 16, all in the same 28px box, so nothing reflows. VS Code's sidebar rail is deliberately its own denser tier — a 24px box with a 14px glyph — because nothing sits beside it to disagree with. On touch every one of them is a 20px glyph in a 36px target.
+
+- **The row above the messages was missed twice.** Three surfaces build that header with three different sets of ids, so scoping the first fix to one of them left the desktop app and the browser at 20px glyphs with a 2px gap. All three are sized now, per surface, with no JavaScript deciding it.
+
+- **Two controls leave the row on touch rather than shrink:** the per-session pin, which the row's ⋯ menu already carries, and the "+" beside PROJECTS, where the full-width Add project under the list is the better target by every measure.
+
+### The rail
+
+- **"Add project" is visible without hovering it.** VS Code's default theme paints secondary buttons fully transparent and keeps them readable with a border this control does not draw, so the button existed only under the pointer.
+
+- **Rail rows stopped blinking while the rail loads.** One boot rebuilds the rail a dozen times or more as each project's rows arrive, and the row under a stationary cursor lost its hover — fill and buttons both — for a frame on every one of them.
+
+- **One action, one icon.** The rail's new-session button wore a "+" while the New button above the messages wore the square-pen; "+" now means only "add a project". That button also sits under the project list at full width, which is where it earns its keep when the list is short or empty.
+
+- **Small things found on a phone.** "Signed in to GitHub. Clone again." became "Try to clone again" — you only ever see that sentence after a clone has failed. The Cloning button carries the same blinking dots every other progress indicator here uses. And slash-command rows were set in the editor's monospace font while the @-mention rows beside them used the UI font; a menu item is being read, not edited, so the two popovers now agree.
+
+## 4.1.0 — 2026-09-01
+
+**The browser stops being the lesser half.** Rewinding a message, connecting Claude Code, signing in to GitHub and cloning a private repository were all things you had to walk to a desk to do — which on a cloud machine means walking to a computer that does not exist. All four now work from a phone. And a conversation no longer belongs to whichever tab opened it first: the tab you are holding wins.
+
+### From a browser
+
+- **Rewind and Edit, from whichever screen you are driving.** They were gated to the desk on the assumption that a remote could not be trusted with them — but there is no desk on a cloud machine, so the feature was simply missing there. An unsent message now belongs to its conversation and comes back to the surface that asked for it: edit from a phone and the text arrives on the phone, not in a draft at a laptop nobody is sitting at. If you switch conversations while the rewind is still running, the message parks on the conversation it was written for and comes back the next time that conversation loads. Nothing is lost.
+
+- **Claude Code connects from a browser.** It never could, because Claude's CLI does not print a device code and poll — it prints a link and waits for you to paste the result back. That is a different shape from Grok and Codex, and probing the wrong command is what kept it desk-only. The card now reads in the order you act: what you are about to do, the link that does it, then the field for what it gives back.
+
+- **Sign in to GitHub, and clone a private repository.** A cloud machine could only ever clone public repositories, which is most of the promise missing for most people's code. The old fix button opened a terminal on the host — on a hosted machine that is a screen with nobody at it. Signing in now happens where you are: a link and a short code, the same shape as connecting an agent. We never handle the token; `gh` stores its own credential, and git is wired to use it before the flow reports success, because a sign-in that leaves cloning broken is worse than no sign-in at all.
+
+- **When something genuinely cannot happen in a browser, it says so.** Installing the GitHub CLI needs elevation, so it stays a desk action — and rather than silently opening an invisible terminal, it tells you where to do it. On a cloud machine the message says the truth instead: `gh` ships with the image, so its absence is a broken machine, not a missing step.
+
+### One conversation, several tabs
+
+- **The tab you are holding wins.** A conversation used to belong to the tab that opened it for as long as that tab's connection lasted, and nothing ever expired — so a forgotten tab on a laptop could make a conversation unreachable from your phone, with a refusal that named "another tab" without being able to say which. Now an explicit ask takes it: tapping a session in the rail, picking one from history, or choosing Continue here. No timer, no idle threshold, nothing to configure.
+
+- **A tab that loses a conversation is told what happened, once.** It keeps its transcript, its controls freeze, and one button takes the conversation back. Reconnecting after a network change does not count as asking, so a phone waking from your pocket cannot silently steal a conversation back from the screen in your hand.
+
+### Fixed
+
+- **Re-focusing a live conversation showed the wrong agent.** Joining from a phone a conversation the desk already held left the model picker and the chrome describing whatever was there before — and on a session whose models had not arrived yet, the same path threw and wiped the transcript to an error.
+
+- **A machine that is waking now says so.** Opening a page for a sleeping cloud machine showed nothing at all while it came up, which reads as a broken link rather than a machine getting out of bed.
+
+- **Knowledge work says where cloning went.** Clone from GitHub is a coding affordance and is absent in knowledge-work mode, where an absent thing explains nothing. The menu now says it is one setting away, and selecting the hint opens that setting.
+
+- **A rewind while another rewind was still parked no longer replaces it.** Narrow to trigger, and fixed anyway: the outcome was a message you wrote disappearing from the transcript and the composer at once.
+
+- **Cloud machines with no SVG decoder no longer die on a missing icon.** New machines carry the fix; existing ones are upgraded in place.
+
+## 4.0.0 — 2026-08-31
+
+**Cloud machines.** A hosted environment you reach from a browser, with Grok Build and the agents already on it — no laptop to leave running, nothing to install. This release is the one that makes connecting an agent there work end to end, because a cloud machine has no desk: there is no second screen to answer a dialog, no terminal to read, and no one sitting at it. Every fix below came out of using one for real.
+
+### Connecting an agent
+
+- **One dialog, not two implementations.** The sign-in used to report into the transcript's welcome card, which refuses to draw over a conversation — so on a machine with any history the code, the progress and the failure were invisible, and Settings had grown a second copy of the whole flow to work around it. There is now one renderer, in a dialog, and both places open it. Closing it puts you back exactly where you were.
+
+- **A sign-in finishes the job.** Connecting an account proved the credential and then stopped: the model picker stayed empty and the card still offered to connect the agent you had just connected, until you reloaded the page. Signing in now does what the Providers "Check again" button has always done — start the conversation that was waiting for an agent, fill the picker, and put the card away.
+
+- **The agents are named as products.** Grok Build by SpaceXAI, Codex by OpenAI, Claude Code by Anthropic — in Settings, in the sign-in dialog, and on the buttons, with each vendor's mark beside it. The heading used to say "Connect Grok" while the button under it said "Connect Grok Build", because there were two lists of names.
+
+- **Step one of the Codex sign-in is a link again**, and the security warning OpenAI is about to show you is named in bold before you meet it. Signing out puts the next sign-in back at step one, instead of dropping you at the code with the setting still off.
+
+- **Disconnecting says it is disconnecting.** A sign-out from a browser crosses the network, wakes a machine that may have gone to sleep, and runs the vendor's own CLI — ten to fifteen seconds during which the button said "Sign out" and nothing happened, so people clicked it again. It now reads "Disconnecting…" and refuses the second click.
+
+### Cloud machines
+
+- **The projects rail is there from the first frame.** It used to wait for the machine to answer before drawing, which on a machine that was asleep meant the pre-rail layout — no rail, no file explorer — was the whole screen until it woke. Measured at four seconds of waiting; now a third of a second. A linked laptop still waits, because its Grok Build may be older than the answer.
+
+- **A machine that is asleep is not a machine that is broken.** Sleeping is what a cloud machine does when you stop typing, and it wakes on your next message — so the page no longer announces it as a fault while you are reading. If a message is waiting to send, it says so, calmly, and sends it when the machine comes back.
+
+- **The empty conversation calls itself AFK Pilot Cloud** there, rather than naming an extension nobody installed.
+
+### Fixed
+
+- **"Could not restore this tab's previous conversation."** An empty conversation was remembered as worth restoring whenever anything at all had been drawn in the transcript — including the notice saying an account had signed out. The machine then cleared that empty conversation away, so the next refresh asked for something that no longer existed, drew the error, and armed itself to do it again. Refreshing made it worse; only "New session" escaped. A conversation now counts as empty when it has no turns in it, and a refused restore forgets what it was refused.
+
+- **"Sessions need a newer Grok Build"** was not a version check at all — it was an eight-second timeout, latched for as long as the page stayed open. A machine that was waking, or busy signing an account out, got labelled as an old install and never asked again. Reconnecting now asks again.
+
+- **Signing out cleans up after itself.** Each sign-out replaced its conversations and left the empty ones behind, so a few connect/disconnect cycles put untitled sessions in the rail that nobody could account for.
+
+- **The slash menu starts where your text starts.** In a browser it was drawn against the outside edge of the composer rather than the centred text inside it, so it hung further to the left the wider the window — which made it look like it depended on zoom.
+
+- **The code and the buttons in the sign-in dialog are centred** by construction rather than by arithmetic that happened to work at one font size.
+
+## 3.19.8 — 2026-08-31
+
+Almost everything here is about **cloud machines** — the hosted environment you reach from a browser — because that is where a week of real use found the gaps. At a desk, the one change you will notice is the model picker.
+
+### Fixed — connecting an agent from a browser
+
+- **A sign-in that did not survive a refresh.** Connect Grok, connect Codex, reload the page, and both accounts offered Connect again. Two things were wrong and both had to go: the sign-in verified the credential but never recorded the account as connected — only the Providers refresh and the Check button ever did that — and the refresh itself was withheld from remotes, which is right for a laptop that has a desk behind it and wrong for a cloud machine, where the browser is the only surface there is. Signing in now records what it proved, and a cloud machine can re-observe its own accounts.
+
+- **A machine that went to sleep in the middle of a sign-in.** Start a connection on a phone, switch to the vendor's page to approve it, and nothing on the machine is talking any more — so it was allowed to pause, which killed the connection the CLI was waiting on. Codex approvals that "worked" produced no credential. A sign-in now counts as work for as long as it runs, including while the credential is being checked afterwards.
+
+- **"Codex approved the sign-in, but no usable credential landed."** It had landed. The check that looks for it opens a throwaway session, reads the models, and deletes it — and Codex cannot delete a session that never wrote anything, so a working sign-in was declared a failure one step after it succeeded. Cleaning up can no longer fail the check that comes before it.
+
+- **Connecting Codex is now two numbered steps, and the security warning is not a surprise.** Codex needs one setting turned on in your OpenAI account before any code is accepted, and OpenAI's page then warns — correctly — that device codes are used in phishing and to continue only if a CLI started the sign-in. Step 1 gets you to the setting, with the link and the exact place it hides. Step 2 shows the code beside a note saying that warning is coming, that this machine's Codex CLI is what started this, and never to use a code you did not start yourself.
+
+- **Connecting from Settings looked like a button that did nothing.** The sign-in reported into the transcript's welcome card, which refuses to draw over a conversation — so on a machine with any history, the code, the progress and the failure were all invisible. Settings → Providers now shows the whole flow itself: the code, a Copy button, the sign-in link, and Cancel. Tapping Connect again while one is running repeats the current code to the tab you are holding instead of answering with silence.
+
+- **Success is announced only when it is true.** The CLI exiting cleanly means the vendor approved; it does not mean this machine can use the account. "Connected" now waits for the credential to answer, and when it does not, the message says which of the two failed — a sign-in that never landed, or a sign-in that landed and needs another moment.
+
+### Fixed — cloud machines
+
+- **A machine being built is no longer reported as broken.** A brand-new environment can take up to twenty-five minutes to install from scratch, and the page called it a failure after ninety seconds — advising a reset for a machine that was working perfectly. It now explains at ninety seconds, blames only after twenty-five minutes, and shows progress in the calm blue of a notice rather than the red of an error. Reopening the page for a machine that has worked for days no longer mistakes it for a first boot.
+
+- **Claude Code says so up front.** It cannot be connected on a cloud machine yet — its sign-in needs a terminal — so instead of a Connect button that always ends in a wall, the row and the start screen say we are working on adding it. Grok is marked as the recommended agent there, and a fresh machine offers all three rather than whichever one happened to be asked for.
+
+- **Anonymous usage stats and Thumbs feedback can be changed.** Both were read-only on any remote. A cloud machine has no desk to change them from, so read-only meant never.
+
+- **Settings stopped talking about "the desk"** on a machine that does not have one, and the tips stopped suggesting things a browser cannot do — dropping a file onto the composer works in the app's own window, not in a browser. The tip that suggests connecting a second agent now appears on remotes at all, which is where it matters most: on a cloud machine that is the only way to do it.
+
+### Fixed
+
+- **A newly connected agent appears in the model picker straight away.** Connect Codex from a conversation that already has messages in it and it was missing from the picker until you reloaded — the catalogue was refreshed only for conversations that had not started yet. A first-time agent is purely additive, so it now reaches the picker you are actually looking at.
+
+- **"Update Grok Build to preview"** read as an instruction to install a version called "preview". The rail now says the sessions it cannot list need a newer Grok Build, and when the chat reports that a project folder is no longer open, it adds that the machine is running an older build — the two halves of the same fact, previously on opposite sides of the screen.
+
+- **A sign-out that could not run now logs why.** The message said only that it "could not be observed"; the log now carries the path and the error, which is what the diagnosis actually needs.
+
+## 3.19.7 — 2026-08-30
+
+### Fixed
+
+- **Less of the freeze when you have a lot of conversations.** Reported as a hard lock with a white title bar (#133, #131) and as session switching going wrong (#138). We reproduced it here rather than guessing: with 3000 conversations on disk the app's main thread — the one that paints the window — stopped responding for about a second at a time. The cause was not the agent being slow. A test that stalled the agent by three seconds left the window perfectly responsive; that is a spinner, not a freeze. It was us, walking your entire conversation folder to sort it by date, **up to four times for every click**, on the thread that draws the app — and nothing on screen changed as a result of any of those walks. Opening a conversation no longer rebuilds the list at all, because the set of conversations does not change when you open one, and the periodic tidy-up of abandoned empty conversations no longer runs on every click, because it ignores anything under 30 minutes old and so could never have found something a run half an hour earlier had missed. Measured on one machine at 3000 conversations, before and after, back to back: catalog walks over three conversation opens **from 11 down to 4**, total time the window spent unresponsive **roughly halved** (4.8s to 2.3s), and the worst single stall from about 1.1s to 0.8s. **This is an improvement, not a cure** — a stall you can still notice remains, one walk per open is still there, and the change that removes it is written down and waiting. If you have a large history, this release should feel better; please say so on #133 if it does not.
+
+- **Dark High Contrast made the effort dots and the check mark invisible.** They were painted in VS Code's button colour, which that theme defines as pure black, so they vanished into the popover behind them (#139, thanks @HubKing). They now use the link colour, which every theme guarantees is readable as text. A test now enforces the rule across the whole UI, and it immediately found a third place with the same bug that nobody had reported: the settings toggle switch, which could have rendered "on" identically to "off".
+
+- **One-word commands run in your shell too.** 3.19.6 unwrapped the agent's `bash -lc` wrapper only when the command inside was quoted — and the tool that builds those wrappers leaves anything simple unquoted. So `ls`, `pwd`, `make` and `pytest` kept the old path and stayed on macOS's bash 3.2, which is most of what anyone actually types (#140, thanks @russwyte). A bare command built only from characters no shell treats specially is now unwrapped too; anything with whitespace, a variable, a glob, a tilde, a pipe or a redirect still keeps the wrapper, because those are where the two readings could differ.
+
+- **"Connect Codex" opened a terminal that could not start.** Installing Codex with npm leaves two files side by side: one for Git Bash and one for Windows. We were finding the Git Bash one first, and Windows cannot execute it at all — so the sign-in terminal failed to launch with nothing to click, and the same unusable path was handed to the agent process. We now look for the Windows one first, which is what the Grok CLI lookup has always done.
+
+- **Connectors stop asking you to sign in again out of nowhere.** A connector whose stored credential has gone missing cannot refresh it, so the proxy starts a fresh sign-in and opens a browser — unprompted, on every new conversation, for ever, because nothing recorded that it failed. One connector in that state reads as the app demanding sign-ins at random. Those connectors are now left out until you reconnect them: the row says so and offers a Connect button, and no browser opens unless you press it. This is deliberately not about expiry — credentials expire every few hours by design and are renewed silently; only a credential that is actually gone counts.
+
+### Fixed — cloud environments
+
+- **Providers can be connected and disconnected from the page that lists them.** Settings → Providers was read-only for a remote, which was true when it was written and stopped being true when headless sign-in shipped — leaving the onboarding card as the only way to connect an agent from a phone or a cloud machine. Signing **out** now works too, but only on a cloud environment, where the remote is the machine's only surface: a credential you can grant and never revoke is the worse answer there. At a desk it stays local, because signing out revokes a credential every window on that machine shares.
+
+- **The Codex sign-in card's own button did nothing.** The card that explains the one account setting Codex needs was shown unconditionally, so pressing "I've turned it on — connect" re-drew the same card. It could never be got past. The advice is still shown first — it saves a wait for a failure almost every account hits — but it is advice, not a gate, and the second attempt now runs for real. The step naming the setting also says **at the very bottom**, because that is where it is on the page.
+
+- **A new machine no longer says it is broken while it is still starting.** Opening a cloud environment straight after creating or resetting it announced that it was not responding — a message written for a machine that went away, shown to one that had not arrived yet, which is the first thing a new user sees. Starting up and having gone offline are now separate states with separate words, and a first boot that genuinely never finishes still says so after 90 seconds rather than reassuring you for ever.
+
+- **A provider that cannot be signed in from a cloud machine no longer tells you to go and do it at your computer.** There is no computer to walk to. It now says what does work there.
+
+## 3.19.6 — 2026-08-30
+
+### Fixed
+
+- **Agent commands really do run in your own shell now.** 3.19.5 switched the shell on macOS and Linux and that was not enough: Grok sends every command already wrapped as `/bin/bash -lc …`, so running it under zsh just meant zsh handed it straight back to bash — the same bash 3.2 from 2007, sourcing the same profile, printing the same sdkman error. Verified against the real CLI: **every** command it issues arrives inside that wrapper. The wrapper is now unwrapped and the command is given to your shell as an explicit argument, so it cannot bounce back into bash — when that shell can stand in for bash (zsh, bash). On `/bin/sh`, dash or ksh the wrapper is deliberately left alone, because Grok wrote the script for bash and a smaller shell would fail on syntax it is entitled to use. A command the model itself wrote as `bash -lc …` is left alone. Found, diagnosed and fixed by **@russwyte** in #141 — including the part 3.19.5 missed. A `$SHELL` we cannot drive (fish, nushell) or that is not a runnable file still falls back to `/bin/sh`. **If a project's `.env` sets `SHELL`,** the agent reads that while your commands still run under the shell VS Code itself was started with — so bash-only syntax could now fail where it previously worked. Rare, and on the list to fix. **One behaviour change worth knowing:** that wrapper was also making every command run through a *login* shell, so your profile was being sourced. It no longer is. If a tool is on a `PATH` that only `~/.zprofile` or `~/.bash_profile` sets, the agent may stop finding it — tell us if that happens to you, it is the kind of trade-off worth revisiting with real cases.
+
+## 3.19.5 — 2026-08-30
+
+### Fixed
+
+- **Agent commands run in your own shell on macOS and Linux.** Every command the agent ran went through `/bin/sh`, which on macOS is bash 3.2 from 2007 — not the shell you actually use. Anything that branches on which shell is running took the wrong branch: sdkman printed a `bad substitution` error at the top of every command's output, because seeing bash 3.2 sends it down a path that needs bash 4. Commands now run under the shell `$SHELL` names, when it is one the agent can drive (sh, bash, zsh, ksh, dash, ash), and fall back to `/bin/sh` otherwise. That also lines the two halves up: the agent decides which dialect to write from `$SHELL`, so running the shell `$SHELL` names means the shell it describes and the shell it gets are the same one. **This changes which shell runs your command, not what your profile sets up:** as before, commands are not run through a login shell, so `~/.zshrc` and `~/.bash_profile` are still not read and a tool that only exists on a `PATH` set there is still not found. Setting **Terminal shell** to `cmd` forces `/bin/sh` exactly as before, and Windows is unchanged. Thanks to @russwyte (#140), whose report named the cause precisely.
+
+- **A slow conversation open now says where the time went.** The `session open:` line in the log listed phases that could add up to a small fraction of the time the open really took, with nothing admitting the gap — one report showed 5.2 seconds against 379ms of named work, and every phase on it looked fast. The line now accounts for its whole total: whatever the named phases do not claim is printed as `other`, and the clock starts when you click rather than partway through, so finding the conversation and reading its stored details are on the line too. That last part is not small — on a machine with a lot of history it was the largest single piece of the open, and it was invisible. Starting a new conversation is now timed too — in one reporter's log that step took between 2.2 and 4.8 seconds every single time, and nothing on the line said so. Chasing #131, #133 and #138; if you have been hit by one of those, a fresh log now says considerably more.
+
+## 3.19.4 — 2026-08-28
+
+### Added
+
+- **The file panel can be told to look again.** It read each folder once and kept that listing for as long as the project stayed open, so anything changing files behind its back — the agent writing them, a build, a branch switch, another editor — left it quietly wrong with no way to ask for a fresh look. There is now a **Refresh** control in the panel header, **Refresh this folder** on a folder's right-click menu, and the same button inside an empty folder, which is where it is easiest to conclude the panel is simply broken. Refreshing keeps your place: folders you had open stay open, and your filter text, scroll position and open file tabs all survive. Thanks to @leriksen71LJR (#134).
+
+### Fixed
+
+- **A folder too big to list in full appeared to be empty.** Past the listing cap, the "Folder truncated" note replaced the very entries it was meant to sit under, so a large folder showed the warning and none of its files. The note now sits below them.
+
+## 3.19.3 — 2026-08-28
+
+### Fixed
+
+- **The desktop app writes its log again.** 3.19.2 added a log file so anyone chasing a problem would have something to send, and the code that started it could not run — the app threw on every launch before writing a line, so the release whose whole purpose was to produce logs produced none. It writes from the first line now, and rotation measures what it actually wrote rather than guessing at startup, so a long session no longer grows one file without end. Still under **Settings → Advanced → Show logs**.
+- **A long turn survives you putting your phone down.** On a cloud environment the machine is suspended when nothing has touched it for about a minute, and suspended means frozen — so a turn that spent four minutes running tests or an install was stopped in the middle of the work you had walked away from. That is the one thing remote control exists to prevent. The machine now says it is still working while the agent is working and for as long as any command it started is still running, however long that takes; if it stops to ask you something and you do not come back, it goes to sleep after twenty minutes and wakes when you open the page, with the question still there. **Nothing changes on your own computer**, where the wake lock already covered this.
 
 ### Changed
 
-- **README rewritten** to lead with what the extension does for you — diff-preview approvals, `@file` context, inline image/video, voice — instead of internals, with a trimmed feature list.
-- **Listing clarified** as an **unofficial community extension** (display name + description).
-- **Changelog slimmed:** releases before 1.4.0 moved to [docs/CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md); entries stay terse going forward.
+- **A new install no longer files your work under the name of the tool.** New projects went into `~/Grok Build`, and on the desktop app that folder was also your first project — the product's name on a folder that is yours. New installs now get an **AFK Pilot** folder holding a first project called **My First Project**, so the container and the project are no longer the same thing. If you already have a `~/Grok Build` folder it keeps being used and nothing moves; that decision is made once and remembered, so an upgrade never scatters your projects across two roots. In a cloud environment the welcome screen now reads **AFK Pilot (Cloud)**, which is the product you are actually in.
 
-## 1.4.15 — 2026-06-26
+## 3.19.2 — 2026-08-27
 
-> Cover the #22 Windows session-start bug on newer Grok CLI builds (through 0.2.67) and when the hang moves to session start.
+### Fixed
 
-### Fixes
+- **You can get the logs off the desktop app.** *Settings → Advanced → Show logs* did nothing: it was wired to an empty function, DevTools is disabled in packaged builds, and the log went to stdout — which is discarded when the app starts from an icon rather than a terminal. Anyone asked for a log went looking and correctly found none. The app now writes a log file under its own data folder, keeps one previous copy, and **Show logs** opens the folder with it selected. Lines are written as they happen, so the ones just before a freeze survive. Reported while chasing #131 and #133 by @RudyParengal, who was right that the button did nothing.
+- **A proposed-change diff you closed stays closed.** Returning to a conversation reopened the `Grok proposed:` tab and pushed the files you were working in off the screen. Auto-open now happens once when the change is proposed, not every time the conversation is redrawn — a new edit still opens, and **open diff** reopens it whenever you want. Thanks to @tarekmaalouf (#132) for pinning down exactly what was happening.
 
-- **The Windows session-start workaround now covers Grok CLI 0.2.65–0.2.67 and a `session/new`-stage hang (#22).** Grok CLI 0.2.67 *looked* fixed — the ACP `initialize` handshake answers again — but the stdin-until-EOF regression only **moved**: the next request, `session/new`, now hangs instead (with stdin held open, as any live client must), so a real session still can't start. v1.4.14 only knew the 0.2.61–0.2.64 range and only recognized an `initialize`-stage hang, so anyone landing on 0.2.65–0.2.67 was left stuck. Now: the proactive pin covers the full confirmed-broken range **0.2.61–0.2.67** and pins the CLI back to the last fully-working **0.2.60** before starting; and the evidence-driven reactive recovery also fires on a **`session/new` / `session/load`** timeout, not just `initialize` — so a future still-broken build self-heals on the observed failure regardless of which startup request hangs. Verified with a controlled stdin-open probe (`initialize` then `session/new`) against real 0.2.67. ([src/cli-locator.ts](src/cli-locator.ts), [src/sidebar.ts](src/sidebar.ts))
+## 3.19.1 — 2026-08-27
 
-### Docs
+### Fixed
 
-- Recorded that **0.2.67 does not fix #22** — the hang moved from `initialize` to `session/new` — with the reproduction probe in [research/stdio-eof-regression.md](research/stdio-eof-regression.md). Rewrote CLAUDE.md's status into a concise current-state project map (per-version history lives here in the changelog, not there).
+- **Cloud environments can start.** The Linux build published in 3.19.0 could install itself on a hosted machine and then never come up: a packaged build refuses to take its relay or its device token from the environment, which is right for an app on your desk and impossible for a machine with no keyboard. That one build is now marked as a cloud build at package time and accepts an identity only when the machine also declares itself a cloud environment. **Nothing changes for the Mac and Windows apps** — they still refuse the environment exactly as before, and the Linux AppImage remains a cloud-only artifact rather than a desktop download.
 
-## 1.4.14 — 2026-06-25
+## 3.19.0 — 2026-08-27
 
-> Smoother diff review on permission cards.
+### Added
 
-### Features
+- **Connect an agent from your phone.** The remote empty state used to say sign-in could only happen at your computer, and stop there — true of how it worked, and a dead end at the moment you most wanted a next step. Pressing **Connect** from a phone or browser now runs the agent CLI's headless sign-in and shows you the link and the short code it prints; you confirm it in your own browser and the page finishes on its own. The credential still lands on the computer running the extension, the same as before — nothing is kept in the browser and the relay never sees it. **Nothing changes at your computer**, where Connect still opens a terminal, because there the CLI opens your browser for you. Grok works this way today; Codex needs both a recent CLI and "Allow device code login" enabled on the account; **Claude has to be connected at your computer**, because its sign-in is a terminal interface that prints nothing when it is not attached to one. The app finds this out by asking the CLI rather than by checking a version, so an agent that gains the ability starts working without an update here. Signing *out* stays at your computer. See [Signing agents in](https://github.com/phuryn/grok-build-vscode/blob/main/docs/provider-login.md).
 
-- **Diff previews don't nag you to save, auto-open, and clean up after themselves (#21).** Closing a diff preview **no longer prompts you to save**: every diff the extension opens — whether from the *open diff preview →* link on an edit card or auto-opened on a permission card — is now backed by read-only virtual documents instead of scratch buffers, so there's nothing to save (and you also get proper syntax highlighting now). On a permission card the diff also **opens automatically** (the *open diff →* button stays, to re-open it) and **closes itself** when you click **Allow / Reject**. The preview reuses a single tab across Grok's many small sequential edits and keeps focus on the chat, so reviewing a stream of edits is just: glance, decide, repeat. ([src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
+## 3.18.0 — 2026-08-26
 
-## 1.4.13 — 2026-06-25
+### Added
 
-> Self-healing recovery if a *future* Grok CLI build ships the same Windows bug. _(Not released on its own — rolled into the 1.4.14 release.)_
+- **Add project can make one, not just find one.** It used to be a single control that opened your operating system's folder picker — right for a folder that already exists, and wrong for everything else. There are three ways in now. **New project** takes a name and creates `~/Grok Build/<name>`: one folder, no `git init`, and nothing to choose in a file dialog. **Import a folder** is the picker, unchanged. **Clone from GitHub** takes a repository URL and checks it out beside the others; it appears in Coding mode, because that is where it belongs. A host that offers only one of the three shows no menu at all.
+- **Naming a project and cloning one work from your phone.** They send a name or a URL and let the computer running the extension decide where it goes, which is why they can travel when the folder picker never could — a native dialog is not something a browser can show or answer. Importing stays at the desk for that reason.
+- **Cloning uses the Git credentials you already have.** No token to paste, nothing stored, and public repositories need nothing at all — on most machines the GitHub CLI is never needed at all. When a private repository does fail, the form says so and offers the next step rather than printing what Git said. **Sign in to GitHub** runs `gh auth login` *and* `gh auth setup-git`, because login alone asks whether to configure Git and lets you say no — which would leave the clone failing exactly as before. If the CLI is not installed, the button offers to install it and names the exact command first; if there is no package manager to install it with either — a Mac without Homebrew, Windows without winget — it points at cli.github.com rather than offering a button that would run a command which is also missing.
+- **A tip on the empty screen.** Once an agent is connected the welcome screen had nothing to say; it now carries one quiet line naming something you have not set up yet — another agent, a routine, connectors, read aloud, `@` file mentions, a worktree. Each links to the exact place it names. You are never shown advice about something you have already done, no tip appears twice in a day, and **✕** means *not today* rather than never. When it all applies to you, the line is simply gone. See [Tips on the empty screen](https://github.com/phuryn/grok-build-vscode/blob/main/docs/empty-state-tips.md).
 
-### Fixes
+### Fixed
 
-- **Auto-recovers from a still-broken future CLI build, not just the known ones (#22).** v1.4.12 pins the CLI back to 0.2.60 when it detects one of the *known* broken builds (0.2.61–0.2.64) before starting. But if xAI ships a **new** build (0.2.65+) that still has the bug, that closed range wouldn't catch it and the session would hang with no automatic fix. The extension now also recovers **reactively**: if a session fails to start on Windows with the regression's signature (the `initialize` handshake timing out / *"exited (code null)"*) and the CLI is on any build newer than the supported 0.2.60, it automatically downgrades to 0.2.60 and **retries the start once** — triggered by the actual failure rather than a hardcoded version list, so it self-heals on builds that don't exist yet. If you later update the CLI by hand onto another broken build, the same recovery runs again on the next failure. Every automatic downgrade (proactive or reactive) shows a notification explaining what happened. If the downgrade can't run, you still get the manual-workaround message as before. ([src/cli-locator.ts](src/cli-locator.ts), [src/sidebar.ts](src/sidebar.ts))
+- **The Settings link on a tip opens the right page.** Every tip that points at Settings now lands on its own category rather than the top of the page.
+
+### Documentation
+
+- [Projects](https://github.com/phuryn/grok-build-vscode/blob/main/docs/projects.md) — the three ways to add one, where new folders go, name rules, and what happens when a clone needs credentials.
+- [Signing agents in](https://github.com/phuryn/grok-build-vscode/blob/main/docs/provider-login.md) — how Grok, Codex and Claude authenticate, including the headless paths for a machine you only ever reach remotely.
+- [Tips on the empty screen](https://github.com/phuryn/grok-build-vscode/blob/main/docs/empty-state-tips.md) — what can be suggested, the rules it follows, and where the state lives.
+
+## 3.17.2 — 2026-08-25
+
+### Fixed
+
+- **The routine model picker lists each agent once.** It was showing every provider twice — three headings holding a single "use this agent's default" row, then three more holding the real models. The default row is now offered only where it means something: when an agent has no other model to show yet, or when a routine is already set to it. New routines start on a real model, the way the composer does.
+
+## 3.17.1 — 2026-08-25
+
+### Fixed
+
+- **Routines now load in the VS Code Settings tab.** Opening Settings as a tab (rather than through the chat panel) left the Routines page saying "Loading routines…" and never finishing. The tab listens for its own updates and had never been told about routines, so the answer arrived and was dropped. The chat panel and the desktop app were unaffected.
+
+## 3.17.0 — 2026-08-24
+
+### Added
+
+- **Routines.** A prompt, a project, a model, and a cadence — saved once and run on a schedule. Settings → Routines. Each firing opens its own session named after the routine (`[Routine] Morning brief`), so the answer is waiting in the rail rather than needing you to be there when it arrives. The last twenty runs are kept per routine, as a strip you can read at a glance: a run that worked opens its session, one that was skipped says which model was missing, one that failed says why. A daily cadence takes a time of day and holds it through daylight saving; anything shorter runs at most once every fifteen minutes. Routines run while any Grok window is open — this extension, or the desktop app — and nothing runs once they are all closed, which the page says rather than leaving you to discover. On a phone you can create, edit, pause and remove them for any project that phone can already reach.
+- **Zapier connector.** Reaches whatever apps you have added to your own Zapier MCP server — Gmail, Calendar, Slack and thousands more. Sign in through the browser like the other connectors; there is nothing to paste. Build the server and pick its apps in Zapier first, since one with no apps added exposes no tools.
+
+### Fixed
+
+- **A connector that fails to start now says what went wrong.** The report took the last line of the failure, and for anything Node itself throws that line is the version banner — so a broken install surfaced as `Could not connect: Node.js v20.19.0`, which named nothing. It now reports the error.
+- **Every connector's "get a token" link pointed at GitHub.** The address came from the connector; the words next to it were hardcoded, so any connector but GitHub sent you to the wrong place.
+- **Settings no longer jumps back to the top while you are using it.** Anything that refreshed the page — connecting a connector, saving a change — scrolled it to the beginning and moved the row out from under you.
+
+## 3.16.0 — 2026-08-24
+
+### Added
+
+- **The waiting indicator says how long it has been waiting.** *Grokking* now carries a running count from the moment it appears — `Grokking · 4m 12s`. A turn has no deadline you can see (the extension tolerates 30 minutes of CLI silence before giving up, deliberately, so a long healthy turn is never killed as if it were stuck), which meant "working" and "wedged" looked identical. The count says nothing about whether anything is wrong, only how long the wait has lasted.
+
+### Fixed
+
+- **A slow network no longer holds up every session start.** The silent CLI update that runs once after an extension upgrade could block the composer for up to three minutes, and a failure left it to be retried on the *next* window — so where `x.ai` is unreachable, every new window paid that stall again, indefinitely. It now gets 20 seconds and one attempt per extension version. The update is optional; if it can't finish quickly the session starts on the CLI you already have. Thanks to [@funkpopo](https://github.com/funkpopo), whose measurements from a network that can't reach `x.ai` found this ([#129](https://github.com/phuryn/grok-build-vscode/pull/129)).
+- **A local connector that reports no health status is no longer shown as unavailable.** Servers declared in your Grok config files often report that they are enabled without a health field, and only an explicit `ready` earned the green dot — so a working server looked exactly like a broken one, on a row with nothing to click. Thanks to [@funkpopo](https://github.com/funkpopo) ([#128](https://github.com/phuryn/grok-build-vscode/pull/128)).
+- **A connector that recovered stops showing as failed.** A server's error message was never cleared once reported, so a connector that failed once kept that error for the rest of the session and its row stayed red even after it came back. A later status report now supersedes it. Connector status is also honest on the phone now: the error text deliberately stays on your machine (it can quote a launch command), but the fact of a failure travels, so a broken server no longer reads as ready there.
+- **The Windows desktop installer builds again.** The telemetry identity added in 3.15.0 was passed to the packager as a bare argument, and PowerShell split it in two — so the Windows leg of the release failed while macOS succeeded, and v3.15.0 shipped without a `.exe` until it was rebuilt.
+
+## 3.15.0 — 2026-08-23
+
+### Added
+
+- **A file read is now a link to the file, and clicking it shows you the file.** A `Read` row reads `Read chat.js lines 8400-8459`, with the path and range themselves clickable and no excerpt underneath — the six lines it used to print were the ones you could already see, and they cost the row the space the path needed ([#122](https://github.com/phuryn/grok-build-vscode/issues/122)). In an editor the link opens the real file with those lines selected. In the desktop app it opens a preview showing the **whole file** with line numbers and the agent's lines marked in blue, scrolled to them — the surrounding context is the reason to click, and until now that surface showed only the excerpt. Both previews gained **Open in file panel**, beside Copy and Save As, for when a glance turns into reading.
+
+### Fixed
+
+- **Connectors stop asking you to sign in again when more than one window is open.** `mcp-remote` pins its sign-in port to the one recorded in its own registration, and on Windows it cannot see that another window already holds it. The extension answered that collision by retrying on a different port — which is `mcp-remote`'s signal to discard its registration and enrol afresh, so a browser tab opened, and because the credential store is shared, every other window was pushed into signing in too. One collision re-authorised the machine. The collision is now reported instead of worked around: it means the connector is already signed in and running, which is the good case.
+- **Links to files under `~` open ([#125](https://github.com/phuryn/grok-build-vscode/issues/125)).** `~/Downloads/notes.md` was treated as a relative name and looked for inside the project, so clicking it said the file was missing. `~` is now expanded to your home directory. `~someone/…` is deliberately left alone — resolving another account's home needs more than a guess.
+- **Reading a whole file no longer invents a line range.** A read with no offset or limit showed `lines 1-812`, which was not a range the agent chose but simply the length of the file. The row shows the path alone, and the link opens the file with nothing selected.
+- **Expanded tool details appear while the agent is still working.** With *Expand tool details* on, a group settled its expansion only once the batch had finished, so reads and searches stayed collapsed until the end — commands too. They open as the rows arrive now.
+- **The desktop app was reporting no usage data at all.** Packaging rewrote the app's name, so its identity check could never match and telemetry disabled itself silently — which is correct behaviour for a fork and wrong for our own app. Every figure we had was therefore "of editor users" without saying so.
+- **Usage data stopped discarding editors it did not recognise.** The host name was checked against a fixed list of seven products, so anything else — Antigravity IDE, code-server, Kiro, Devin, Windsurf — was dropped on the floor rather than recorded. It is now validated for shape, the same way the model name always has been.
+
+### Changed
+
+- **The anonymous usage event records four more things**, all documented in [docs/privacy.md](docs/privacy.md): which CLI the session runs on, how many connectors are set up on the machine, whether the session started in a git worktree, and whether this install has been seen before. Values only, never content — the CLI is one of three names, and the connector figure is a count, never the list.
+- **`install.sh` and `release.sh` do what their PowerShell counterparts do.** The shell versions were about half the size, and the gaps were not cosmetic: `install.sh` could not build against a staging relay at all, `release.sh` skipped the screens gate, the wait for CI, the Open VSX publish and the local install, and was committed without its execute bit — so the command its own usage text documents could never have run. `install.sh --all` also found no editors on macOS, exited non-zero, and looked successful.
+
+## 3.14.1 — 2026-08-22
+
+### Fixed
+
+- **Connectors stop asking you to sign in again.** `mcp-remote` stores its authorisation tokens in a folder named after its own version, and the extension was letting npm resolve whichever version was newest at the moment a session started — so every upstream release silently emptied your credentials and opened a browser tab for each connected service. Three versions shipped in twenty-four hours. The version is pinned now: the desktop app and the editors share one set of tokens, and changing it becomes a deliberate decision instead of a surprise.
+- **View all on a Read row opens the file, not a copy of it ([#122](https://github.com/phuryn/grok-build-vscode/issues/122)).** It opened an untitled document holding just the lines the agent had read; it now opens the real file with those lines selected.
+- **A long-running conversation stops growing its stored cost ledger without limit.** One entry per turn was kept forever; past 400 turns the older ones now fold into a running total.
+
+## 3.14.0 — 2026-08-21
+
+### Added
+
+- **Three more connectors, and connectors that take a key.** **GitHub**, **Calendly** and **Airtable** join Settings → Connectors. GitHub is the first that authorises with a personal access token you paste on the row itself (fine-grained recommended) rather than a browser round trip — the token goes to the platform secret store, never into `grok.mcpConnectors` and never into a settings file you might share. Connecting it in one editor now takes effect in the others instead of disconnecting them.
+- **A long conversation opens in a fifth of a second ([#102](https://github.com/phuryn/grok-build-vscode/issues/102)).** Opening a conversation with hundreds of turns took the better part of a minute and left the panel unusable while it worked. It now renders the most recent turns first and fills in the rest as you scroll back: 46 seconds became 191 milliseconds on the conversation that prompted the report, and resizing the panel went from a quarter of a second to ten milliseconds.
+
+### Fixed
+
+- **A reconnect feels like nothing happened.** Switching apps on a phone, locking the screen, or losing signal all drop the socket, and the reconnect used to be loud: the conversation was torn down before its replacement existed, the welcome screen flashed over a chat that was still coming back, the title blanked, the composer stole focus, and "Starting" appeared over a conversation that was merely being restored. The conversation now stays on screen throughout, and the panel says *Restoring conversation* rather than pretending to start a new one.
+- **Your place in the conversation survives a reconnect.** A reader scrolled up was yanked back to the bottom when the transcript was replayed — twice over, and from more than one direction. If you had scrolled up you stay where you were; if you were at the bottom you keep following, as before.
+- **A conversation name is a name, not the prompt that started it.** Whole first prompts were being stored as the conversation's automatic name — one had grown to 27,813 characters — which bloated the stored session index and slowed every read of it. Names are capped, and existing oversized ones are trimmed on load: the index on the machine that surfaced this went from 4.4 MB to 1.4 MB.
+- **File-panel row actions stop sticking.** After clicking a row, its actions stayed visible and highlighted once the pointer had moved away.
+- **The desktop app focuses the composer when it opens**, so you can type straight away.
+- **Plan and permission cards stay with their turn** when a long conversation fills in earlier history, instead of draining to the wrong place.
+
+## 3.13.1 — 2026-08-20
+
+### Added
+
+- **Connectors — sign in to the apps you already work in.** **Settings → Connectors** ships in release builds now; it was development-only in 3.13.0. Connect Linear, Notion, Atlassian, Canva, Stripe, Sentry or Cloudflare once on this computer and every agent can use them — Grok, Codex and Claude alike. You authorise in your browser and the tokens are cached by `mcp-remote` under `~/.mcp-auth`, so the extension never handles one. The page has three sections: apps you connect here, the grok.com connectors that follow your Grok account, and local Grok connectors declared in this machine's config files. Project-file servers stay off it.
+- **Copy path and Copy relative path ([#120](https://github.com/phuryn/grok-build-vscode/issues/120)).** Every row in the file panel offers both, on files and folders, on the desk and on a phone.
+- **Rate a Grok turn ([#114](https://github.com/phuryn/grok-build-vscode/issues/114)).** Thumbs on a finished turn send a rating to SpaceXAI. Off by default — turn on **Thumbs feedback to SpaceXAI** in Settings → General — and they appear only where the Grok session actually supports feedback, never on Codex or Claude.
+
+### Fixed
+
+- **Connectors could not start at all on macOS.** A desktop app launched from Finder inherits a PATH with no Homebrew in it, so `npx` was missing. Finding it was not enough either: `npx` is a script whose `#!/usr/bin/env node` line needs `node` findable as well, so the child's environment is fixed alongside the lookup. Windows keeps its PATH exactly as you wrote it.
+- **Queueing a message with images keeps the images.** Attachments were dropped when a message went to the queue — everything you attached is queued with it, or nothing is. Steer carries them too, and an image's number is stamped when you attach it and never moves afterwards.
+- **The context breakdown adds up, and stays put.** The rows in the popover did not sum to the figure above them, and a breakdown could be shown against numbers from a different reading. Each one now belongs to the measurement that produced it. Settings also stopped rebuilding itself over and over while open.
+- **Queued messages look like sent ones.** Images in a queued message sit below the text, where they sit in a message you have already sent, and the first message in a conversation gets a little room above it.
+
+## 3.13.0 — 2026-08-19
+
+### Added
+
+- **Find in a conversation.** Long conversations were navigable only by scrolling. There is now a find bar — in the **⋯** menu on every surface, and on **Ctrl/Cmd+F** in VS Code and the desktop app (the browser keeps its own find, and on a phone the menu is the only door there was). Next and previous, a live match count, case sensitivity, and regular expressions, with `^` and `$` matching per line. It searches what you wrote and what the agent replied, plus the label on each tool row — the command that ran, the file that was read — but not the contents of those rows: searching a common word used to bury the handful of hits in your conversation under dozens from command output and diffs. Matches are highlighted without touching the page, so nothing in the transcript stops working while you search.
+- **The context donut shows where the window went.** Clicking it now breaks the used space into System, Tools, Messages, Skills, MCP and Free, with the auto-compact threshold. Grok only, and it costs nothing to look: the number comes from a control-plane reading rather than a question put to the model, so opening the popover does not consume the window it is describing. Contributed by @funkpopo.
+- **Icons in the gear menu and Settings.** Knowledge work and Coding carry marks, as do Report a bug, Request a feature, Contact and the repository link.
+
+### Fixed
+
+- **A larger chat font no longer cuts the panel in half ([#119](https://github.com/phuryn/grok-build-vscode/issues/119)).** At 200% only a fraction of the chat was visible. The stylesheet was correcting for zoom in a way browsers used to require and no longer do, so the correction became the error — and it was wrong at every setting except 100%, overflowing below it as well as clipping above. Reported by @FireInWinter.
+- **Slash autocomplete stops offering commands that would not run ([#110](https://github.com/phuryn/grok-build-vscode/issues/110)).** Skills work anywhere in a message; commands only run when they start it. The popover treated both the same, so a command typed on a second line was suggested, accepted, and then quietly sent as ordinary text. Now skills are offered wherever you are typing and commands only at the start, which is exactly where each one works. Reported by @ryukenshin546-a11y and @SimonEast.
+- **A file the agent reads says which file, and which lines ([#122](https://github.com/phuryn/grok-build-vscode/issues/122)).** Read rows now carry the path and the line range, and open the whole file the same way command output does. Where the range is not reported, the path shows without one rather than a guess. Requested by @padixa.
+- **Settings is clearer about what it can act on.** The **Account** page is now **Remote control**, which is what it does — linking this desk to a phone or browser. Version rows for the two ACP adapters are gone: they ship inside the extension and move only when it does, so there was nothing to act on. The Codex updates row is gone for the opposite reason — it said updates were handled elsewhere, which was untrue whenever the extension had installed Codex itself.
+- **A fresh clone no longer produces a file the tests cannot parse.** The repository never declared its line-ending convention, so a new checkout on Windows could rewrite a script's first line into something Node refused to read.
 
 ### Internal
 
-- Verified on macOS (Apple Silicon) that the regression is **Windows-only** — grok 0.2.64, the build that hangs on Windows, completes the stdin-open ACP `initialize` handshake in ~450ms (4/4 runs) — so the whole workaround stays correctly gated to Windows. Recorded in [research/stdio-eof-regression.md](research/stdio-eof-regression.md) with a reproduction probe. ([research/stdio-eof-mac-probe.cjs](research/stdio-eof-mac-probe.cjs))
+- MCP server inventory, read from the agent's own rails rather than a command that cannot see managed connectors. Contributed by @funkpopo. Together with the connector work it is visible in development builds only, until a failed sign-in stops leaving a process behind.
+- The unit suite stopped reporting the machine's mood: bounds that were measuring how fast a subprocess starts, rather than detecting one that had hung, made three or four unrelated tests fail per run.
 
-## 1.4.12 — 2026-06-25
+## 3.12.4 — 2026-08-18
 
-> Works around a Grok CLI 0.2.61+ bug that stopped sessions from starting.
+### Fixed
 
-### Fixes
+- **MCP tool calls show what went in and what came back.** An MCP call was a single line with no way to see the arguments or the result. It now gets the same expandable IN/OUT block shell commands have, on all three agents — which took measuring each one, because they agree on nothing: the tool name, the arguments and the result each live somewhere different, and two of the three send no `content` at all on completion. Grok's internal tool-search rows fold into the explore group instead of cluttering the transcript, and a Codex server that genuinely fails to start still says so.
+- **Long tool names stay readable.** A name like `mcp.codex_apps.codex_document_control.list_documents` was cut at the end — exactly where the useful part is, leaving a column of rows that all read the same. Long names now elide in the middle, keeping both ends, and hovering shows the complete name.
+- **Skill search looks at descriptions, not just names.** A skill you remembered by what it does rather than what it is called was unfindable. Matching now covers descriptions, name matches still rank first, and the matched words are highlighted wherever they landed so a description-only hit makes sense.
+- **Opening a long conversation no longer scrolls endlessly.** Loading a big conversation replayed every message while forcing the view to the bottom after each one — roughly fifteen hundred times on the largest conversations here, which read as an infinite scroll that only stopped when you switched away. The view now settles once, at the end, and loading is quicker for it. Opening the same conversation twice at once can no longer interleave two copies of its history either.
+- **Grok conversations stop jumping in Recents when you open them.** A `session/load` rewrites `events.jsonl`, so ranking by that file promoted whatever you had just opened — and, because the previously-opened one carried a fresh stamp too, it often looked like the *previous* conversation jumping. Grok now ranks by `updates.jsonl`, which a load leaves alone and a real turn advances, so work done in the terminal still promotes a row. **Claude conversations can still jump** — its listing time is restamped on open and the pinning that should hold it does not yet survive in practice; Codex was never affected.
+- **A live turn no longer dies at 30 minutes with `ACP request timed out: session/prompt` ([#117](https://github.com/phuryn/grok-build-vscode/issues/117)).** `session/prompt` stays open for the whole turn, but the client armed a one-shot 30-minute timer that streaming `session/update` traffic never reset — so a healthy long job (training, a long tool loop, many slow steps) was cut while the agent was still working. The timer is now idle-based: any ACP traffic re-arms it (default 30 minutes of silence). A 24-hour absolute cap remains as a safety net. Tune `grok.acp.promptIdleTimeoutMs`, `grok.acp.promptAbsoluteTimeoutMs` (`0` disables), and `grok.acp.requestTimeoutMs` on newly started sessions.
+- **MCP tool results show the whole payload.** Codex rows that only printed a terse `Action completed.` were dropping `structuredContent` — where Gmail and similar servers put the actual messages. OUT now carries the text and the structured JSON, and a failed Codex call shows its error instead of an empty box. Pretty-printing that JSON stops at the 100K display cap so a nested result cannot expand into megabytes first, and a Claude JSON string is shown as the adapter sent it so 64-bit identifiers are not rounded.
+- **Stopping a command still shows [Cancelled] when the browser is newer than the desk.** An older host that never sent a cancellation flag was being read as "not cancelled", so a genuine Stop lost its marker. The host now always says whether it was a kill.
+- **Reopened conversations show shell command output again (#44).** Switching away from a live Claude conversation and back no longer drops the command's output.
 
-- **Sessions start again on Grok CLI 0.2.61–0.2.64 (#22).** A regression in the Grok CLI broke `grok agent stdio`: the agent no longer reads its first line of input until the input stream is closed, which never happens for a live connection — so the extension's startup handshake hung forever and you saw *"Grok exited (code null)"* / *"ACP request timed out: initialize"*. The last working build is **0.2.60**. Since the extension can't make the CLI read its input, it now **detects a broken CLI version on startup and automatically pins it back to 0.2.60** before connecting, with a one-time notice — no manual downgrade needed. Once the CLI is healthy again nothing is changed. If the automatic downgrade can't run, the start-failure message now tells you exactly how to fix it by hand (`grok update --version 0.2.60`). The version range is bounded to the known-broken builds so a future fixed release won't be needlessly downgraded. (The regression has so far only been reported on Windows, so the automatic pin and the update guard below currently apply there.) ([src/cli-locator.ts](src/cli-locator.ts), [src/sidebar.ts](src/sidebar.ts))
-- **"Update Grok Build CLI" won't move you onto a broken build.** Because Grok CLI 0.2.61+ is unusable by the extension (above), the gear → **About** update action is now **disabled with a note** when you're on the latest supported version (0.2.60) or newer — so a one-click update can't reinstall a broken build. It stays enabled only when you're on something *older* than 0.2.60, and in that case it updates **to 0.2.60** (never to an unsupported `latest`). The silent on-upgrade CLI update follows the same rule. ([src/cli-locator.ts](src/cli-locator.ts), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
+## 3.12.3 — 2026-08-18
 
-### Docs
+### Fixed
 
-- Documented the root cause, the controlled reproduction, and a copy-paste bug report for xAI in [research/stdio-eof-regression.md](research/stdio-eof-regression.md).
+- **The desktop app no longer dies when a phone or browser connects.** Opening a remote client while the app happened to be refreshing its voice settings could crash it outright — a Windows error dialog and a dead window, not a degraded feature. A background file watcher was asking a client that had connected but not yet finished its handshake which project it was on, and treating "not ready yet" as a fatal error. It now waits for that client instead, and the same assumption has been corrected everywhere else it was made.
+- **Dragging a panel edge follows your cursor when the UI is zoomed.** The rail and the file panel both jumped on grab and then drifted further from the pointer the further you dragged, because the drag was measured in screen pixels while the layout was in zoomed ones. Both now agree. At the default zoom nothing changes.
+- **Codex shows which MCP tool it ran.** Calls to MCP servers appeared as a bare `Run`, so a row of them told you nothing — the name was on the wire, but a generic label was taking precedence over it. They now read as `mcp.<server>.<tool>`, matching how the same calls already appeared for Grok and Claude.
 
-## 1.4.11 — 2026-06-20
+## 3.12.2 — 2026-08-18
 
-> Nested code blocks render correctly.
+### Fixed
 
-### Fixes
+- **Stray "New session" conversations stop piling up.** Checking whether an agent is signed in quietly started a real conversation and then tried to end it — but that particular cleanup never worked, so every check left an empty conversation behind. They showed up as identical "New session" rows you could not open (the CLI cannot load a conversation with no messages) and that survived **Clear all**. The check now runs somewhere harmless and removes after itself, so nothing new accumulates. Anything already on your disk stays where it is and is inert; it was never taking part in your work.
+- **Clear all history finishes the job.** It deleted the files while the agent processes were still shutting down, so on Windows the delete could fail — or the CLI would write the conversation back — and the rows returned. It now waits for those processes to exit first, and refreshes the project list for projects other than the one you are looking at.
 
-- **Nested code blocks no longer eat the outer fence (#20).** Asking the chat for a code block fenced by 4 or 5 backticks (so it can contain an inner ```` ``` ```` block) used to strip the first three backticks of the outer fence and close the block early at the inner fence — splitting one block into several and mangling the output. The Markdown renderer now matches a fence of three-or-more backticks and requires the closing fence to be the same length, so a longer outer fence correctly wraps shorter inner ones (per the CommonMark spec). This makes clean, copy-pasteable nested examples (e.g. for an `AGENTS.md`) render the same as on grok.com and in the Grok CLI. ([media/chat.js](media/chat.js))
+## 3.12.1 — 2026-08-17
 
-## 1.4.10 — 2026-06-18
+### Fixed
 
-> Session history that stays fast with thousands of sessions.
+- **The desktop app opens on a fresh install instead of hanging (#116).** Launching with no project configured sat on "Starting" forever. The app asked itself to open a conversation, found no folder to open it in, and returned without ever telling the window it had stopped working — so the loading state had nothing to clear it. Reported by @ffgrep, who also found the workaround: adding a project, or setting `workspaceRoots` by hand.
+- **A first run now has somewhere to work.** Rather than asking you to understand projects before you can send a message, the app creates a **Grok Build** folder in your home directory and starts there. It happens once, only when you have no projects at all, and it is an ordinary project you can remove — adding your own stops it being offered again. Plenty of people want this for chat or knowledge work and have no reason to think about project organisation.
+- **Removing every project gives you an empty state, not a spinner.** It names what is needed and offers **Add project folder**, and starting a conversation stays blocked until you add one — the same dead end was reachable that way too.
 
-### Features
+## 3.12.0 — 2026-08-17
 
-- **Session history loads in pages and stays fast at scale.** The history dropdown used to read and parse *every* saved session on each open, which got slow once a project had hundreds or thousands of them. It now loads the **most recent 100** (newest first by last activity) and pulls in older ones as you **scroll to the bottom**. The **search box** filters by name across your **entire** history — not just the loaded page — so you can still find an old session instantly. Behind the scenes it orders sessions with one cheap directory `stat` each (no file reads), reads only the page you're looking at, and caches by file modification time so re-opening the dropdown costs effectively no disk reads. ([src/sessions.ts](src/sessions.ts), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
-- **Switching model or reasoning effort on a fresh session no longer clutters history.** Some model and effort changes need the session to restart. If you flip them a few times right after opening a session — before you've actually said anything — each restart used to leave behind an empty, identical session in your history. Now an empty session (one where only the hidden setup has run) restarts cleanly with no "Summarize & Restart vs. Just Restart" prompt, and the throwaway session is removed instead of piling up. If you had renamed that session, the name carries over to the restarted one. ([src/sidebar.ts](src/sidebar.ts), [src/sessions.ts](src/sessions.ts))
+### Added
 
-### Fixes
+- **Colour, rename and opening a conversation happen the moment you do them.** Picking a project colour, renaming a conversation, or opening one from the rail or history used to sit still for a second or two while the host was asked and answered — longest in the browser, where every confirmation makes a round trip to your desk. All three now apply immediately. Renaming anywhere updates every surface at once, so the top bar no longer shows the old name after you renamed it in the history list. Opening a conversation switches the title and holds the messages panel on a loading state instead of leaving the previous transcript sitting under the new name. Your desk stays the authority throughout: if it disagrees, or never answers, the display returns to what it actually says.
+- **Maximize the file panel in the browser.** afkpilot.com on a monitor docks the panel beside the chat, exactly like the desktop app — but had no way to give it the whole window. It does now, with Escape to restore. On a phone nothing changes: the panel already fills the screen there.
+- **Provider marks on Settings → Providers.** Each row carries its agent's mark, so Grok, Codex and Claude Code are identifiable at a glance rather than by reading down a column of names.
 
-- **History dropdown no longer opens clipped off the right edge.** Opening the session-history popover quickly (before its rows had finished loading) could position it too far right, so it spilled past the panel edge and only looked right after closing and reopening. The popover is now right-aligned to the panel (respecting the edge padding) and grows leftward, so it stays fully on-screen no matter how its contents resize as sessions load in. In a narrow panel it also caps its width to fit, so a long session name truncates with an ellipsis instead of pushing the popover off the left edge. Resizing the panel while the dropdown is open now re-fits it live (no need to close and reopen), and switching to another panel tab or extension closes it so it can't reappear mis-sized when you come back. ([media/chat.js](media/chat.js))
+### Fixed
 
-### Internal
+- **Opening a Grok conversation no longer runs it on a different agent.** With Grok disconnected, opening a Grok conversation from the rail reported "Failed to start Codex" — and it meant it: the conversation had been quietly handed to whichever agent could answer, because a freshly opened session looked empty before its history loaded. A conversation now keeps the agent it belongs to, and if that agent cannot answer you are told so by name. The wrong error text was the visible symptom; running your conversation on an agent you did not choose was the actual bug.
+- **Refresh finds an agent you signed into somewhere else.** Approving Grok in a browser and pressing Refresh in Settings → Providers did nothing, because it only re-checked accounts already marked connected — which is precisely the case you press it to fix. Every installed agent is re-checked now.
+- **The ⋯ menu stops closing itself while projects load.** Opening it during the first seconds after a window opens had it vanish every few seconds until the project list settled.
+- **The browser matches the editor's text size.** afkpilot.com on a desktop rendered a size larger than the same UI in VS Code or the desktop app, because the browser has no editor font setting to inherit and fell back to its own default. It now matches at 13px. Phones and tablets are unchanged — text stays at the larger size the touch layout was designed around.
 
-- **Opt-in performance simulation for the history popover.** A new `npm run test:perf` suite (kept out of `npm test` and CI) builds a 5000-session in-memory store and asserts the access-count improvement: first open drops file reads from 5000 to 100 (~98%), a repeat open does zero reads (modification-time cache), and search warms the catalog once then stays read-free — with a modeled-latency projection and a real in-memory parse-cost wall-clock. ([test/sessions.perf.ts](test/sessions.perf.ts), [vitest.perf.config.ts](vitest.perf.config.ts), [package.json](package.json))
+## 3.11.0 — 2026-08-17
 
-### Docs
+### Added
 
-- Documented the pagination design in [docs/architecture.md](docs/architecture.md) (§ History at scale) and [CLAUDE.md](CLAUDE.md) (§ History pagination), and updated the *Session history* feature note in the [README](README.md).
+- **Settings → Providers can be made to tell the truth.** The page said whether Grok, Codex and Claude were connected, but nothing ever re-checked: sign out inside a terminal, install a CLI, let a token lapse, and it kept repeating whatever it last heard. There's now a **Refresh** button above the list, and opening the page runs the same check on its own. It re-looks for each CLI and re-tests the accounts that are actually connected — it never marks an account connected on your behalf, so a refresh can only ever tell you what is true. The button says "Checking…" while it works. On the phone the list stays read-only, as it was, but it updates the moment your desk re-checks.
 
-## 1.4.9 — 2026-06-16
+### Fixed
 
-> Make the chat bigger — just the chat.
+- **The VS Code settings tab keeps up with your accounts.** Opened as an editor tab, Settings → Providers only ever showed the state it started with — connect or sign out anywhere else and that tab never heard about it, so it could sit there contradicting the sidebar until you closed and reopened it. It now receives the same live updates every other surface gets.
 
-### Features
+## 3.10.1 — 2026-08-16
 
-- **Adjustable chat font size (#14).** A new `grok.chatFontScale` setting zooms the Grok chat panel only — text, icons, and spacing together — as a percent (e.g. `150`, `200`, or smaller like `70`). Unlike VS Code's global `Ctrl/Cmd+Shift+=`, it leaves the rest of the editor at its normal size, so you can enlarge (or shrink) just the chat for readability. It applies live with no reload, the composer stays pinned to the bottom of the panel at any scale, and it works at both User (global) and Workspace (local) scope. ([package.json](package.json), [src/sidebar.ts](src/sidebar.ts), [media/chat.css](media/chat.css), [media/chat.js](media/chat.js))
+### Fixed
 
-### Docs
+- **Grok can see the images it opens (#79).** Asking Grok to read a `.png` or `.jpg` came back `Cannot read binary file`, while the same CLI in a terminal described pictures happily. The cause was on this side: the extension told the CLI it could resolve files on its behalf, and that routed *every* read — images included — down a text-only path with no image branch. It no longer does, so reading a picture reaches the CLI's own image-aware path and the model actually sees it. Generated images, screenshots a subagent produced, anything Grok opens by path. Pasting and attaching images were never affected — those always sent the pixels, and still do. Applies to grok CLI 1.0.4 and newer, where that image-aware read exists; older CLIs keep their previous behaviour, and Codex sessions are unchanged.
+- **Codex Auto accept stays Auto accept.** Codex reports Plan/Default and Agent/full-access as two options on every snapshot. Treating collaboration `default` as the host mode discarded `agent-full-access`, so picking Auto accept snapped back to Agent and approving a plan from full-access implemented under an Agent badge.
+- **A rejected Plan switch no longer leaves the Plan badge up.** The toolbar followed the click, not `session/set_mode`. When that RPC failed, Claude and Codex stayed writable (no client gate) while the UI claimed Plan.
+- **Plan mode blocks a command that arrives in the same stdout chunk as the switch.** Raising the client gate after `await setMode` left a window: readline can deliver the success reply and a `terminal/create` in one turn, and the handler still saw the gate down. A successful Plan reply now commits the gate in the response hook, before the next line is dispatched. A refused switch still leaves the badge and gate unchanged.
 
-- **README polish.** Added screenshots for *Voice input* and the *Agent Dashboard*, and moved a few wire-level implementation details out of the feature blurbs into [docs/architecture.md](docs/architecture.md) so the feature list reads less like internals. ([README.md](README.md), [docs/architecture.md](docs/architecture.md))
+## 3.10.0 — 2026-08-15
 
-## 1.4.8 — 2026-06-15
+### Added
 
-> Run several Grok sessions at once — switch between them instantly, and see at a glance which one needs you.
+- **Touch sizes for real fingers.** On phones and tablets the whole UI steps up: 15–16px text in the rail, file tree and panel (reading prose goes 12 → 15px), every row you tap is at least 36px tall — including the project headers and tree rows that quietly sat under the floor — and every tap target meets one universal 36px minimum with zero exceptions. Text inputs go 16px on touch, which stops iOS Safari's zoom-lurch when you focus the search or the composer. The code viewer deliberately keeps its smaller type: columns beat point size on a phone. Desktop and mouse layouts are pixel-identical to before.
+- **File tabs that behave like tabs.** The file panel's strip stops scrolling: named tabs shrink to icon-only, then overflow into one "…" chip styled like a tab — and whatever fits shows its whole name, extension included, so `.env` and `CLAUDE.md` read fully instead of becoming `…`. The active tab always keeps its ✕ and its name; maximize/minimize sits pinned at the right and can never silently disappear; on desktop, maximize gives the panel the whole window until Escape.
+- **A real mode switcher in the file viewer.** Reader and Source are a proper segmented control with a filled selected state; Cancel, Save and ⋯ sit at the right end; and both "…" menus now close when you tap their button again.
+- **One icon scale everywhere.** Every top-bar icon rides the same 20px glyph in an invisible touch-sized hit box with color-only hover — chat header, file panel and rail now measure identical on the phone.
 
-### Features
+### Fixed
 
-- **Multi-session Agent Dashboard.** The sidebar now keeps several sessions *alive* at once instead of one at a time. Switching between them from the history dropdown is **instant and lossless** — the conversation you switch away from keeps running in the background (mid-turn, mid-approval, anything), and switching back replays its exact state with no reload. Picking a session that isn't live anymore loads it from history as before. ([src/sidebar.ts](src/sidebar.ts), [src/session.ts](src/session.ts))
-- **Status dots in the history dropdown.** Every session shows a dot so you can see what each one is doing without opening it. It's **gray** at rest, and only lights up when there's something to know: **blue** = working, **yellow** = needs you (a permission, question, or plan to review), **green** = finished with output you haven't opened yet, **red** = finished with an error you haven't opened. The green/red marker is an *unread* badge — it clears the moment you open the session, and it's **persisted**, so it survives the idle cleanup below and even a VS Code restart. Walk away, come back, and the green sessions are exactly the ones with results waiting. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css), [src/session-pool.ts](src/session-pool.ts))
-- **Idle sessions are cleaned up automatically.** To keep a pile of background sessions from each holding a live process, a session left untouched for an hour — or beyond a cap of ~8 live — is quietly shut down (never one that's working or waiting on you). It reappears in history and reloads on click, so nothing is lost. ([src/session-pool.ts](src/session-pool.ts))
-- **Updating the Grok Build CLI warns about sessions in progress.** With multiple sessions now able to run at once, the *Update Grok Build CLI* action confirms before it restarts when any session is mid-turn or waiting on you — so an update doesn't silently interrupt work in a background session. ([src/sidebar.ts](src/sidebar.ts))
-- **No more long pause before Grok starts.** Sending your first message used to sit silent for 15–40 seconds before anything appeared. Behind the scenes the extension primes each session with a hidden plan-mode instruction, and that primer was running *in front of* your first message and — because Grok Build is an agentic CLI — was wandering off to read files and search the workspace before your real prompt even ran. The primer now fires **the moment a session goes live**, silently in the background, so it's almost always finished before you hit send; if you're quick, your message shows immediately and is released the instant the primer settles. The primer text itself was also trimmed to just the protocol it needs to teach (the product blurb and repo link that were tempting Grok to go exploring are gone), so it completes in a beat instead of dozens of seconds. ([src/sidebar.ts](src/sidebar.ts), [src/grok-primer.ts](src/grok-primer.ts), [src/session.ts](src/session.ts))
-- **A "Grokking…" indicator while you wait.** Every turn now shows an animated *Grokking…* placeholder the instant you send, so there's immediate feedback that Grok received your message — it's replaced in place the moment the first thought, reply, or tool action arrives. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
+- **Refreshing the phone lands in your conversation, directly.** The page holds a quiet "Restoring conversation…" instead of flashing a blank New session (title bar included) and then swapping. Restores survive a just-reloaded desk (the host waits out its own cold start instead of refusing), a genuinely failed restore says so once and hands any queued text back to the composer — including text queued mid-turn, which used to vanish — and a brand-new empty session refreshes clean instead of announcing "could not restore" over phantom "queued actions".
+- **Transient agent hiccups stop painting terminal errors.** A failed provider start retries quietly before surfacing; a process that dies mid-startup can no longer be treated as running (which could silently swallow an automatic sign-in retry); and "exited (code 0)" on an empty conversation — a clean exit with nothing to say — no longer renders as a red must-restart banner.
+- **Worktree dialogs answer the conversation they were opened for.** Fork, apply and remove name their session on the wire and the host refuses a mismatch, so a confirmation answered after switching conversations can never land on the wrong one.
+- **Just the conversation name.** The repository suffix under session names is gone on every surface — the rail already says which project you're in.
+- **The `/` command popover hugs its content** instead of spanning the whole composer.
 
-## 1.4.7 — 2026-06-15
+## 3.9.0 — 2026-08-14
 
-> Sharper math, and one-click export for equations and diagrams.
+### Added
 
-### Features
+- **Parallel subagents stop scrambling the chat.** The CLI streams every agent's words onto one wire, interleaved mid-sentence — and the transcript used to paint them that way (#62). Each subagent now gets its own card in the conversation: collapsed with a live one-line status while it works, expandable to its own transcript of prose and tool calls, with the parent's narration staying coherent above it all. Old CLI versions that never interleaved behave exactly as before.
+- **All settings, one place.** A full settings surface — search with `/`, categories with icons, one row per setting with a sentence that says what it does. On desktop and the phone it opens over the app with **← Back to app** as the exit; in VS Code it's an editor tab plus a native gear icon on the Grok view's title bar. The gear popover slims down to quick actions and one Settings entry. **About** lives at the bottom of Settings now — versions, update check, report-a-bug and feature-request links, and a support contact. Restore defaults confirms first with a concrete list, and never touches things you wrote yourself (voice dictionary, send phrase).
+- **Voice's fiddly bits are editable** — the spoken send phrase and the recognition dictionary, from any client including the phone, saved to the config scope that actually wins.
+- **The telemetry switch is visible.** The existing anonymous-usage setting has a real toggle on desktop and a row everywhere, with the honest description: one anonymous session-start event, never prompts, code, paths, or identity; the IP address is discarded, never stored.
+- **Devices tell afkpilot.com what they are.** Linking (and every reconnect) now reports the client kind and OS, so the device list can show "DESKTOP-X (VS Code extension, Windows 11)" with the right OS mark — existing devices label themselves on their next connect, no re-linking needed.
+- **Unlink from the desktop app** — gear → Your account → "Unlink this device…", with a native confirmation naming the machine. The palette-less desktop finally has the deliberate path (#112's side-finding).
 
-- **Math now renders with [MathJax](https://www.mathjax.org) (replacing KaTeX).** MathJax produces self-contained SVG that's closer to "real LaTeX," renders `\label`/`\ref`-style environments without painting red errors, and — crucially — gives every equation an exportable vector. Inline `\(…\)` sits on the text baseline in your editor's text color; display `\[…\]` gets its own centered, horizontally-scrollable block. The swap also fixed a double-rendering bug where Chromium drew MathJax's hidden accessibility MathML as a *second*, visible copy of each equation (`enableAssistiveMml: false`). ([media/chat.js](media/chat.js), [src/sidebar.ts](src/sidebar.ts), [media/mathjax/](media/mathjax/))
-- **Copy / Download / Open actions on display math + Mermaid diagrams.** Hover any display equation or rendered diagram for a top-right overlay (mirrors the generated-image actions): **Copy** the LaTeX/Mermaid source, **Download** as an image, or **Open** it in VS Code's image preview. Download offers a quick-pick — **PNG** (rasterized with your VS Code theme background, i.e. what you see), or a **transparent SVG** tuned **for a dark** or **for a light** background. Math recolors its ink for each; Mermaid is re-rendered in its matching light/dark theme so a "for light background" diagram actually uses the light palette. ([media/chat.js](media/chat.js), [src/sidebar.ts](src/sidebar.ts))
+### Fixed
 
-### Internal
+- **Desktop opens in its real layout.** The brief flash of the old panel-less UI before the rail and file panel arrived is gone — the full three-column chrome paints from the first frame.
+- **Rail menus stop growing sideways.** Context menus cap at a sane width with ellipsis instead of stretching as wide as their longest entry.
+- **The gray idle dot next to provider logos is gone** — the logo already says which agent owns the session; the dot only returns for states that mean something (working, needs you, unread, error).
+- **"How it works" tells desktop users the truth** — "Keep this app open," not a list of editors you're not using.
 
-- **`video-gen` is excluded from the default live-test gate** (opt-in via `--only=video-gen`). In the headless test harness grok 0.2.x spins on `/imagine-video` instead of producing a clip, so it never completes — the feature works interactively, so a default-on test only produced noise. ([scripts/live-tests.cjs](scripts/live-tests.cjs))
+## 3.8.0 — 2026-08-14
 
-## 1.4.6 — 2026-06-15
+### Added
 
-> Grok's Mermaid diagrams now render as diagrams.
+- **The desktop app updates itself.** Windows and macOS builds check quietly in the background, download the new version while you keep working, and the rail button becomes **Restart to update** when it's staged — one click installs silently and brings the app right back. A normal quit installs it too. No wizard, no SmartScreen detour, no download page: that whole trip now exists only as the fallback when the feed is unreachable. An in-flight reply is never interrupted — the update waits for your click or your next quit.
+- **Typing part of a command's name finds it.** `/rev` matches `/code-review` now, not just commands that start with those letters — commands beginning with what you typed still list first (#110).
+- **Anonymous usage telemetry knows the app from the editor.** The one existing session-start event now says whether it came from the desktop app or VS Code, and which settings shape the session (mode, model, effort, thinking traces, voice on/off, which agents are connected). Strictly enums and booleans — a new test proves no path, filename, or free text can enter the payload, and any value the app hasn't actually measured is omitted rather than guessed. The full field list is in docs/privacy.md.
 
-### Features
+### Fixed
 
-- **Mermaid diagram rendering.** Grok answers with ` ```mermaid ` fenced blocks — flowcharts, sequence/state diagrams, git graphs, class diagrams, ER, pie, and more — which the chat previously showed as raw diagram source. These now render as real diagrams via the vendored **[Mermaid](https://mermaid.js.org)** library (bundled into the extension, no network — works offline and in the packaged build). The diagram is themed to match VS Code (dark/light) and gets horizontal scroll so a wide flowchart doesn't blow out the narrow sidebar. Rendering is asynchronous and DOM-based (Mermaid measures text to lay out nodes), so unlike the LaTeX path it runs as a post-render pass over the inserted message; an SVG cache keyed by the diagram source keeps the streaming bubble flicker-free (the agent message re-renders every animation frame) and stops the same diagram being laid out dozens of times before the first render resolves. A half-streamed block stays as plain text until its closing ` ``` ` arrives, and if Mermaid can't load or the diagram is malformed the readable source is shown instead of an error. ([media/chat.js](media/chat.js), [src/sidebar.ts](src/sidebar.ts), [media/mermaid/](media/mermaid/))
+- **The projects rail no longer vanishes on desktop startup.** Opening the app with a restored conversation could boot into a chat with no left rail at all — every time, on some machines — until a hard reload brought it back. The startup handshake was mistaking its own just-started session for a window reload and skipping the project list on the strength of it.
+- **The desktop window can no longer open scrambled.** An occasional first paint had the content shifted and cropped at both edges, panels pushed off-screen, zoom applied twice. The window now shows only once the page can measure it, the app's zoom is the only zoom, and a boot-time focus can no longer scroll the layout into a stuck state.
+- **Your history is there before the agent is.** With the CLI still starting — or not installed at all — conversations on disk now list and open read-only instead of showing an empty rail behind a blank onboarding screen.
+- **Grok 4.6** replaces Grok 4.5 across the listing and manifest, and packaging keeps the Codex adapter's dependencies out of the shipped artifacts (5.2 MB vsix, 17 MB desktop asar — with the ~350 MB Codex platform binary provably excluded from both).
 
-## 1.4.5 — 2026-06-15
+## 3.7.0 — 2026-08-13
 
-> Grok's math now renders as math.
+### Added
 
-### Features
+- **OpenAI Codex can run alongside Grok.** Connect it from the gear in VS Code or Settings on the desktop; models from both providers share one picker, every conversation keeps the provider it started with, and both providers' sessions sit side by side in the rail. No Codex CLI installed? The app offers to install a pinned, checksummed copy for you. A phone sees which providers are connected; signing in and out stays at the desk.
+- **Export a conversation as Markdown.** In the conversation's ⋯ menu on every surface — VS Code opens it as an untitled document, the desktop asks where to save, the browser downloads the file. Rewound turns and hidden bookkeeping never leak into it, and an export of a partial phone history says so instead of passing as the whole conversation.
+- **The VS Code chat grew its own ⋯ menu.** Continue in a new chat moved there from the gear, alongside the new export — per-conversation actions live with the conversation now.
+- **"View all" and proposed diffs open inside the desktop app.** A themed, syntax-highlighted overlay with Copy and Save As replaces the bare read-only window that knew a file's language but couldn't paint it.
+- **Copy Link.** Right-click — or long-press on a phone — a link in the transcript to copy its real address; file references copy their path.
+- **Shell scripts can be saved from the file panel.** Editing `deploy.sh` or a `.ps1` was refused with "executable path refused" — a check written to stop the operating system *launching* a file, reused to decide whether you were allowed to *write* one. It stopped only the person: ask grok to edit the same file and it always could. The refusal stays exactly where it belongs, on Open in default app and Reveal. `.bat` and `.cmd` also open in the panel now, which `.sh` and `.ps1` already did.
+- **Opening a conversation logs where the time went.** One line in Output → Grok splits the open into its phases, so a "sometimes slow" report can carry numbers instead of an impression.
 
-- **LaTeX / math rendering.** Grok increasingly answers with TeX — inline `\(…\)` and display `\[…\]` (including `\begin{pmatrix}` matrices, fractions, sums, Greek) — which the chat previously showed as raw backslash-soup. Math is now rendered with **[KaTeX](https://katex.org)**, vendored into the extension (no network, works offline and in the packaged build). The renderer pulls LaTeX out *before* HTML-escaping so the backslashes and braces survive intact; inline math flows with the text, display math gets its own block with horizontal scroll so a wide matrix doesn't blow out the narrow sidebar. A malformed expression renders as an inline red error (KaTeX `throwOnError:false`) instead of blanking the message; if KaTeX somehow can't load, the raw TeX is shown rather than swallowed. `\label{…}` (which Grok emits inside `align`/`equation` blocks for cross-referencing) is stripped before rendering — KaTeX has no `\ref`/`\eqref` system so it would otherwise paint the label as a red error, and `\label` produces no visible output in real LaTeX anyway. Single `$…$` is deliberately **not** a delimiter — too many false positives with prose currency ("$5 and $10"). ([media/chat.js](media/chat.js), [media/webview-helpers.js](media/webview-helpers.js), [src/sidebar.ts](src/sidebar.ts), [media/katex/](media/katex/))
+### Fixed
 
-## 1.4.4 — 2026-06-15
+- **The chat no longer scrolls away from the bottom on its own.** With the UI zoomed and tool details expanded, answering a permission card — or just a growing reply — could unpin the view and bring the "Scroll to bottom" button back every turn. Only a real gesture (wheel, touch, scrollbar, paging keys) unpins now; a reader who scrolled up to read history stays exactly where they are.
+- **"View all" opens with a language.** A command opens in your shell's language, and output is no longer forced to Plain Text, so the editor can recognize JSON, logs and generated code.
+- **Copy and the timestamp under a message are readable without hovering.** They rest dimmed instead of invisible — and on a phone they take a direct tap, no gesture first.
+- **Plan mode is no longer lost to a slow version check.** A first `grok --version` after install can time out (Windows antivirus is the usual cause). The last verified version for that binary is remembered, so a failed probe keeps Plan when the file has not changed. That memory is only a stand-in — picking Plan checks again — so a later update is not stuck behind a stale reading, and a live check still replaces the stand-in either way. A live reading of an old CLI is still refused. The disabled message now says the check failed and that picking Plan again or reloading retries it.
+- **Windows machines can sleep with the chat panel open.** The first click created an audio session and never released it, even with every sound setting off. The session is created only when a sound is actually on, and it is suspended again once the tone finishes.
+- **Everything you tap on a phone is at least 36px.** The rename pencil was 22px — below the accessibility minimum — and the file-panel toggle, the one you use to reach files at all, was 28. Save and Cancel were 26 tall. Mouse-driven windows keep their compact controls; the larger targets appear only where the pointer is a finger.
 
-> You can read history again while Grok is thinking.
+## 3.6.0 — 2026-08-12
 
-### Fixes
+### Added
 
-- **Scrolling up no longer gets yanked back down while Grok is thinking** ([#16](https://github.com/phuryn/grok-build-vscode/issues/16)). The chat snapped to the bottom on *every* streaming update, so any attempt to scroll up and re-read earlier messages (or Grok's own earlier reasoning) was undone on the very next thought chunk. The view now follows streaming output only while you're already pinned to the bottom; the moment you scroll up to read history, auto-scroll pauses and leaves you there. Genuinely interactive activity you need to see — **permission cards**, **ask-user-question cards**, and **your own sent message** — still pulls the view back down and re-pins. This also restores the ability to keep an eye on reasoning while permission cards stack up ([#15](https://github.com/phuryn/grok-build-vscode/issues/15)). ([media/chat.js](media/chat.js), [media/webview-helpers.js](media/webview-helpers.js))
+- **Code in the file panel is syntax-highlighted — while you read it and while you type.** Every file that was not Markdown or JSON opened as flat grey text: fine for a glance, tiring for anything longer. Around sixty file types now colour their comments, strings and keywords, and the colours stay when you switch to editing rather than vanishing the moment you tap Edit. It is our own highlighter rather than a library — the panel runs under a strict content policy that cannot load one, and the alternative was ~200KB of parser in every page load for something you mostly skim.
+- **`.sql` and about twenty more file types open in the panel at all.** They used to be handed to the operating system, which on the desk is a detour and from a phone means they could not be opened. `.scss`, `.ini`, `.conf`, `.rb`, `.php`, `.kt`, `.swift`, `.cs` and `.diff` are among the rest.
+- **A link in a README opens the file it points at.** Tapping `_shared/auth.ts` in a rendered Markdown file was treated as a web address, so from a phone it navigated away from the app entirely. It now opens that file as a tab. Links that really do point at the web still go to the browser.
 
-## 1.4.3 — 2026-06-09
+### Fixed
 
-> Docs catch-up and a faster, leaner session start.
+- **Referring to an image the agent could not find.** Attach a picture, attach another in a later message, and asking about the second failed with *"does not match any attached image"*. The tag said `#2` because it was the conversation's second image; grok counts the images on the message it is reading, where it was the first. Images are now numbered from 1 in every message — in the tag and in what you see — so the number you read is the number the agent was told. Two pictures in one conversation are both "Image #1" now, each in its own message, which is the trade that makes the reference work at all.
+- **Deleting the last empty line of a file, and having it come back.** The editor said "Saved." while the file on disk kept the newline you had just removed. Saving a formatted `.json` had the mirror-image problem: it quietly *removed* the final newline every time, so `package.json` came back with a spurious change after any edit.
+- **The file panel is the whole screen on a phone and a third column on a desktop — never something in between.** At tablet widths it floated over the middle of the chat with the projects rail showing behind it. Below the width where it can sit beside the conversation it now takes the screen, and the panel's own close button brings you back. Files no longer carry individual close buttons there — two small targets side by side, and a project tab that looked closable but was not.
+- **A file that cannot be previewed opens as a tab, with the reason inside it.** The message used to be painted over the file tree with no tab at all, so nothing told you which file had failed, and the tree's search box stayed on screen above it. On the desk the file was also handed straight to your operating system before you could see what it applied to; *Open in default app* is now offered inside that tab instead of taken on your behalf.
+- **"More actions" in the file viewer opens.** On Grok Build Desktop the button did nothing, silently — the click that opened the menu was also the click that closed it.
+- **A conversation you send to rises up its project in the rail.** Sending in one project never told a connected browser that a *different* project had just become active, so its position there went stale.
 
-### Docs
+## 3.5.0 — 2026-08-11
 
-- **README rewrite.** Restructured around three audiences: users get a clean **Requirements → Install → Quick start** path, then a **Features & capabilities** section where each feature is its own collapsible — ordered by what actually sells the extension (diff-preview approval, modes, `/imagine` images+videos, voice…) rather than by implementation. **Configuration**, **Commands & keybindings**, and **Development** each collapse into a single `<details>` so the page scans in seconds while staying self-contained for the Marketplace listing. The deep dive — diagram, message flow, module map, design notes, and the Plan-Mode "the one part that isn't thin" explainer — moved to a new [docs/architecture.md](docs/architecture.md), linked from a short *How it works* teaser.
-- **Removed stale claims.** Dropped the **Subagents** feature section (still research-only — it rarely fires in practice, so it shouldn't read as shipped) and the "generated media is inlined as base64" known-limit (1.4.2 switched media to `asWebviewUri` streaming). Trimmed the opening screenshots to the sidebar + an inline `/imagine` result, with a *More screenshots* link to the folder; removed a decorative image that carried no information.
-- **Canonical `README.md` / `CHANGELOG.md` casing.** The working-tree files were lowercase on disk (a Windows case-insensitivity slip) while git already tracked them uppercase; the disk now matches. (`vsce` still normalizes the *packaged* copies to lowercase inside the `.vsix` — that's its own convention, which the Marketplace renders fine.) `scripts/release.*` now reference `CHANGELOG.md` so the release-notes extraction works on case-sensitive filesystems too.
+### Added
+
+- **The browser gets the desktop's file panel — the same one.** Browsing files from your phone was a different piece of software from the panel in Grok Build Desktop: a flat list you stepped through, one file at a time, floating over the chat. It is now literally the same panel — a tree you expand in place, several files open at once as tabs, and on a wide screen it docks beside the conversation instead of covering it. On a phone it still opens as a drawer, because a phone has no room for a third column. There is one renderer now instead of two that drifted apart every time either was touched.
+- **Version & about describes the machine you are driving.** On a phone the page said "This extension" over a "Checking for updates…" that never finished — the desk machine's own panel, shown to a device that is neither the extension nor able to update anything. It now says what you are holding, what it is connected to, and the two versions installed over there. No update button: the binaries live on the desk machine and only the desk can replace them.
+- **Opening a conversation from GROK: PROJECTS brings the chat forward.** The rail has its own icon in the activity bar, so a click could load the conversation behind whatever view you were looking at and read as having done nothing.
+
+### Fixed
+
+- **Saving no longer throws you out of the file, or moves your cursor.** A successful save dropped you back to the read view, so carrying on meant clicking Edit again — for the ordinary habit of saving as you work. It also rebuilt the editor, which sent the caret to the top and lost your selection and scroll position. You now stay exactly where you were.
+- **The right-click menu in the file panel respects zoom.** It was placed at raw pointer coordinates while the chat scales, so the further from the top-left you clicked, the further away the menu appeared. It also could not flip up and had no bottom clamp, so it could open off the screen.
+- **The file panel's toolbar buttons are visible.** Every icon on the open-file row rendered as an empty box.
+- **Markdown reads like every other file type again.** It had become the only kind with a worded toggle while everything else got an icon, so one toolbar looked like two designs.
+- **Conversations sit at one spacing everywhere in the rail** — including under a section label, which used to sit noticeably further from its first row than the rows sat from each other.
+- **The project name is no longer truncated when nothing sits beside it**, and the shading behind a row's hover actions matches the row rather than the panel.
+- **The VS Code rail stopped re-reading every project on every refresh.** Each refresh asked every other project for its conversations again — a full pass over its history — even when nothing about it had changed.
+- **A phone can no longer start a CLI update on your desk machine.** The status still travels, so you can see the CLI is behind; acting on it belongs to the machine it is installed on.
+
+## 3.4.0 — 2026-08-10
+
+### Added
+
+- **Archived projects stay on the desk.** A project you have filed away no longer appears on your phone, and its conversations, files and pinned rows go with it. Working in it again at the desk brings it back. Opening it in VS Code keeps it visible throughout — filing something away was never meant to hide the thing you are looking at.
+- **Opening a conversation now says where its time went.** The log records each phase of an open — waiting for the previous CLI to exit, checking its version, starting it, loading the transcript — so a slow one can be explained instead of guessed at. Measured first: ordering 1,786 conversations takes 190ms, so the wait was never the history list.
+
+### Fixed
+
+- **Renaming a conversation no longer makes the top bar jump.** The rename pencil is a fixed-height button and the tallest thing in that row, so hiding it collapsed the row and took 7px off the whole bar, dragging the project line and the separator up with it.
+- **The top-bar icons sit level.** They were 2px from the top edge and 15px from the rule underneath, left behind when the conversation name grew a second line.
+- **A file type is no longer linked as a file.** "The main `.md` files" turned `.md` into a link to nothing; a bare extension names a kind of file, not one you can open. `.env` and `.gitignore` still link, being real filenames.
+- **A crashed CLI no longer keeps a worktree slot forever.** If it died while a worktree was still being copied, the dead process stayed referenced until the window closed.
+- **The extension's own docs name SpaceXAI** where they describe who makes Grok. The trademark line still reads xAI, which is what the rights holder's own brand guidelines ask for.
+
+## 3.3.1 — 2026-08-10
+
+### Fixed
+
+- **Menus in the projects rail stop running away from the pointer.** On a wide rail a menu opens at the right-hand edge, next to the ⋯ button — far enough from the click that the "you have walked away" rule closed it before you could reach it. Walking away is now something you can only do after arriving.
+- **"Set color" opens its swatches where the menu was.** Right-clicking a project opens the menu under the pointer, but choosing Set color threw the colours back across the rail to the ⋯ button, out from under the cursor that was following them.
+
+## 3.3.0 — 2026-08-10
+
+### Added
+
+- **A projects rail in VS Code**, with its own icon in the activity bar. Every project Grok has worked in, side by side: pinned conversations, the ten most recent across all of them, and each project's own list underneath. Until now VS Code showed you one project — whichever folder the window had open — and everything else was invisible unless you reopened the window somewhere else.
+- **Open a conversation from any project without leaving the one you are in.** Nothing reloads. The chat follows the conversation, and so do New Session, worktrees, and the file chips — a conversation in another project no longer quietly attaches a file from the folder VS Code happens to have open.
+- **Browse your project's files from a browser, and edit them.** Open a text file on your phone, change it, save it. Images preview but cannot be edited; nothing else can be read or written, and every path is checked against the repository that tab has selected.
+- **Projects can be added to the rail and hidden from it.** Adding one records it rather than reopening the window — VS Code turns a single-folder window into a multi-root one and restarts the extension host, which is not a reasonable price for putting a folder in a list.
+- **Projects file themselves away when they go quiet.** Anything untouched for a month, and anything with no conversations at all, moves to an archive group; working in one brings it straight back. Opening a project in VS Code always lifts it to the top, marked **Your IDE**.
+- **Projects can have a colour in VS Code**, as they already could on desktop and the phone.
+
+### Fixed
+
+- **Worktrees work again, and the reason they didn't is worth stating.** Not every worktree the Grok CLI makes is a `git worktree` — for some repositories it makes a full copy instead, which the original repository's worktree list will never mention. So a perfectly good checkout was created and then rejected as unrecognised, and the retry that appeared to succeed had actually been waved through on the CLI's own say-so, sometimes onto an empty folder where the agent then failed to start. Both halves are fixed: git is asked first and always, and a copied checkout is verified from a file on disk rather than taken on trust.
+- **"Remove worktree failed: Internal error."** The CLI deletes the checkout and *then* fails to deregister it, so what was left was an empty folder and an error you could do nothing about. That leftover is now removed for you. A creation that *is* rejected also tells you where the checkout was left, instead of leaving orphans behind silently.
+- **The rail's menu did nothing.** Rename, Delete, Clear all history and Hide project were all silent — VS Code disables the browser prompts they relied on, and every one of them read that as "cancelled". They ask properly now, which is also why the lists had looked frozen: nothing had happened to refresh them.
+- **Recent updates when you send a message.** It ranks by when a conversation last changed, and that clock is written by the agent, not by the extension — so there was no moment on our side to notice. The end of a turn is now that moment.
+- **Menus close when you look away.** A click anywhere else in VS Code never reaches the rail, so an open menu had no way to know it had been left behind. Moving the pointer well away from it closes it too.
+- **"Move to Projects" appeared on projects already in Projects**, because the menu read a stored flag while the rail places rows by how recently you worked in them. The action follows the group the project is actually shown in.
+- **A conversation's project is named under its title**, not beside it, and the rename pencil stayed where it belongs instead of dropping to a line of its own.
+- **Deleting a conversation no longer fails with a directory-not-empty error on Windows**, which happened when anything still had the folder open for a moment.
+- **Plan mode stops disappearing because a version check was slow.** Only a CLI actually verified as too old turns it off now, and the message says the version could not be checked rather than implying the CLI is out of date.
+- **Grok Build Desktop's prompts look like dialogs.** The worktree prompt in particular was a window with rules across the top and bottom, no padding, the stock Electron icon, and a maximise button — a small web page rather than a question.
 
 ### Changed
 
-- **The hidden plan-mode primer no longer costs a startup round-trip.** The extension sends Grok a hidden "primer" that teaches it the Plan-Mode verdict protocol. It used to fire at **every** session start — new *and* every restore — locking the composer until Grok acknowledged and burning a turn even on a session you only opened to glance at. It's now sent **lazily**, as its own hidden turn before your **first real prompt** — on a new *or* restored session — so it rides along with work you already triggered. The composer is ready the instant the session connects, and opening/abandoning a session (or restoring just to read history) costs nothing. Re-asserting the primer on the first post-restore send (rather than trusting a copy buried in replayed history, which a `/compact` can drop) keeps Plan Mode reliable across resumes. Best-effort and unchanged in protocol — the plan-gate remains the real enforcement. ([src/grok-primer.ts](src/grok-primer.ts), [src/sidebar.ts](src/sidebar.ts))
+- **Clicking a conversation in the VS Code rail highlights it immediately**, instead of waiting for the conversation to load. It has always worked that way on desktop, where the rail and the chat share a window.
+- **"Current" is now "Your IDE"**, and it means the folder VS Code has open — not whichever project you were last looking at in the rail.
+- **Section labels in the VS Code rail scroll with their conversations** rather than staying pinned at the top of the panel.
+- **xAI is named SpaceXAI** where the non-affiliation notice says who we are not affiliated with. The trademark line still reads "of xAI", which is what their own brand guidelines ask for.
 
-## 1.4.2 — 2026-06-09
+## 3.2.11 — 2026-08-09
 
-> Generated video renders now, and inline media is a tighter thumbnail.
+### Added
 
-### Fixes
+- **Projects can have a colour.** Give each project a coloured folder in the conversation rail — *Set color* in its ⋯ menu, six colours or none. The choice is stored with your projects rather than in one browser, so it follows you to your phone. Desktop and browser.
+- **Right-click works wherever ⋯ does.** Projects and conversations in the rail, files and folders in Grok Build Desktop's file panel — right-clicking opens the same menu the ⋯ button does. Not on touch, where a long press already means something.
+- **Folders can be revealed in Finder or Explorer**, not only files, and the file panel's row actions now live in a ⋯ menu like the conversation list's do.
 
-- **Generated videos (`/imagine-video`) finally render.** Detection, path extraction, MIME, and CSP were all already correct — the failure was the delivery: a multi-MB clip base64-inlined into a single `postMessage` `data:` URI was silently dropped, so the `<video>` got an empty source. Generated files are now served via `webview.asWebviewUri` (the grok home is a `localResourceRoots` entry), so the webview **streams the file straight from disk** instead of carrying it as a giant string — videos play, and large images load lazily. Files written outside the served roots still fall back to a base64 `data:` URI, so nothing regresses. ([src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
+### Fixed
 
-### Polish
+- **Conversations stop jumping to the top of the list for being opened.** Opening one rewrites its record on disk, and the list read that as activity — so merely looking at an old conversation promoted it above ones you had actually been working in. The list now follows the conversation itself. Measured against a real store of 1,592 conversations: 46 were sitting higher than they had earned.
+- **Closing a project takes one click.** Clicking an unselected project used to switch into it and force it open, so the first click on an already-open one appeared to do nothing. It also left the chat on one project while the rail claimed another; switching now follows from opening a conversation, which is what made that state coherent in the first place.
+- **The conversation list stops flickering while a conversation opens.** The row buttons blinked under a stationary cursor, and an open ⋯ menu was closed again on every refresh — so it could not be used at the moment you most wanted it.
+- **The store listing printed "Install" and "Quick start" twice.** It is generated from the project README, and the generator was adding its own copy on top of the one already there.
 
-- **The Copy path / Open in VS Code hover icons now sit on the image.** They were anchored to the chat column's right edge, so on a thumbnail they floated in empty space well to the right of the picture. The media block is now sized to the rendered image, so the icons pin to the image's own top-right corner — for videos too. ([media/chat.css](media/chat.css))
-- **Inline media is capped at 320px wide** (was 640px), so a generation reads as a compact thumbnail in the narrow sidebar instead of dominating the chat. The file is untouched — click an image (or **Open in VS Code**) for full resolution. ([media/chat.css](media/chat.css))
+### Changed
 
-## 1.4.1 — 2026-06-09
+- **Clicking a conversation highlights it immediately** instead of waiting for it to load, so a click never looks dropped. The few actions that act on "whichever conversation is open" — continue in a new chat, and worktree apply/remove — grey out for that moment, because until the load finishes there is genuinely no safe answer to which conversation they would act on.
+- **One waiting animation everywhere.** The status line's growing ellipsis is gone; everything that is working now shows the same three blinking dots, and they hold still if your system asks for reduced motion.
 
-> A two-part fix for generated images that stopped rendering in 1.4.0.
+## 3.2.10 — 2026-08-09
 
-### Fixes
+### Fixed
 
-- **Generated images are visible again.** 1.4.0 capped inline media at 640px by wrapping it in a `width: fit-content` container. That made the `<img>`'s `max-width: 100%` resolve against an *indefinite* width, which collapses a replaced element to zero in Chromium — so every generation (including plain `/imagine`) rendered as an invisible, zero-width image. The container is now a normal block (definite width), so the percentage resolves correctly while the **640px cap stays**. ([media/chat.css](media/chat.css))
-- **Reference-edited images (`image_edit`) now render too.** Editing a real photo with `/imagine` runs Grok's **`image_edit`** tool (title `imagine-edit: …`, variant `ImageEdit`) — a surface 1.4.0's detector didn't know about, so the saved file was never inlined. Confirmed live against grok 0.2.x: the completed result reports the path as the same machine-readable JSON `{path}` the other media tools use (an extended-length `\\?\C:\…` Windows path, stripped to canonical form). `isMediaGenToolCall` now recognizes it. ([src/acp-dispatch.ts](src/acp-dispatch.ts))
+- **Generated videos play, and 3.2.9 was wrong about why they didn't.** That release said the browser engine ran out of video decoders and stopped reserving one per clip. It wasn't the decoders, and it didn't work. The real cause: Grok Build Desktop served every file whole, ignoring the "send me this part of it" requests a video player makes as it plays. Playback would start, run about a second, and die. The app answers those requests properly now. Measured against the clips that failed: 4 failures in 45 attempts before, none in 45 after. *This is Desktop only — in VS Code the editor serves the file itself, and that path is not ours to fix.*
+- **A video shows its first frame again, instead of an empty box that jumps.** The preview 3.2.9 traded away comes back now the byte-range problem is actually fixed, and the clip is the right shape before you press play rather than snapping to it afterwards.
+- **The chat scrollbar sits against the edge of the pane.** At a small chat font on a wide window it floated well inland — the further in, the smaller the font. The text column is still a comfortable reading width; it just no longer drags the scrollbar with it. Desktop only.
+- **Clicking a conversation moves the file panel to its project.** Clicking a *project* always did, and so did starting a new conversation, which is what made it look arbitrary. Desktop only.
+- **Links to a plan open the plan.** Plans are written outside your project, so clicking one did nothing at all — no window, no error.
 
-## 1.4.0 — 2026-06-08
+### Changed
 
-> Two new CLI surfaces — generated image/video rendering and a Sign-Out action. The media wire format was confirmed live against grok 0.2.33 (see [research/image-generation.md](research/image-generation.md)). Available on the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=PawelHuryn.grok-vscode-phuryn).
+- **A generated image or video now offers "Show in folder" in Grok Build Desktop.** Opening the file gave you nothing you couldn't already see: clips play in the chat, and pictures enlarge in place. Finding the file is the useful thing. In VS Code the button still opens an editor tab, which is what an editor is for.
+- **The composer drops the words beside its two icons when it is narrow.** "Agent mode" and the token count give way to the icon and the ring; the tooltips carry what the labels stopped saying, including which mode is active.
+- **Recent lists ten conversations, not twenty**, and the file panel's title and tabs line up with the rows beneath them.
 
-### Fixes
+## 3.2.9 — 2026-08-08
 
-- **Every message you send no longer renders twice (grok 0.2.33 regression).** grok **≥0.2.33 echoes the live prompt back** as a `user_message_chunk` mid-turn — 0.2.3 did not (the code's own comment read "the agent never echoes them back"). The webview already renders the bubble optimistically from `send()`, so the echo produced a **second, duplicate bubble** (and double-counted `userMessageCount`, skewing plan positioning). The host now forwards `user_message_chunk` **only during a session/load replay** (a new `replaying` flag), and the webview's `appendUserChunk` guards the same — so a live echo can never double the bubble. ([src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
+### Fixed
 
-### Image & video generation
+- **Links to generated images open.** When Grok makes a picture it usually links to it in its reply as well, and it writes that link relative to the conversation rather than to your project — so clicking it went looking in your repository for a file that was never there. Grok Build Desktop answered *"File not found … It is not under the open project"*; VS Code simply opened nothing. Those links now find the picture that was actually generated. The image in the transcript was always right; it was only the link beneath it that missed.
+- **The open-file button on a generated image works in Grok Build Desktop.** Generated pictures live in Grok's own conversation folder, which sits outside your project, so the button was refused every time it was pressed. It is now allowed for that one kind of file — a picture or video Grok generated for one of this project's conversations — and for nothing else. Everything the app opens on your behalf is still held to the same containment checks as before.
+- **Generated videos play after the first few.** Every video in a conversation reserved a decoder the moment it appeared, whether or not anyone watched it, and enough of them in one chat exhausted the browser engine's pool — after which pressing play on some clips did nothing, and which clips varied. A video now reserves nothing until you press play. The trade is that a clip shows an empty frame rather than a preview until it starts.
+- **A clearer answer when video generation is blocked by your account settings.** xAI refuses video generation on accounts with zero data retention, and says so by naming an API field you cannot supply. Grok Build now adds where the setting actually lives: the Grok CLI's `/settings` → Privacy → Coding data, retention, and training.
 
-- **Generated images and videos render inline.** When Grok generates an image (the subscription-only `/imagine`) or a video (`/imagine-video`), it now shows up as an actual image or a playable `<video>` in the chat instead of a dead tool chip. The real wire format (confirmed live, [research/image-generation.md](research/image-generation.md)) is **not** an ACP image block — Grok's **`image_gen`** / **`image_to_video`** tools write the file into the session directory (`images/*.jpg`, `videos/*.mp4`) and report the path as a JSON string inside the completed tool result's text. The host recognizes the media-gen call, parses the path out and classifies image-vs-video by extension (`isMediaGenToolCall`/`extractGeneratedMediaPaths`), reads the file and inlines it as a `data:` URI (webviews can't load arbitrary disk paths under the CSP — `media-src data:` was added for video), and the webview renders it. Hovering an image or video reveals two top-right icons (styled like the code-block copy button): **Copy path** and **Open in VS Code** — the latter is the only way to open a *video's* file, since its click drives playback controls (clicking an image still opens its source too). Inline media is capped at **640px** on the longer edge so full-resolution generations stay legible in the chat (the file is untouched). ACP-standard image/`resource_link` blocks are also handled as a forward-compatible fallback. Both render identically on **session resume** (Grok replays the generation as a single collapsed `tool_call`). ([src/acp-dispatch.ts](src/acp-dispatch.ts), [src/acp.ts](src/acp.ts), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js), [media/chat.css](media/chat.css))
+### Changed
 
-### Account
+- **Clicking a generated image enlarges it where there is no editor to open it in.** In Grok Build Desktop and in the browser client the picture now opens full-size in place. Previously the browser left it inert, and Desktop handed the file to whichever program your system uses for images — leaving the app to show you something already on screen. In VS Code the click still opens an editor tab, which is what an editor is for.
 
-- **Sign out from the extension (#13).** New `Grok: Log Out` command (palette) and a **Sign out** item in the gear menu run `grok logout` to clear the CLI's cached credentials, tear down the live session, and drop back to the auth-required onboarding screen — no more switching to a terminal to change xAI accounts. ([src/sidebar.ts](src/sidebar.ts), [src/extension.ts](src/extension.ts), [package.json](package.json), [media/chat.js](media/chat.js))
+## 3.2.8 — 2026-08-08
 
-### Keeping the CLI current
+### Fixed
 
-- **The Grok Build CLI is updated silently when the extension upgrades.** Grok doesn't auto-update, so a user who installs a new extension version could be left on an older CLI whose wire format the new extension no longer matches. Now, the first time a session starts after the extension's own version changes, the host runs `grok update` once before spawning the CLI — so the next handshake reports the freshly-updated version. It fires **only on an actual upgrade**, never on a fresh install (the "not-first-run" rule — a clean install just records its baseline version), at most once per activation, via `execFile` while no grok process is alive (sidesteps the Windows binary lock), and is best-effort (a failed update logs and continues on the current binary). The gate is the pure, unit-tested `extensionWasUpgraded`. ([src/cli-locator.ts](src/cli-locator.ts), [src/sidebar.ts](src/sidebar.ts), [media/chat.js](media/chat.js))
-- **The welcome status line tracks real readiness.** It now follows the true session-start lifecycle — `Updating Grok Build CLI…` (during a silent update) → `Starting…` (through the hidden primer turn, while the composer spinner is up) → `Connected · v<version>`. Previously it flipped to "connected" at the ACP handshake, *before* the primer had been sent and processed, so it claimed readiness while grok was still being primed; it now stays "Starting…" until the spinner actually clears. ([media/chat.js](media/chat.js))
+- **The chat opens in Cursor.** Cursor reserves the secondary side bar for its own agent UI and refuses to place an extension there, so the panel Grok Build asks for was never created — the view was dropped into Explorer and every way of opening it answered "command not found". It now opens the view wherever the editor actually put it.
+- **A fresh install lands somewhere you can see it.** On the very first run — and only then — a chat the editor has stashed somewhere unusable is moved into its own view. It has to happen without you opening anything, because someone whose chat is buried in an Explorer section has no way to open it. After that first run the placement is yours and nothing touches it again: there is no way for an extension to ask where its own view sits, so we cannot tell someone who deliberately moved it from someone who never did, and guessing would mean dragging your layout back after every update.
 
-### Gear menu & status polish
+### Changed
 
-- **The gear menu gets an "Other" group with About, Config & debug, and Log out.** The flat Config / Account / Debug sections collapse into two sub-views (mirroring the Model picker): **About** shows the *This extension* + *Grok Build CLI* versions, checks for a newer CLI (`grok update --check`), and offers an **Update Grok Build CLI** action; **Config & debug** holds the config links + extension logs. The on-demand update tears the session down, runs `grok update`, then **resumes the same session** on the fresh binary (preserving the conversation), showing the `Updating… → Starting… → Connected · v<new>` lifecycle. ([media/chat.js](media/chat.js), [media/chat.css](media/chat.css), [src/sidebar.ts](src/sidebar.ts))
-- **About shows the real CLI version, even on builds the handshake doesn't tag.** The native-Windows build doesn't report a version in the ACP `initialize` response, so About used to read a bare "—" right next to a confident "CLI is up to date". It now adopts the version the update check returns (`grok update --check`'s `currentVersion`), and the action collapses to a grayed "CLI is up to date" (no button) when there's nothing to do. ([media/chat.js](media/chat.js))
-- **The Config & debug → MCP servers link works on Windows.** It used to type a quoted `"C:\…\grok.exe" mcp list` into the terminal, which PowerShell (the default Windows shell) parses as a string literal and rejects with "Unexpected token". It now launches grok directly as the terminal's own process (`shellPath`/`shellArgs` → `grok mcp list`), sidestepping shell quoting entirely. ([src/sidebar.ts](src/sidebar.ts))
-- **Transient status text animates and is capitalized.** "Starting", "Updating Grok Build CLI", "Thinking", and "Summarizing" now show an animated trailing ellipsis (a CSS `::after` so the layout doesn't shift), and the welcome line reads "Starting…" / "Connected · v…" (capitalized). ([media/chat.css](media/chat.css), [media/chat.js](media/chat.js))
+- **Move view now appears only where the editor needs it**, as a single **Move view…** that opens the editor's own destination picker; **Grok: Move Chat View** does the same from the command palette. The three fixed destinations are gone. In an editor with a secondary side bar they duplicated a **Move To** it already offers, and in one without, all three led to the same place — because a container is not a location, and an editor is free to draw our containers wherever it likes. Its own picker moves by location, which is how it reaches docks we cannot name.
+- **Move view is hidden in the browser client.** Where the chat sits is a property of the machine running the extension, so those entries could never do anything from a phone.
 
-### Tests
+## 3.2.7 — 2026-08-08
 
-- New grok-free tests for v1.4.0: the `image_gen`/`image_to_video` path-in-JSON result extraction (`isMediaGenToolCall`/`extractGeneratedMediaPaths`, classifying image vs video and covering the collapsed-resume shape) and ACP-standard image fallbacks (`extractImageContent`/`collectToolImages` across inline base64, resource blob, file/remote `resource_link`) plus image-vs-text chunk routing, and happy-dom DOM tests driving the real `media/chat.js` render paths — `addGeneratedMedia` (clickable inline `<img>`, `<video controls>`, remote-link fallback, and the hover **Copy path** / **Open in VS Code** actions for both image and video). Plus the silent-update gate (`extensionWasUpgraded` — fresh-install vs upgrade vs unchanged vs downgrade) and a happy-dom suite pinning the welcome version-line lifecycle (`Updating Grok Build CLI…` → `Starting…` at the handshake → `Connected · v<version>` only when the priming spinner clears, and no reversion on later busy toggles). And the 0.2.33 regression fixes: a fake-CLI scenario that echoes a live `user_message_chunk` + a DOM test asserting a single bubble (no duplicate), and a gear-menu suite (the Other group, the About panel's versions + `grokUpdateStatus`-driven update button incl. the version-from-update-check fallback, the Config & debug links). **401 grok-free tests total.**
+### Changed
+
+- **Grok Build Desktop for macOS is signed and notarised by Apple.** It opens on first double-click — no *unidentified developer* warning, no trip through Privacy & Security, and no *"damaged and can't be opened"* on Apple silicon. Installers on this release are the first signed ones.
+
+### Fixed
+
+- **Voice finds ffmpeg where it is actually installed.** The desktop app only searched the `PATH` it inherits, which on macOS leaves out Homebrew's directory — so `brew install ffmpeg` looked like it had done nothing, and voice kept reporting ffmpeg missing until you pointed a setting at the binary by hand. It now checks the standard install locations too.
+- **A useful answer when ffmpeg is missing.** The error offered only *Open Settings*, which cannot help when the program isn't installed at all — it sent you to a text field to name a file you don't have. It now shows the install command, and on macOS offers to open a terminal with it typed ready to run. Pointing the setting at a folder instead of the program is also named as such, rather than failing as a permissions error.
+
+## 3.2.6 — 2026-08-08
+
+### Fixed
+
+- **The extension loads again.** 3.2.0 through 3.2.5 failed to start: a module the sidebar needs at runtime was left out of the published package, so activation threw before a single command was registered — every `Grok:` command answered "command not found" and the sidebar never appeared. Update from any 3.2.x; the downgrade to 3.1.0 is no longer needed. Grok Build Desktop was never affected. Found and diagnosed in #101.
+- **Packaging refuses to build a package that cannot load.** Every `require` in the packed code is now resolved against the files actually being shipped, so a missing module fails the build instead of reaching a marketplace.
+
+## 3.2.5 — 2026-08-07
+
+### Changed
+
+- **"Update available" opens a page that just gives you the download.** It used to open the GitHub release, which lists ten files — installers for three platforms, their checksums, and the VS Code extension — with nothing saying which one is yours. Now it detects your platform, offers one button, and shows how to get past the first-launch warning.
+
+## 3.2.4 — 2026-08-07
+
+### Added
+
+- **Hide a project from the desktop rail** — in a project's `⋯` menu. It leaves the list; nothing leaves your disk, and **+** adds it back.
+
+### Changed
+
+- **Projects are listed by name**, in the rail and the repository picker. They used to reorder by recent activity, so starting a conversation moved the project you were in to the top and shifted everything under your cursor.
+
+### Fixed
+
+- **A new conversation appears in the rail straight away.** The project moved to the top but gained no row, and only closing and reopening it made the conversation show up.
+- **New session is never disabled.** While the app was switching projects, every **+** in the rail greyed out at once — and on a switch that opens no conversation it stayed that way.
+- **"+" on another project starts the conversation there**, rather than switching and leaving you on whatever was already open.
+
+## 3.2.3 — 2026-08-07
+
+### Fixed
+
+- **Grok Build Desktop opens on macOS.** Earlier builds were refused outright — *"Grok Build Desktop is damaged and can't be opened"* — because the app carried no signature at all, which Apple silicon will not load. It is now ad-hoc signed, so macOS asks whether to open it (*right-click → Open*, or *Privacy & Security → Open Anyway*) instead of telling you to bin it. Still not notarised; a certificate is on the way. If you already downloaded an earlier build, `xattr -dr com.apple.quarantine "/Applications/Grok Build Desktop.app"` recovers it.
+
+## 3.2.2 — 2026-08-07
+
+### Fixed
+
+- **The Marketplace and Open VSX listing shows its screenshot again.** A screenshot removed in 3.2.1 was still referenced by the store page, which renders from its own copy of the README, so the listing showed alt text where the picture should be.
+
+## 3.2.1 — 2026-08-07
+
+### Fixed
+
+- **The projects rail lists other projects' conversations from a phone again.** It said *"Update Grok Build to preview"* against a host that was fully up to date and had already answered — the reply was dropped on the way out because it described a project other than the one that browser tab was working in, which is exactly what the rail asks about.
+- **Grok Build Desktop wears its own icon on Windows.** The Start menu, the taskbar and Task Manager showed Electron's default: the packaging step that stamps the icon and version details onto the app had been switched off. The installer wizard carries the mark now too.
+
+## 3.2.0 — 2026-08-07
+
+### Added
+
+- **Grok Build Desktop (Community) — a standalone app for Windows and macOS.** The same coding agent, without an editor or a terminal in front of it: open a folder and start. Projects on the left, the conversation in the middle, your files on the right. The builds are **not code-signed yet** — Windows SmartScreen and macOS Gatekeeper will warn you the first time. [Download](https://afkpilot.com/desktop).
+- **The desktop file panel edits text files, in tabs.** Several files open at once, each with its own unsaved-changes dot. Markdown opens as a preview with a source toggle, `Ctrl`/`Cmd+S` saves, **Cancel changes** reverts, and closing a tab with unsaved edits asks first. If the agent changed the file underneath you, the save is refused and you choose: reload its version, or keep yours. Silently winning that race in either direction is how people lose work.
+- **The app tells you when a new version exists.** It checks on start and every twelve hours, and shows how to update. It does not install anything behind your back — and it cannot on macOS anyway, since an unsigned app can't be replaced automatically.
+- **Add project folders from the rail.** A `+` on the PROJECTS heading, and the empty rail offers it too.
+- **A project that turns off permission prompts now asks you first.** A repository can ship a `.grok/config.toml` setting `permission_mode = "always-approve"`, and it overrides your own setting — so cloning someone's code was enough to remove every prompt between the agent and your machine. Opening such a project now says so and waits for you. Your own global setting is unaffected and stays silent.
+
+### Changed
+
+- **"Continue in a new chat" moved to the conversation's `⋯` menu**, beside Rename and Delete — the things you do *to* a conversation. The composer's settings keep model and effort, which is what they are for. Worktree apply and remove moved with it.
+- **The file tree and the projects rail can be resized** by dragging their edge, on desktop and in the browser.
+
+### Fixed
+
+- **File icons are visible in dark themes.** Around thirty file types drew almost black on a dark background, so `.dockerignore` and friends were nearly invisible.
+- **Markdown files render properly in the desktop panel** — lists, tables and the rest, using the same renderer the conversation uses, rather than a reduced one that handled only links and headings.
+- **The settings button under the composer opens settings on the first click** when the gear menu is already open, instead of only focusing the composer.
+- **A phone's project drawer is full width again.** It had collapsed to about 150px in AFK Pilot.
+- **Closing a project folder asks first when something is still running.** It ends every conversation in that folder and stops the agent, which discarded a turn in progress with no warning.
+- **`--config-json` applies to one run.** It was merged into your real configuration and left there, so a throwaway setting passed once kept applying on every later launch, with nothing on screen explaining why.
+- **Files in one project can no longer be opened from a conversation in another.** Having both projects open was treated as permission to reach either from either.
+- **Markdown with Windows line endings renders properly.** Headings kept their `#` and bullets kept their `-`, while tables and links worked — so it looked like the renderer was mostly fine when the document's structure was actually gone. Affected chat messages too, not just the file panel.
+- **A file saved after you switch projects goes to the file you opened**, not to a same-named file in the project you switched to.
+- **Selecting a project no longer opens a conversation in it.** It shows you what is there; you choose what to open.
+- **The `⋯` menus close when you click them again.**
+
+## 3.1.0 — 2026-08-06
+
+### Added
+
+- **The panel says which conversation you are in.** The name sits at the top, the same one the history list shows, with the full text in a tooltip when it is too long to fit. Renaming happens there too: hover it and a pencil appears, or tap the name on a phone. Enter or clicking away saves, Escape cancels — no trip through the history list or the `⋯` menu.
+
+### Changed
+
+- **Conversation names, pinned and archived projects now live in `~/.grok/client-state/`** instead of inside VS Code. Nothing changes for you — your existing names, pins and archives move across on first launch and keep working — but they are now readable files rather than editor-private storage, so they can follow you to other Grok clients on the same machine. One visible consequence if you use **multiple VS Code profiles**: those profiles previously kept separate names and pins, and now share one set.
+
+### Fixed
+
+- **A question from Grok always offers a free-text answer** ([#85](https://github.com/phuryn/grok-build-vscode/issues/85)). "Other" only appeared when Grok itself supplied that choice, which it usually doesn't — so there was no way to answer anything the listed options didn't cover.
+- **A long command no longer swallows the chat** ([#71](https://github.com/phuryn/grok-build-vscode/issues/71), [#92](https://github.com/phuryn/grok-build-vscode/issues/92)). The six-line limit counted line breaks rather than the lines you actually see, so a few very long lines filled the bubble regardless — and the permission card showed the whole command with no limit at all. Both are bounded by what is drawn now, with **View all** for the rest, and nothing gained a scrollbar of its own.
+- **"View all" opens a command in its own language** ([#71](https://github.com/phuryn/grok-build-vscode/issues/71)). A Python command was always opened as a shell script; VS Code detects it now.
+- **"Scroll to bottom" stops reappearing while you are already at the bottom** ([#92](https://github.com/phuryn/grok-build-vscode/issues/92)). Tool details growing above the view made the browser adjust the scroll position itself, which read as though you had scrolled away — the more the UI is scaled up, the more often it happened.
+- **An unsent draft no longer gains a copy of itself** every time you leave a conversation and come back. Pulling a message back to the composer with **Edit** was recorded as part of the conversation, so re-opening it did the same thing again — and again.
+- **The project you are working in can be folded** in AFK Pilot's project rail. It was held open so a fold could never hide where you are; now it re-opens only when a conversation actually moves into it, so folding the one you are in sticks.
+- **Rewind no longer states a file count it can't stand behind.** The CLI can report a file it created but left on disk, so the message says what was rolled back and warns that anything created after that point may remain.
+- **The panel wastes less width in VS Code.** The gutter that suits a browser tab is a visible slice of a narrow sidebar, so the desk gets its own — and the conversation's name lines up with the messages under it.
+- **"Scroll to bottom" stops going see-through when you hover it.** It borrowed a colour themes intend as a tint over a toolbar, not as a background of its own, so on many themes the conversation showed through the button.
+- **`Expand tool details` is documented as it behaves.** It has opened tool groups since 1.5.10; the README and the setting description still described the older behaviour.
+
+## 3.0.1 — 2026-08-05
+
+### Fixed
+
+- **History filled up with "Untitled" conversations that would not open.** Sessions you never typed into were being left on disk — one for every window you opened on a project and closed again without asking anything. Nothing removed them, and some the CLI cannot load at all, so clicking one appeared to do nothing. They are cleaned up now, at startup and whenever you start or open a conversation. Anything you renamed, pinned, or actually used is left alone. ([#97](https://github.com/phuryn/grok-build-vscode/issues/97))
+- **A conversation you have not renamed now shows the title Grok gave it** — the same one `grok sessions list` shows — instead of the first 50 characters of whatever you happened to type first. Your own renames still win, and names you have already given are untouched. ([#96](https://github.com/phuryn/grok-build-vscode/issues/96))
+
+## 3.0.0 — 2026-08-05
+
+### Added
+
+- **A projects rail in AFK Pilot.** Every project with Grok history down the left, each showing its newest conversations, with your pinned conversations lifted above them across all projects and a search that filters both. You can start a new session in any project without switching to it first, and rename, delete or clear history from the row itself. On a phone it is a drawer behind the handle in the header.
+- **Archived projects.** Put a project away from its `⋯` menu, and anything untouched for 30 days goes there on its own — into a folded section that stays out of your way. Nothing is lost: an archived project still works, and starting or continuing a conversation in one brings it back. The three most recent projects are never archived automatically, so the list can't empty itself out.
+- **You can delete the conversation you have open**, in VS Code and in AFK Pilot. It closes and a new one starts in the same project.
+
+### Changed
+
+- **AFK Pilot's toolbar moved into the conversation.** The header names the conversation and its project, with Session history and New session beside it; the project controls live in the rail instead. Projects are ordered by their newest conversation rather than by when their folder was last written to, so clearing a project's history no longer moves it to the top.
+
+### Fixed
+
+- **A conversation could be wedged shut by a Stop that never landed.** If the CLI ignored a stop request, the turn never ended, and from then on every message you sent turned into a queued message that could never be sent — only reloading the window cured it. A stop that goes unanswered for ten seconds now restarts the CLI, keeping the conversation, rather than leaving it stuck.
+- **A message sent while Grok was working appeared twice**, once as your bubble and once as the queued block.
+- **Renaming, deleting and clearing history now work in a project you have not switched to**, instead of being refused — and clearing another project's history shows the result there rather than writing a line into whatever conversation you happen to be reading.
 
 ---
 
-Older releases (before 1.4.0): see [docs/CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md).
+## 2.3.1 — 2026-08-02
+
+### Changed
+
+- **Dictation inserts where your cursor is** instead of always appending to the end, and replaces the text you had selected — so you can pause, correct a sentence in the middle, and carry on in place. Authored by [@tarcisiomiranda](https://github.com/tarcisiomiranda) in [#72](https://github.com/phuryn/grok-build-vscode/pull/72), co-authored here; it was ported onto the current voice transport rather than merged, because the branch predated the shared-PCM rewrite.
+- **Clicking Send or Queue now turns the microphone off** and sends exactly the text you can see. A transcript still in flight can no longer refill the composer you just cleared. Saying **"grok send"** still submits hands-free and keeps listening — that flow is unchanged on purpose.
+
+### Fixed
+
+- **Dictation could wipe a draft you had already typed.** The composer position was only remembered when the extension believed voice was configured, but recording is the host's call — so when the two disagreed, the first words transcribed replaced everything in the box.
+
+---
+
+## 2.3.0 — 2026-08-01
+
+### Added
+
+- **You can see what you attached** ([#88](https://github.com/phuryn/grok-build-vscode/issues/88)). Images preview as thumbnails in the composer and in the conversation itself, in VS Code and in AFK Pilot, live and after a restore. Click or tap one to open it full size — on a phone that version is fetched on demand, so it arrives a moment after the preview instead of being carried around with every conversation. Photos work, not just screenshots: JPEG is decoded and downscaled on your own machine.
+- **What a conversation cost.** A running total per conversation, taken from what the CLI reports and shown only when the whole conversation can be accounted for — a partial figure is worse than none.
+- **AFK Pilot can read a shorter, speech-friendly version of each reply** ([#94](https://github.com/phuryn/grok-build-vscode/issues/94)), matching the switch VS Code already had. Each browser keeps its own preference.
+
+### Changed
+
+- **"Summarize before speaking" is now "Read simplified summaries", and defaults on.** The setting key is unchanged. If the summary fails or never arrives, the original reply is spoken rather than nothing.
+- **Switching repository lands somewhere predictable** — that repository's newest conversation, or a new one if it has none — and says "Loading conversation" while it does, with the switcher held until it finishes.
+
+### Fixed
+
+- **Opening an older conversation from history no longer re-types itself** ([#93](https://github.com/phuryn/grok-build-vscode/issues/93)). It arrives in one update, as a reconnect already did.
+- **The scrollbar reaches the bottom with "Expand tool detail" on** ([#92](https://github.com/phuryn/grok-build-vscode/issues/92)), and a clipped command can be revealed by tapping on a touch screen.
+- **A phone no longer bounces between two repositories.** Reconnecting — which happens every time a phone tab goes to the background — re-asserted a repository that disagreed with the conversation it then restored, so the view flipped back and forth.
+- **An attachment can no longer arrive in the wrong conversation.** If a phone reconnected while an image was still being written to disk, that image could land in whichever conversation VS Code happened to be showing.
+- **Reading replies aloud no longer stops after switching conversation** on a phone.
+
+---
+
+## 2.2.0 — 2026-07-31
+
+### Changed
+
+- **Plan mode now uses the CLI's own approve/reject, instead of a workaround.** Older Grok Build CLIs treated *any* answer to a plan card as approval, so the extension shipped a hidden instruction message teaching the model to read your real verdict from a follow-up, and cancelled the planning turn to re-drive the work itself. The CLI fixed that, so all of it is gone. **Approve & implement** now continues straight into the work in the same turn rather than starting a second one, and **Keep planning** leaves Grok planning — sometimes it revises immediately, sometimes it waits for you to say what to change. A comment you attach to a verdict still reaches Grok *before* it starts implementing.
+- **Plan mode needs Grok Build CLI 0.2.117 or newer.** Updating the extension updates the CLI on your next session. If it can't be updated — or its version can't be read — Plan is shown disabled with the reason, while Agent and Auto-accept carry on working. That's deliberate: the verdict handling above isn't safe on an older CLI.
+
+### Fixed
+
+- **A conversation opened on your phone no longer re-types itself.** Mobile browsers discard a backgrounded tab, so coming back to AFK Pilot rebuilt the conversation one message at a time. It now arrives in a single update, showing your recent exchanges. Opening an *older* session from the history list still streams — that one is next.
+- **Grok Build CLI installs that resolve to a `grok.cmd` shim** (common on Windows) failed the version read, which in turn disabled Plan mode.
+- **Conversations recorded by earlier versions still restore cleanly.** They contain the old hidden instruction message; it stays hidden, and plan cards stay where they belong.
+
+---
+
+## 2.1.1 — 2026-07-31
+
+### Added
+
+- **Custom voice keyterms** ([#73](https://github.com/phuryn/grok-build-vscode/issues/73)). `grok.voiceKeyterms` biases dictation toward your own vocabulary — cmdlets, hooks, internal package names — with User and Workspace scope. `grok.voiceLanguage` additionally formats spoken numbers, currencies and units.
+
+### Fixed
+
+- **Plan mode no longer refuses harmless exploration** ([#89](https://github.com/phuryn/grok-build-vscode/issues/89), [#91](https://github.com/phuryn/grok-build-vscode/issues/91)). Inspection commands — `file`, `ls`, `sips -g`, `git log … 2>$null`, read-only PowerShell conditionals — run while planning again, and answering a question card no longer reports "approve the plan first".
+- **Security: plan mode could be bypassed, letting an agent change your workspace before you approved a plan.** Three routes: a parenthesised subexpression behind an allowlisted command (`echo (Set-Content …)`), agent-supplied environment overrides (`NODE_OPTIONS` on the allowlisted `node --version`), and a plan-file exemption that let any mutating command ride along with a plan write. Affects earlier releases — update when convenient.
+- **Resumed conversations showed the time you opened them** ([#87](https://github.com/phuryn/grok-build-vscode/issues/87)) rather than when the messages were written.
+- **A device revoked from the web left VS Code claiming it was still linked**, with no route out of the state. It now unlinks itself and offers to link again.
+- **A prompt queued from a phone could be lost** when the send that consumed it failed — it is now kept and retried once the problem is cleared.
+
+### Changed
+
+- The device commands are now **AFK Pilot: Link this device** and **AFK Pilot: Unlink this device**, matching the product name.
+- "Summarize before speaking" follows "Read replies aloud": switched off and disabled while replies aren't being spoken, so it can't silently bill an API call later.
+
+---
+
+## 2.1.0 — 2026-07-30
+
+### Added
+
+- **Voice input from AFK Pilot.** Dictate on your phone: the audio streams to your machine, which transcribes it with xAI speech-to-text and puts the text in the composer. End with "grok send" to submit hands-free.
+- **Every browser tab is its own conversation, with its own repository.** Open several tabs against one linked machine, pick a different repo in each, and they stay independent across reloads, reconnects and phone tab-discards.
+- **The same conversation can be open in VS Code and the browser at once**, live in both — start at the desk, carry on from the phone, switch back whenever. A tab that arrives with nothing of its own now continues what the desk is showing, instead of opening an empty session.
+- **"Continue remotely" is one tap** from the chat toolbar on a linked machine, and *Add document*/*Add photo* now sit behind a phone-friendly picker.
+- **"Other" answers take free text** ([#85](https://github.com/phuryn/grok-build-vscode/issues/85)), macOS gets Emacs-style `Ctrl+F`/`Ctrl+P` composer navigation ([#84](https://github.com/phuryn/grok-build-vscode/issues/84)), and a still-processing sound cue plus an opt-in "summarize before speaking" join the audio settings ([#78](https://github.com/phuryn/grok-build-vscode/issues/78)).
+
+### Fixed
+
+- **Security: a linked remote device could delete directories outside the session store.** A crafted session id (e.g. `../..`) passed through `deleteSession` without validation, so a remote client could recursively remove paths outside `~/.grok`. Session ids are now validated at the wire boundary *and* again before any filesystem operation. Affects earlier releases with Remote Control linked — update when convenient.
+- **Expanding a Thinking block could land your click on "No, and tell Grok…"** ([#76](https://github.com/phuryn/grok-build-vscode/issues/76)) — the permission card's scroll no longer moves the buttons out from under the pointer.
+- **Messages sent from a phone appear immediately** instead of vanishing until the round trip completes, which on a weak connection made a send look lost.
+- **The gear no longer offers "Sign in (link this device)" before it knows the answer** — an already-linked machine could be invited to re-link itself during startup.
+
+---
+
+## 2.0.10 — 2026-07-27
+
+### Added
+
+- **Read completed replies aloud.** A new toggle (gear → Config & debug) speaks each finished reply via speech synthesis, skipping code blocks — separate on/off state for VS Code and for AFK Pilot.
+
+### Fixed
+
+- **AFK Pilot's text size no longer follows VS Code's own chat zoom.** The two are meant to be fully independent; changing the desktop zoom while a device was linked could silently affect AFK Pilot's own scale too.
+- **Picking a different repository from AFK Pilot could get stuck showing the old one.** A live, not-yet-saved-to-disk session from whichever repository you'd been in could leak into the newly selected repository's history and be mistaken for "already open," so the screen sometimes never switched over.
+
+---
+
+## 2.0.9 — 2026-07-27
+
+### Added
+
+- **Attach documents from AFK Pilot.** The remote **+** picker gains *Add document* next to *Add photo* — `.md`, `.txt`, `.pdf`, `.csv`, `.xlsx`, and `.docx` (up to 20 MiB) attach as an explicit path chip, exactly like a local drag-and-drop, so Grok reads the file with its own tools. Linked devices on an older release simply don't see the option.
+
+### Fixed
+
+- **Security: a linked remote device could reference files outside your workspace via an `@`-mention.** Selecting a mention result resolved the picked path by joining it to the workspace root with no containment check, so a crafted path from a remote client could point outside the workspace and have its contents attached to the next message. Remote mentions are now resolved exclusively against the host's own indexed file catalog — the same list the autocomplete popup offered — never against an arbitrary path. Present since `@`-mention shipped (v1.7.5); if you use Remote Control (AFK Pilot), update when convenient.
+
+---
+
+## 2.0.8 — 2026-07-26
+
+### Fixed
+
+- **Long command output and diffs no longer scroll inside a small box** ([#71](https://github.com/phuryn/grok-build-vscode/issues/71)). A command's captured output and an edit's inline diff now show a short preview that grows **inline** — *View all* / *Show more* — so the page scrolls normally instead of trapping you in a nested scrollbar. On a linked device, where there's no editor to open the full text, both expand in place.
+- **Permission-card keyboard polish** ([#68](https://github.com/phuryn/grok-build-vscode/issues/68)): the option with keyboard focus now shows a clear outline, and answering a card returns focus to the composer.
+
+---
+
+## 2.0.7 — 2026-07-26
+
+### Fixed
+
+- **Switching repository from your phone no longer changes what VS Code shows.** The choice is shared across your remote devices on purpose — that's the point of it — but VS Code has no repository picker, so it now stays on the workspace you have open: its history list keeps showing that project's sessions, and *New session* starts there. Previously a phone switching projects silently re-scoped the list and pointed *New session* at a different checkout.
+
+---
+
+## 2.0.6 — 2026-07-26
+
+### Fixed
+
+- **Worktree sessions are back in their repository's history** ([2.0.5](#205--2026-07-26) regression). They were matched to their parent by comparing the repository's *git root* against the folder open in VS Code — the same path in the usual case, but not when you open a *subdirectory* of a repository, and then those sessions vanished from the list. The parent repository now lists every worktree session again, as it did before 2.0.5.
+- **A worktree opened directly as your workspace is now a repository in its own right.** It was excluded from the picker as "not a repository you choose between", which left *Clear all history* pointing at an entry that wasn't in the list — so it silently did nothing after you confirmed it.
+
+---
+
+## 2.0.5 — 2026-07-26
+
+### Added
+
+- **Switch repositories from a linked AFK Pilot device.** The chat header on the web client gains a repo chip listing every project Grok has sessions for — pick one to browse its history, pin the ones you reach for, then *New session* to start Grok there. A project's worktrees come with it instead of appearing as separate entries. The chip is remote-only: in VS Code the window already *is* the repository.
+
+### Fixed
+
+- **Re-linking a machine no longer costs you a device slot.** Linking was tracked per link rather than per machine, so re-pairing after a reinstall or a failed connection added a *second* device and could push you past your device limit — for hardware you already had. A re-link now supersedes that machine's previous entry.
+
+---
+
+## 2.0.4 — 2026-07-26
+
+### Fixed
+
+- **The native diff editor shows the whole file**, opened on the first changed line, instead of a context-free preview of only the replaced lines ([#66](https://github.com/phuryn/grok-build-vscode/issues/66)). Grok never sends the file itself, so both sides are reconstructed from the copy on disk plus its per-site line metadata — anchored per site, so a repeated token can't become a phantom change. An unreadable, oversized, or since-modified file falls back to the previous region-only diff. Thanks to [@padixa](https://github.com/padixa) for the report and the follow-up that scoped it.
+
+---
+
+## 2.0.3 — 2026-07-26
+
+### Added
+
+- **Edit a sent message** — hover your latest message → *Edit*. It removes that turn (restoring any files it changed) and puts the text back in the composer so you can fix it and send again. The exact complement of Rewind, which is offered on every earlier message. ([#56](https://github.com/phuryn/grok-build-vscode/issues/56))
+- **Rewind now returns the message's text to the composer** too — it always deleted that message, so it no longer discards what you wrote.
+- **Keyboard on permission cards** ([#68](https://github.com/phuryn/grok-build-vscode/issues/68)): *Allow once* is ordered first and takes focus when the composer is idle, so Enter approves. Arrows move between options, Escape returns to the composer without answering, and typing any character jumps to the composer instead of pressing a button. A keystroke never selects *Allow always*.
+
+### Fixed
+
+- **Turning off the active-file context chip is now remembered** ([#67](https://github.com/phuryn/grok-build-vscode/issues/67)). The chip is rebuilt whenever you switch files, which silently re-enabled it — so dismissing it was futile. The eye-off choice now persists across file switches and restarts.
+- **Rewind discarded one turn too many.** Grok's rewind removes the message it targets, not just what follows; the confirmation said the opposite. Both the wording and the targeting are corrected, so Rewind and Edit now remove exactly the turns they name.
+- **Rewind left stale plan and permission cards behind.** Those cards are stored by the extension, not by Grok, so rewinding the conversation stranded the ones belonging to deleted turns — they reappeared at the bottom of the restored chat. Both actions now drop them.
+- **Plan snapshot files no longer pile up.** Reopening a session re-wrote a fresh copy of every saved plan, so one session accumulated 13 identical files. Snapshots are now named by their content and reused, and a session's snapshots are deleted with the session.
+- **Rewinding now refunds the discarded turns' tokens.** The session billing total counted turns that no longer exist. Usage is recorded per turn, so the total is recomputed from what survives. (Sessions from before this change keep their existing total — there's nothing stored to subtract.)
+- **Rewind and Edit no longer reload the conversation.** They deleted the whole chat, showed the welcome screen and re-rendered every message; now only the removed turns disappear.
+- **Confirmations for Rewind/Edit are now in-chat**, like every other destructive confirm — no native VS Code modal.
+- **No confirmation dialog unless code will be reverted.** A conversation-only rewind or edit just happens — the message goes straight back to the composer. Turns that changed files on disk still ask, since that part cannot be undone.
+- **Steered messages no longer break Rewind and Edit.** A message sent mid-turn isn't a separate prompt and has no restore point; counting it shifted every later message by one, so Rewind targeted the wrong turn (reverting the wrong files) and Edit failed. Steered messages are now excluded and offer neither action.
+
+### Changed
+
+- Gear → Remote Control: *Your AFK Pilot account* → *Your account*.
+
+---
+
+## 2.0.2 — 2026-07-25
+
+### Fixed
+
+- **Files missing from the composer's `@` autocomplete** in large workspaces ([#69](https://github.com/phuryn/grok-build-vscode/issues/69)). The file index was capped at 5000 entries, and past that cap VS Code returns an arbitrary subset — so real source files could be absent while less relevant ones still showed. Any file open as a tab is now always mentionable, and the new `grok.mentionIndexLimit` setting raises the cap for big repos. Thanks to [@datvm](https://github.com/datvm) for the diagnosis and the fix ([#70](https://github.com/phuryn/grok-build-vscode/pull/70)).
+
+---
+
+## 2.0.1 — 2026-07-25
+
+### Added
+
+- **Keep this machine awake while an [AFK Pilot](https://afkpilot.com) device is linked**, so a turn you started from your phone isn't cut off by idle sleep — `caffeinate` on macOS, `SetThreadExecutionState` on Windows, `systemd-inhibit` on Linux. Only system sleep is blocked (the display still sleeps), the lock is released the moment you sign out, and it never survives closing VS Code. Turn it off with `grok.remote.keepAwake`. A closed laptop lid still suspends on every OS.
+
+---
+
+## 2.0.0 — 2026-07-25
+
+The extension pairs with **[AFK Pilot](https://afkpilot.com)** — a companion web client that brings your Grok sessions to your phone or any browser — and moves to a Fair Source license.
+
+### Added
+
+- **Remote control via [AFK Pilot](https://afkpilot.com)** — gear → *Remote Control* → **Sign in (link this device)** pairs this machine with the AFK Pilot web client: follow running turns, approve permissions, answer questions, and send or steer messages from a phone or any browser while away from your desk. The extension dials out to the service (no inbound port); **Sign out** unlinks the device here and revokes it on your account. The experimental `grok.remoteControl.relayUrl` setting is gone — pairing is one click now.
+- **Touch-ready chat UI** — real tap targets on touch screens, always-visible actions on history rows / images / equations / diagrams (previously hover-only), roomier question and permission cards, and in-browser PNG download for generated images, math, and Mermaid diagrams. A resize (e.g. the mobile keyboard collapsing) no longer yanks the chat to the bottom.
+- ` ```math ` / ` ```latex ` / ` ```tex ` code fences render as display equations, like ` ```mermaid ` already did for diagrams.
+
+### Changed
+
+- **License: MIT → FSL-1.1-MIT (Fair Source).** Free to use, modify, and redistribute for any purpose except a competing commercial product or service; each release automatically becomes plain **MIT two years after publication**. Versions up to and including 1.8.1 were published under MIT and remain MIT. ([LICENSE](LICENSE))
+- **Destructive confirmations are now in-chat dialogs** (delete session, clear all history, apply/remove worktree, remote sign-out) instead of native VS Code modals, so they behave identically in the sidebar and the AFK Pilot browser client.
+- Card titles render in the UI font instead of the editor's monospace.
+
+---
+
+Older releases (before 2.0.0): see [docs/CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md).

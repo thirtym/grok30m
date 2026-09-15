@@ -16,6 +16,16 @@ import {
   decideExtensionUpdate,
   shouldCheckForUpdate,
 } from "./self-update";
+import {
+  COMMUNITY_BASE_VERSION,
+  COMMUNITY_NOTICE_STATE_KEY,
+  COMMUNITY_RELEASES_LATEST,
+  COMMUNITY_RELEASES_PAGE,
+  communityLagStatusText,
+  communityPeekStatusText,
+  decideCommunityLag,
+  shouldNoticeCommunityLag,
+} from "./community-sync";
 import { httpsDownloadFile, httpsGetJson } from "./http-get";
 
 export interface HostUpdateOptions {
@@ -67,6 +77,50 @@ async function fetchLatest(version: string): Promise<GithubRelease> {
   return httpsGetJson<GithubRelease>(GROK30M_RELEASES_LATEST, userAgent(version));
 }
 
+async function fetchCommunityLatest(version: string): Promise<GithubRelease> {
+  return httpsGetJson<GithubRelease>(COMMUNITY_RELEASES_LATEST, userAgent(version));
+}
+
+async function maybeNoticeCommunityLag(
+  context: vscode.ExtensionContext,
+  peek: Awaited<ReturnType<typeof peekCommunityLag>>,
+  opts: HostUpdateOptions,
+): Promise<void> {
+  if (!peek.behind || !peek.latest) return;
+  const noticed = context.globalState.get<string>(COMMUNITY_NOTICE_STATE_KEY);
+  if (!opts.notifyIfCurrent && !shouldNoticeCommunityLag(noticed, peek.latest)) return;
+  await context.globalState.update(COMMUNITY_NOTICE_STATE_KEY, peek.latest);
+  const pick = await vscode.window.showInformationMessage(
+    communityPeekStatusText(peek),
+    "Open community release",
+  );
+  if (pick === "Open community release") {
+    await vscode.env.openExternal(vscode.Uri.parse(COMMUNITY_RELEASES_PAGE));
+  }
+}
+
+function withCommunityLine(grokLine: string, peek: Awaited<ReturnType<typeof peekCommunityLag>>): string {
+  return `${grokLine} ${communityPeekStatusText(peek)}`.trim();
+}
+
+async function notifyCheckResult(
+  context: vscode.ExtensionContext,
+  text: string,
+  peek: Awaited<ReturnType<typeof peekCommunityLag>>,
+  warning = false,
+): Promise<void> {
+  if (peek.behind && peek.latest) {
+    await context.globalState.update(COMMUNITY_NOTICE_STATE_KEY, peek.latest);
+  }
+  const actions = peek.behind ? (["Open community release"] as const) : [];
+  const pick = warning
+    ? await vscode.window.showWarningMessage(text, ...actions)
+    : await vscode.window.showInformationMessage(text, ...actions);
+  if (pick === "Open community release") {
+    await vscode.env.openExternal(vscode.Uri.parse(COMMUNITY_RELEASES_PAGE));
+  }
+}
+
 async function installVsix(filePath: string): Promise<void> {
   try {
     await vscode.commands.executeCommand(
@@ -106,13 +160,26 @@ export async function runHostMaintenance(
     const currentVersion = String((context.extension.packageJSON as { version?: string }).version ?? "");
     const cfg = vscode.workspace.getConfiguration("grok");
     const autoUpdate = cfg.get<boolean>("autoUpdate", true);
-    if (!autoUpdate && !opts.forceCheck) return;
 
     const lastCheck = context.globalState.get<number>(LAST_CHECK_STATE_KEY);
     const now = Date.now();
-    if (!opts.forceCheck && !shouldCheckForUpdate(lastCheck, now)) return;
-
-    await context.globalState.update(LAST_CHECK_STATE_KEY, now);
+    const due = opts.forceCheck || shouldCheckForUpdate(lastCheck, now);
+    const community = due
+      ? await peekCommunityLag(currentVersion)
+      : { base: COMMUNITY_BASE_VERSION, behind: false, status: "" };
+    if (due) {
+      await context.globalState.update(LAST_CHECK_STATE_KEY, now);
+      output.appendLine(
+        community.error
+          ? `Community lag check failed: ${community.error}`
+          : `Community lag check: ${community.behind ? "behind" : "current"} (merged ${community.base}${community.latest ? `, latest ${community.latest}` : ""})`,
+      );
+      if (!opts.notifyIfCurrent) {
+        await maybeNoticeCommunityLag(context, community, opts);
+      }
+    }
+    if (!autoUpdate && !opts.forceCheck) return;
+    if (!due) return;
 
     let release: GithubRelease;
     try {
@@ -121,7 +188,12 @@ export async function runHostMaintenance(
       const msg = (e as Error).message;
       output.appendLine(`Grok30m update check failed: ${msg}`);
       if (opts.notifyIfCurrent) {
-        void vscode.window.showWarningMessage(`Couldn't check Grok30m updates: ${msg}`);
+        await notifyCheckResult(
+          context,
+          withCommunityLine(`Couldn't check Grok30m updates: ${msg}`, community),
+          community,
+          true,
+        );
       }
       return;
     }
@@ -131,16 +203,20 @@ export async function runHostMaintenance(
 
     if (decision.action === "current") {
       if (opts.notifyIfCurrent) {
-        void vscode.window.showInformationMessage(
-          `Grok30m ${currentVersion} is current on ${whereAmI()}.`,
+        await notifyCheckResult(
+          context,
+          withCommunityLine(`Grok30m ${currentVersion} is current on ${whereAmI()}.`, community),
+          community,
         );
       }
       return;
     }
     if (decision.action !== "update") {
       if (opts.notifyIfCurrent) {
-        void vscode.window.showInformationMessage(
-          `Grok30m ${currentVersion} — no newer GitHub release to install.`,
+        await notifyCheckResult(
+          context,
+          withCommunityLine(`Grok30m ${currentVersion} — no newer GitHub release to install.`, community),
+          community,
         );
       }
       return;
@@ -192,6 +268,29 @@ export async function peekExtensionUpdate(
     return { latest: "latest" in decision ? decision.latest : undefined, updateAvailable: false };
   } catch (e) {
     return { updateAvailable: false, error: (e as Error).message };
+  }
+}
+
+/** Status for About — community release vs the tag this fork last merged. */
+export async function peekCommunityLag(
+  version: string,
+): Promise<{ base: string; latest?: string; behind: boolean; status: string; error?: string }> {
+  try {
+    const release = await fetchCommunityLatest(version);
+    const decision = decideCommunityLag(COMMUNITY_BASE_VERSION, release);
+    return {
+      base: COMMUNITY_BASE_VERSION,
+      latest: "latest" in decision ? decision.latest : undefined,
+      behind: decision.action === "behind",
+      status: communityLagStatusText(decision),
+    };
+  } catch (e) {
+    return {
+      base: COMMUNITY_BASE_VERSION,
+      behind: false,
+      status: "Could not reach community releases.",
+      error: (e as Error).message,
+    };
   }
 }
 

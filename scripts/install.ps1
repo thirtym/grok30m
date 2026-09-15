@@ -1,61 +1,246 @@
-# Build this clone and install it into every Cursor/VS Code CLI on this host.
-# For "just give me the current release" use bootstrap.ps1 instead.
+# Install the Grok VS Code extension on Windows.
+# Usage:  pwsh scripts\install.ps1 [-VsixPath path\to.vsix] [-Cli name-or-path] [-All] [-Prod]
+#   -Cli  - a code-compatible CLI to install into (e.g. code-insiders, cursor,
+#           antigravity, C:\path\to\code.cmd); also settable via $env:CODE_CLI.
+#           Default: auto-detect code -> code-insiders -> cursor -> antigravity-ide -> antigravity.
+#   -All  - install into EVERY detected known CLI in one run (build once, install N times).
+#   -Prod - build against the PRODUCTION relay instead of the staging one.
+#
+# Always builds a FRESH .vsix from the current source (npm run package clears the
+# stale one first) unless an explicit -VsixPath is given - so an install never
+# silently ships a leftover build. Uses --force so a same-version reinstall overwrites.
+#
+# RELAY: this script exists only to put a build on THIS machine for testing, so
+# it builds against the STAGING relay by default. A published extension always
+# runs in production mode, which is why the GROK_RELAY_URL override that serves
+# the desktop app cannot help here - the constant in src\remote-frames.ts has to
+# be swapped for the build and swapped back afterwards.
+#
+# The swap-back is in a finally block, and the script verifies the file is byte
+# identical afterwards. Forgetting to restore it by hand is how a staging URL
+# reached the PUBLIC repo once already; that is the whole reason this is
+# automated rather than written down. The staging URL itself is NOT in this
+# file - it comes from the gitignored .env, because this repository is public.
+#
+# `npm run package` now refuses a non-production REMOTE_RELAY_URL. This script
+# sets GROK_ALLOW_STAGING_RELAY_VSIX to the required phrase for that one
+# build only — a flag or a leftover `=1` will not pass.
+
 param(
-    [string]$VsixPath
+    [string]$VsixPath,
+    [string]$Cli,
+    [switch]$All,
+    [switch]$Prod
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$Id = "grok30m.grok30m"
-$Conflicts = @("PawelHuryn.grok-vscode-phuryn", "paul-local.grok-tabs")
+$knownClis = @("code", "code-insiders", "cursor", "antigravity-ide", "antigravity")
+if (-not $Cli -and $env:CODE_CLI) { $Cli = $env:CODE_CLI }
+if ($All -and $Cli) { throw "-All and -Cli are mutually exclusive." }
 
-function Find-EditorClis {
-    $found = New-Object System.Collections.Generic.List[string]
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
-    function Add-Cli([string]$path) {
-        if (-not $path) { return }
-        if (-not (Test-Path $path)) { return }
-        if ($seen.Add($path)) { [void]$found.Add($path) }
-    }
-    foreach ($name in @("cursor", "cursor-insiders", "code", "code-insiders")) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) { Add-Cli $cmd.Source }
-    }
-    $la = $env:LOCALAPPDATA
-    Add-Cli "$la\Programs\cursor\resources\app\bin\cursor.cmd"
-    Add-Cli "$la\Programs\Cursor\resources\app\bin\cursor.cmd"
-    Add-Cli "$la\Programs\Microsoft VS Code\bin\code.cmd"
-    Add-Cli "$la\Programs\Microsoft VS Code Insiders\bin\code-insiders.cmd"
-    Get-ChildItem -Path "$env:USERPROFILE\.cursor-server\bin" -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Add-Cli (Join-Path $_.FullName "bin\remote-cli\cursor.cmd") }
-    Get-ChildItem -Path "$env:USERPROFILE\.vscode-server\bin" -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Add-Cli (Join-Path $_.FullName "bin\remote-cli\code.cmd") }
-    return $found
+$framesPath = Join-Path $repoRoot "src\remote-frames.ts"
+$prodRelayLine = 'export const REMOTE_RELAY_URL = PRODUCTION_RELAY_URL;'
+# Must match scripts/check-production-relay.mjs. A tripwire in
+# test/check-production-relay.test.ts fails if either side drifts.
+$allowStagingRelayEnv = "GROK_ALLOW_STAGING_RELAY_VSIX"
+$allowStagingRelayValue = "I_UNDERSTAND_THIS_VSIX_MUST_NOT_BE_RELEASED"
+
+function Get-DevRelayUrl {
+    $envFile = Join-Path $repoRoot ".env"
+    if (-not (Test-Path $envFile)) { return $null }
+    $line = Get-Content $envFile | Where-Object { $_ -match '^\s*GROK_RELAY_URL\s*=' } | Select-Object -First 1
+    if (-not $line) { return $null }
+    $value = ($line -replace '^\s*GROK_RELAY_URL\s*=\s*', '').Trim().Trim('"').Trim("'")
+    # Same rule as resolveRelayUrl in src\remote-frames.ts: ws(s), an authority,
+    # an optional base path (a relay may live behind a prefix), and no query,
+    # fragment or credentials. These two must agree, or desktop-dev would accept
+    # a URL that a staging .vsix build silently refuses.
+    if ($value -notmatch '^wss?://[^/@\s?#]+(/[^\s?#]*)?$') { return $null }
+    return ($value -replace '/+$', '')
 }
 
+function Read-TextFile([string]$path) { return [System.IO.File]::ReadAllText($path) }
+function Write-TextFile([string]$path, [string]$text) {
+    # UTF-8 with NO BOM, so a swap-and-restore leaves the file byte identical.
+    [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding $false))
+}
+
+$swappedRelayLine = $null
+$devUrl = $null
+$relayLabel = "production"
+
 if (-not $VsixPath) {
+    if ((-not $Prod) -and (-not (Test-Path (Join-Path $repoRoot '.env')))) {
+        # No .env at all: an ordinary contributor following docs/INSTALL.md.
+        # Build against production rather than refusing the documented command.
+        Write-Host "No .env at the repo root - building against PRODUCTION."
+        Write-Host "Maintainers testing against staging: add GROK_RELAY_URL=wss://... to .env"
+        $Prod = $true
+    }
+
+    if (-not $Prod) {
+        $devUrl = Get-DevRelayUrl
+        if (-not $devUrl) {
+            throw @"
+.env exists but carries no usable staging relay.
+Fix the line, or build against production explicitly:
+    GROK_RELAY_URL=wss://your-staging-relay.example
+    pwsh scripts\install.ps1 -Prod
+"@
+        }
+        $current = Read-TextFile $framesPath
+        if (-not $current.Contains($prodRelayLine)) {
+            throw "src\remote-frames.ts does not contain the expected production relay line - refusing to swap. Restore it first."
+        }
+        # ONE LINE swapped, and one line swapped back - never a whole-file
+        # snapshot restored over the top. A snapshot would silently discard
+        # anything else edited during the build (an agent, an open editor), and
+        # the restore would look like it succeeded because it only ever proves
+        # it rewrote its own copy.
+        $devRelayLine = "export const REMOTE_RELAY_URL = `"$devUrl`";"
+        Write-TextFile $framesPath $current.Replace($prodRelayLine, $devRelayLine)
+        $swappedRelayLine = $devRelayLine
+        $relayLabel = $devUrl
+    }
+
+    Write-Host ""
+    Write-Host "  Relay for this build: $relayLabel" -ForegroundColor Cyan
+    Write-Host ""
     Write-Host "Building a fresh .vsix from current source..."
     Push-Location $repoRoot
+    $previousAllowStaging = [Environment]::GetEnvironmentVariable($allowStagingRelayEnv)
+    $beforeVsix = @()
     try {
-        if (-not (Test-Path "node_modules")) { npm install }
-        npm run package
-        $vsix = Get-ChildItem -Path $repoRoot -Filter "grok30m-*.vsix" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    } finally { Pop-Location }
-    if (-not $vsix) { throw "Build did not produce a grok30m-*.vsix." }
+        # npm writes to stderr for things that are not failures - and on the dev
+        # path it ALWAYS does, because `npm run package` warns that it is
+        # packaging a non-production relay, which is the whole point of this
+        # script. Under $ErrorActionPreference = "Stop", Windows PowerShell 5.1
+        # turns any native-command stderr into a terminating error, so the build
+        # aborted on its own success message. (pwsh 7 does not, which is why the
+        # documented `pwsh scripts\install.ps1` invocation never hit it.)
+        #
+        # PS 5.1 also leaves $LASTEXITCODE unchanged when command *resolution*
+        # fails. If npm is missing, both exit-code checks would pass and the
+        # leftover *.vsix would be installed under a "fresh build" banner.
+        if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+            throw "npm is not on PATH. Install Node.js, then re-run."
+        }
+        $beforeVsix = @(Get-ChildItem -Path $repoRoot -Filter "*.vsix" -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{ Path = $_.FullName; Ticks = $_.LastWriteTimeUtc.Ticks; Length = $_.Length }
+        })
+        $ErrorActionPreference = "Continue"
+        if (-not (Test-Path "node_modules")) {
+            npm install
+            if ($LASTEXITCODE) { $ErrorActionPreference = "Stop"; throw "npm install failed (exit $LASTEXITCODE)" }
+        }
+        if ($swappedRelayLine) {
+            [Environment]::SetEnvironmentVariable($allowStagingRelayEnv, $allowStagingRelayValue)
+        }
+        npm run package   # clears stale grok-vscode-phuryn-*.vsix first, then builds
+        $packageExit = $LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+        if ($packageExit) { throw "npm run package failed (exit $packageExit)" }
+        $vsix = Get-ChildItem -Path $repoRoot -Filter "*.vsix" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    } finally {
+        if ($null -eq $previousAllowStaging) {
+            [Environment]::SetEnvironmentVariable($allowStagingRelayEnv, $null)
+        } else {
+            [Environment]::SetEnvironmentVariable($allowStagingRelayEnv, $previousAllowStaging)
+        }
+        Pop-Location
+        if ($swappedRelayLine) {
+            # Restore even when the build threw, by swapping OUR line back in the
+            # file as it stands now - so any other edit made meanwhile survives.
+            $now = Read-TextFile $framesPath
+            if ($now.Contains($swappedRelayLine)) {
+                Write-TextFile $framesPath $now.Replace($swappedRelayLine, $prodRelayLine)
+            }
+            # Then prove the staging URL is actually gone. A leak here is the
+            # exact thing this automation exists to prevent, so it is checked
+            # against the file rather than against our own copy of it.
+            if ((Read-TextFile $framesPath).Contains($devUrl)) {
+                Write-Host ""
+                Write-Host "  !! src\remote-frames.ts still names the staging relay." -ForegroundColor Red
+                Write-Host "     Restore it before committing: $prodRelayLine" -ForegroundColor Red
+                Write-Host ""
+            }
+        }
+    }
+    if (-not $vsix) { throw "Build did not produce a .vsix." }
+    $unchanged = $beforeVsix | Where-Object {
+        $_.Path -eq $vsix.FullName -and $_.Ticks -eq $vsix.LastWriteTimeUtc.Ticks -and $_.Length -eq $vsix.Length
+    }
+    if ($unchanged) {
+        throw "npm run package did not produce a new .vsix (refusing to install a leftover build)."
+    }
     $VsixPath = $vsix.FullName
 }
 
-$clis = Find-EditorClis
-if ($clis.Count -eq 0) { throw "Could not find Cursor or VS Code CLI." }
-
-foreach ($cli in $clis) {
-    Write-Host "Installing $VsixPath via $cli"
-    foreach ($ext in @($Id) + $Conflicts) {
-        & $cli --uninstall-extension $ext 2>$null | Out-Null
+function Find-KnownClis {
+    $found = @()
+    foreach ($name in $knownClis) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { $found += $cmd.Source }
     }
-    & $cli --install-extension $VsixPath --force
+    return $found
+}
+
+function Find-CodeCli {
+    if ($Cli) {
+        $cmd = Get-Command $Cli -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        if (Test-Path $Cli) { return $Cli }
+        throw "Requested CLI not found: $Cli"
+    }
+    foreach ($name in $knownClis) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($fallback in @(
+        "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd",
+        "$env:LOCALAPPDATA\Programs\Microsoft VS Code Insiders\bin\code-insiders.cmd",
+        "$env:LOCALAPPDATA\Programs\cursor\resources\app\bin\cursor.cmd"
+    )) {
+        if (Test-Path $fallback) { return $fallback }
+    }
+    throw "Could not find a code-compatible CLI. Install VS Code, or pass one: pwsh scripts\install.ps1 -Cli <name-or-path>"
+}
+
+if ($All) {
+    $targets = Find-KnownClis
+    if (-not $targets) { throw "No known code-compatible CLI detected ($($knownClis -join ', '))." }
+} else {
+    $targets = @(Find-CodeCli)
+}
+
+# The editor CLIs print a Node deprecation warning to stderr. Under
+# $ErrorActionPreference = "Stop" that becomes a TERMINATING error, so -All used
+# to install into the first editor and stop - leaving the others silently on the
+# previous version while the run looked like it had failed outright. Exit codes
+# are the truth here, not stderr.
+$installed = @()
+$failed = @()
+foreach ($code in $targets) {
+    Write-Host "Installing $VsixPath via $code"
+    $ErrorActionPreference = "Continue"
+    & $code --install-extension $VsixPath --force 2>&1 | ForEach-Object { Write-Host "  $_" }
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($exit -eq 0) { $installed += $code } else { $failed += "$code (exit $exit)" }
 }
 
 Write-Host ""
-Write-Host "Done. Reload every open window (Developer: Reload Window)."
-Write-Host "Grok30m will then keep itself current from GitHub Releases."
+Write-Host "  Relay: $relayLabel" -ForegroundColor Cyan
+Write-Host "  Installed into: $($installed -join ', ')" -ForegroundColor Green
+if ($failed) { Write-Host "  FAILED: $($failed -join ', ')" -ForegroundColor Red }
+Write-Host ""
+Write-Host "Reload the IDE window (Ctrl+Shift+P -> 'Developer: Reload Window') and click the Grok icon."
+
+if (-not $Cli -and -not $All) {
+    $chosen = [System.IO.Path]::GetFileNameWithoutExtension($targets[0])
+    $others = $knownClis | Where-Object { $_ -ne $chosen -and (Get-Command $_ -ErrorAction SilentlyContinue) }
+    if ($others) {
+        Write-Host "Also detected: $($others -join ', ') - to install there instead: pwsh scripts\install.ps1 -Cli <name> (or -All for every detected IDE)"
+    }
+}

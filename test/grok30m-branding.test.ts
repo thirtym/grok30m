@@ -14,14 +14,14 @@ describe("Grok30m identity", () => {
     activationEvents?: string[];
     extensionKind?: string[];
     contributes: {
-      configuration: { properties: Record<string, { default?: unknown }> };
-      viewsContainers?: Record<string, unknown>;
-      commands?: { command: string }[];
+      configuration: { title?: string; properties: Record<string, { default?: unknown }> };
+      viewsContainers?: Record<string, { title: string }[]>;
+      commands?: { command: string; title: string }[];
     };
   };
 
   it("welcome names Grok30m and links the 30m fork", () => {
-    expect(sidebar).toContain("<h2>Grok30m</h2>");
+    expect(sidebar).toContain('"Grok30m"');
     expect(sidebar).toContain("30m fork of Grok Build (Community)");
     expect(sidebar).toContain("https://github.com/thirtym/grok30m");
     expect(sidebar).not.toContain("by Paweł Huryn");
@@ -33,6 +33,24 @@ describe("Grok30m identity", () => {
     expect(pkg.displayName).toBe("Grok30m");
   });
 
+  it("chrome says Grok30m so it cannot be mistaken for community Grok Build", () => {
+    expect(pkg.contributes.configuration.title).toBe("Grok30m");
+    const containers = pkg.contributes.viewsContainers as Record<string, { title: string }[]>;
+    for (const group of Object.values(containers)) {
+      for (const view of group) expect(view.title).toBe("Grok30m");
+    }
+    for (const cmd of pkg.contributes.commands ?? []) {
+      if (cmd.command === "grok.linkRemote" || cmd.command === "grok.unlinkRemote") continue;
+      expect(cmd.title, cmd.command).toMatch(/Grok30m/);
+    }
+    const settings = readFileSync(path.join(root, "media", "settings.js"), "utf8");
+    expect(settings).toContain('title: "Grok30m"');
+    expect(settings).not.toContain('title: "This extension"');
+    expect(settings).not.toContain("Community Grok Build");
+    expect(sidebar).toContain("Grok30m Settings");
+    expect(sidebar).not.toContain("title: \"Grok Settings\"");
+  });
+
   it("keeps editor-tab chat, Sessions sidebar, and hide-automation", () => {
     const props = pkg.contributes.configuration.properties;
     expect(props["grok.preferredLocation"].default).toBe("panel");
@@ -41,7 +59,7 @@ describe("Grok30m identity", () => {
     expect(pkg.contributes.viewsContainers).toEqual(
       expect.objectContaining({ activitybar: expect.any(Array) }),
     );
-    expect(pkg.contributes.viewsContainers).not.toHaveProperty("secondarySidebar");
+    expect(pkg.contributes.views.grokPrimary?.some((v: { id: string }) => v.id === "grok.sessions")).toBe(true);
   });
 
   it("activates on startup so GitHub-release updates run on every host, including SSH remotes", () => {

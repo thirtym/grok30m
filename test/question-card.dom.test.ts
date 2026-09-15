@@ -33,7 +33,7 @@ describe("question card (real chat.js in a DOM)", () => {
     expect(card).not.toBeNull();
     expect(card!.querySelector(".question-text")!.textContent).toBe("Pick one?");
     const labels = [...card!.querySelectorAll(".question-option .question-option-label")].map((b) => b.textContent);
-    expect(labels).toEqual(["Option A", "Option B"]);
+    expect(labels).toEqual(["Option A", "Option B", "Other"]);
     expect(card!.querySelector(".question-option-desc")!.textContent).toBe("first");
   });
 
@@ -119,6 +119,84 @@ describe("question card (real chat.js in a DOM)", () => {
       type: "questionAnswer",
       requestId: 5,
       answers: { Q1: "1a", Q2: "2b" },
+      annotations: {},
+    });
+  });
+
+  it("'Other' opens a text field and sends the typed answer instead of the literal label", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, {
+      type: "questionRequest",
+      req: {
+        id: 6,
+        questions: [{
+          question: "What should I do?",
+          options: [{ label: "Proceed" }, { label: "Other", description: "Type a different instruction" }],
+          multiSelect: false,
+        }],
+      },
+    });
+
+    const card = doc.querySelector(".card.question")!;
+    expect([...card.querySelectorAll(".question-option .question-option-label")]
+      .filter((label) => label.textContent?.trim().toLowerCase() === "other"))
+      .toHaveLength(1);
+    const other = [...card.querySelectorAll(".question-option")]
+      .find((b) => b.textContent!.includes("Other")) as HTMLButtonElement;
+    click(window, other);
+    const custom = card.querySelector(".question-other-input") as HTMLInputElement;
+    const submit = [...card.querySelectorAll(".card-actions button")]
+      .find((b) => b.textContent === "Submit") as HTMLButtonElement;
+    expect(custom.hidden).toBe(false);
+    expect(doc.activeElement).toBe(custom);
+    expect(submit.disabled).toBe(true);
+
+    custom.value = "Use the existing API instead";
+    custom.dispatchEvent(new window.Event("input", { bubbles: true }));
+    expect(submit.disabled).toBe(false);
+    click(window, submit);
+
+    expect(posted).toContainEqual({
+      type: "questionAnswer",
+      requestId: 6,
+      answers: { "What should I do?": "Use the existing API instead" },
+      annotations: {},
+    });
+    expect(card.querySelector(".question-answer")!.textContent)
+      .toContain("Use the existing API instead");
+  });
+
+  it("adds one free-text 'Other' when the request does not provide one", () => {
+    const { window, posted, doc } = bootWebview();
+    dispatch(window, {
+      type: "questionRequest",
+      req: {
+        id: 7,
+        questions: [{
+          question: "What should I do?",
+          options: [{ label: "Proceed" }],
+          multiSelect: false,
+        }],
+      },
+    });
+
+    const card = doc.querySelector(".card.question")!;
+    const labels = [...card.querySelectorAll(".question-option .question-option-label")]
+      .map((label) => label.textContent);
+    expect(labels).toEqual(["Proceed", "Other"]);
+
+    const other = [...card.querySelectorAll(".question-option")]
+      .find((button) => button.textContent!.includes("Other")) as HTMLButtonElement;
+    click(window, other);
+    const custom = card.querySelector(".question-other-input") as HTMLInputElement;
+    custom.value = "Use the existing API instead";
+    custom.dispatchEvent(new window.Event("input", { bubbles: true }));
+    click(window, card.querySelector(".card-actions .primary") as HTMLButtonElement);
+
+    expect(posted).toContainEqual({
+      type: "questionAnswer",
+      requestId: 7,
+      answers: { "What should I do?": "Use the existing API instead" },
       annotations: {},
     });
   });
@@ -275,5 +353,63 @@ describe("question card — resume restore (replayed tool_call)", () => {
     const card = doc.querySelector(".card.question.resolved")!;
     expect(card.querySelector(".question-text")!.textContent).toBe("Pick a number?");
     expect(card.querySelector(".question-answer")!.textContent).toBe("✓ Seven");
+  });
+});
+
+/**
+ * #144 — the "Other" answer is a textarea, not a one-line input.
+ *
+ * The reporter wanted to paste a list or a couple of paragraphs into it and
+ * could not read back what they had typed. Everything the single-line input
+ * supported has to keep working, which is what the existing cases above
+ * cover; these assert the element itself and that a newline survives.
+ */
+describe("question card: the Other field takes more than one line (#144)", () => {
+  const withOther = (requestId: number) => ({
+    id: requestId,
+    questions: [{
+      question: "What should I do?",
+      options: [{ label: "Proceed", description: "go" }],
+      multiSelect: false,
+    }],
+  });
+
+  const openOther = (window: any, doc: any) => {
+    const card = doc.querySelector(".card.question") as HTMLElement;
+    const other = [...card.querySelectorAll(".question-option")]
+      .find((b) => b.textContent!.includes("Other")) as HTMLButtonElement;
+    click(window, other);
+    return card.querySelector(".question-other-input") as HTMLTextAreaElement;
+  };
+
+  it("renders a textarea", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "questionRequest", req: withOther(90) });
+    expect(openOther(window, doc).tagName).toBe("TEXTAREA");
+  });
+
+  it("starts at one row, so it is no heavier than the input it replaced", () => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "questionRequest", req: withOther(91) });
+    // happy-dom hands `rows` back as the raw attribute string.
+    expect(Number(openOther(window, doc).rows)).toBe(1);
+  });
+
+  it("carries a multi-line answer through to the host verbatim", () => {
+    const { window, doc, posted } = bootWebview();
+    dispatch(window, { type: "questionRequest", req: withOther(92) });
+    const custom = openOther(window, doc);
+    const answer = "First paragraph.\n\n- one\n- two";
+    custom.value = answer;
+    custom.dispatchEvent(new window.Event("input", { bubbles: true }));
+    const card = doc.querySelector(".card.question") as HTMLElement;
+    click(window, card.querySelector(".card-actions .primary") as HTMLButtonElement);
+
+    expect(posted).toContainEqual({
+      type: "questionAnswer",
+      requestId: 92,
+      answers: { "What should I do?": answer },
+      annotations: {},
+    });
   });
 });
