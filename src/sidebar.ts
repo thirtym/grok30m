@@ -368,7 +368,7 @@ import {
 } from "./sessions";
 import { shouldHideAutoSession } from "./session-tags";
 import { COMMUNITY_BASE_VERSION, COMMUNITY_RELEASES_PAGE } from "./community-sync";
-import { peekCommunityLag } from "./host-update";
+import { peekCommunityLag } from "./release-peek";
 import {
   base64DecodedByteLength,
   isTrustedCodexGeneratedImagePath,

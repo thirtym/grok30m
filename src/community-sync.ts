@@ -1,4 +1,4 @@
-// Pure "are we behind community?" policy. GitHub fetch lives in host-update.
+// Pure "are we behind community?" policy. GitHub fetch lives in release-peek.
 // Compares the community release this fork last merged, never Grok30m's 2.x.
 import { parseGrokVersion, compareVersionTuple } from "./cli-locator";
 import type { GithubRelease } from "./self-update";

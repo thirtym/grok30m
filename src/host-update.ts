@@ -19,14 +19,14 @@ import {
 import {
   COMMUNITY_BASE_VERSION,
   COMMUNITY_NOTICE_STATE_KEY,
-  COMMUNITY_RELEASES_LATEST,
   COMMUNITY_RELEASES_PAGE,
-  communityLagStatusText,
   communityPeekStatusText,
-  decideCommunityLag,
   shouldNoticeCommunityLag,
 } from "./community-sync";
 import { httpsDownloadFile, httpsGetJson } from "./http-get";
+import { peekCommunityLag, peekExtensionUpdate, type CommunityPeek } from "./release-peek";
+
+export { peekCommunityLag, peekExtensionUpdate };
 
 export interface HostUpdateOptions {
   /** Ignore the 6h throttle (gear → Check, or the command palette). */
@@ -75,10 +75,6 @@ async function uninstallConflicts(output: vscode.OutputChannel): Promise<string[
 
 async function fetchLatest(version: string): Promise<GithubRelease> {
   return httpsGetJson<GithubRelease>(GROK30M_RELEASES_LATEST, userAgent(version));
-}
-
-async function fetchCommunityLatest(version: string): Promise<GithubRelease> {
-  return httpsGetJson<GithubRelease>(COMMUNITY_RELEASES_LATEST, userAgent(version));
 }
 
 async function maybeNoticeCommunityLag(
@@ -164,7 +160,7 @@ export async function runHostMaintenance(
     const lastCheck = context.globalState.get<number>(LAST_CHECK_STATE_KEY);
     const now = Date.now();
     const due = opts.forceCheck || shouldCheckForUpdate(lastCheck, now);
-    const community = due
+    const community: CommunityPeek = due
       ? await peekCommunityLag(currentVersion)
       : { base: COMMUNITY_BASE_VERSION, behind: false, status: "" };
     if (due) {
@@ -249,48 +245,6 @@ export async function runHostMaintenance(
     if (opts.notifyIfCurrent) {
       void vscode.window.showWarningMessage(`Grok30m update failed: ${(e as Error).message}`);
     }
-  }
-}
-
-/** Status for the About panel — does not install. */
-export async function peekExtensionUpdate(
-  currentVersion: string,
-): Promise<{ latest?: string; updateAvailable: boolean; error?: string }> {
-  try {
-    const release = await fetchLatest(currentVersion);
-    const decision = decideExtensionUpdate(currentVersion, release);
-    if (decision.action === "update") {
-      return { latest: decision.latest, updateAvailable: true };
-    }
-    if (decision.action === "current") {
-      return { latest: decision.latest, updateAvailable: false };
-    }
-    return { latest: "latest" in decision ? decision.latest : undefined, updateAvailable: false };
-  } catch (e) {
-    return { updateAvailable: false, error: (e as Error).message };
-  }
-}
-
-/** Status for About — community release vs the tag this fork last merged. */
-export async function peekCommunityLag(
-  version: string,
-): Promise<{ base: string; latest?: string; behind: boolean; status: string; error?: string }> {
-  try {
-    const release = await fetchCommunityLatest(version);
-    const decision = decideCommunityLag(COMMUNITY_BASE_VERSION, release);
-    return {
-      base: COMMUNITY_BASE_VERSION,
-      latest: "latest" in decision ? decision.latest : undefined,
-      behind: decision.action === "behind",
-      status: communityLagStatusText(decision),
-    };
-  } catch (e) {
-    return {
-      base: COMMUNITY_BASE_VERSION,
-      behind: false,
-      status: "Could not reach community releases.",
-      error: (e as Error).message,
-    };
   }
 }
 
