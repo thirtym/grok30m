@@ -106,6 +106,7 @@ jobs:
 
       - name: Open an issue when sync cannot publish
         if: failure()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

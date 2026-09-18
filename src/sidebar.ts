@@ -2842,7 +2842,7 @@ export class GrokSidebar {
   }
 
   private grokConfig(): { get<T>(key: string, defaultValue: T): T } | undefined {
-    const get = this.host.getConfiguration;
+    const get = this.host?.getConfiguration;
     if (typeof get !== "function") return undefined;
     return get.call(this.host, "grok");
   }
