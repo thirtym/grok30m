@@ -94,7 +94,7 @@ jobs:
           git add -A
           git status --short
           git commit -m "Grok30m ${VER}: merge community ${{ needs.check.outputs.community }} and keep session tabs"
-          git tag -a "$TAG" -m "Grok30m ${VER}"
+          git tag -a -f "$TAG" -m "Grok30m ${VER}"
           git push origin HEAD:grok30m
           git push origin "$TAG"
           NOTES=$(awk -v ver="$VER" '

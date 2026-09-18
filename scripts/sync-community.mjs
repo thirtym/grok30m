@@ -186,7 +186,7 @@ function applySync(decision) {
     process.exit(1);
   }
   ensureUpstream();
-  git(["fetch", "upstream", `+refs/tags/${decision.communityTag}:refs/tags/${decision.communityTag}`]);
+  git(["fetch", "upstream", "--no-tags", `+refs/tags/${decision.communityTag}:refs/tags/${decision.communityTag}`]);
   try {
     git(["merge", "--no-edit", decision.communityTag]);
   } catch {
