@@ -1,0 +1,120 @@
+name: Sync community
+
+# Daily peek at community releases. Idle run is checkout + `gh api` only.
+# npm ci / tests / vsix happen only when there is a new tag to merge.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      community_tag:
+        description: "Community tag to merge (default: next unpublished, e.g. v4.6.0)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-community
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      grok: ${{ steps.plan.outputs.grok }}
+      community: ${{ steps.plan.outputs.community }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: grok30m
+          fetch-depth: 1
+
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.community_tag }}"
+          PLAN=/tmp/grok30m-sync-plan.json
+          if [ -n "$TAG" ]; then
+            node scripts/sync-community.mjs --plan --tag "$TAG" | tee "$PLAN"
+          else
+            node scripts/sync-community.mjs --plan | tee "$PLAN"
+          fi
+          echo "action=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/grok30m-sync-plan.json","utf8")).action)')" >> "$GITHUB_OUTPUT"
+          echo "grok=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/grok30m-sync-plan.json","utf8")).grokVersion || "")')" >> "$GITHUB_OUTPUT"
+          echo "community=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/grok30m-sync-plan.json","utf8")).communityTag || "")')" >> "$GITHUB_OUTPUT"
+
+  sync:
+    needs: check
+    if: needs.check.outputs.action == 'sync'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: grok30m
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run compile
+
+      - name: Merge + overlay
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          node scripts/sync-community.mjs --apply --tag "${{ needs.check.outputs.community }}"
+          npm install
+
+      - run: npm test
+      - run: npm run package
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="${{ needs.check.outputs.grok }}"
+          TAG="v${VER}"
+          VSIX=$(ls grok30m-*.vsix | head -n1)
+          git add -A
+          git status --short
+          git commit -m "Grok30m ${VER}: merge community ${{ needs.check.outputs.community }} and keep session tabs"
+          git tag -a "$TAG" -m "Grok30m ${VER}"
+          git push origin HEAD:grok30m
+          git push origin "$TAG"
+          NOTES=$(awk -v ver="$VER" '
+            $0 == "## " ver { started=1 }
+            started && /^## / && $0 != "## " ver { exit }
+            started { print }
+          ' CHANGELOG-Grok30m.md)
+          gh release create "$TAG" --title "Grok30m ${VER}" --notes "$NOTES" "$VSIX"
+
+      - name: Open an issue when sync cannot publish
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="Community sync failed"
+          BODY="Could not merge community and publish a Grok30m vsix. Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          EXISTING=$(gh issue list --search "$TITLE in:title is:open" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi

@@ -16967,7 +16967,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    this.view?.webview.postMessage(message);
+    const chat = this.webviewFor(this.focused);
+    if (chat) chat.postMessage(message);
+    else this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);

@@ -23,8 +23,8 @@ import {
   communityPeekStatusText,
   shouldNoticeCommunityLag,
 } from "./community-sync";
+import { peekCommunityLag, peekExtensionUpdate } from "./release-peek";
 import { httpsDownloadFile, httpsGetJson } from "./http-get";
-import { peekCommunityLag, peekExtensionUpdate, type CommunityPeek } from "./release-peek";
 
 export { peekCommunityLag, peekExtensionUpdate };
 
@@ -247,5 +247,4 @@ export async function runHostMaintenance(
     }
   }
 }
-
 

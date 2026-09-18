@@ -2,10 +2,14 @@ import { describe, it, expect } from "vitest";
 import {
   COMMUNITY_BASE_VERSION,
   COMMUNITY_GITHUB_REPO,
+  bumpPatchVersion,
   communityLagStatusText,
   communityPeekStatusText,
   decideCommunityLag,
+  nextCommunityRelease,
+  prependGrok30mChangelog,
   releaseTagVersion,
+  replaceCommunityBaseVersion,
   shouldNoticeCommunityLag,
 } from "../src/community-sync";
 
@@ -56,5 +60,49 @@ describe("community lag", () => {
       .toBe("Community 4.6.0 is out — this build merged 4.5.2.");
     expect(communityPeekStatusText({ behind: false, base: "4.5.2", error: "offline" }))
       .toBe("Couldn't check community releases.");
+  });
+});
+
+describe("next community release (one tag at a time)", () => {
+  const releases = [
+    { tag_name: "v4.9.0" },
+    { tag_name: "v4.6.0" },
+    { tag_name: "v4.6.1" },
+    { tag_name: "v4.7.0", prerelease: true },
+    { tag_name: "v4.5.2" },
+  ];
+
+  it("picks the oldest published tag newer than the merged base", () => {
+    expect(nextCommunityRelease("4.5.2", releases)).toEqual({
+      tag: "v4.6.0",
+      version: "4.6.0",
+    });
+    expect(nextCommunityRelease("4.6.0", releases)?.version).toBe("4.6.1");
+    expect(nextCommunityRelease("4.9.0", releases)).toBeUndefined();
+  });
+
+  it("skips drafts", () => {
+    expect(nextCommunityRelease("4.5.2", [{ tag_name: "v4.6.0", draft: true }])).toBeUndefined();
+  });
+});
+
+describe("auto-sync file rewrites", () => {
+  it("bumps the Grok30m patch, not the community version", () => {
+    expect(bumpPatchVersion("2.1.0")).toBe("2.1.1");
+  });
+
+  it("rewrites COMMUNITY_BASE_VERSION in place", () => {
+    const src = 'export const COMMUNITY_BASE_VERSION = "4.5.2";\n';
+    expect(replaceCommunityBaseVersion(src, "4.6.0")).toBe(
+      'export const COMMUNITY_BASE_VERSION = "4.6.0";\n',
+    );
+  });
+
+  it("inserts a changelog section above the previous release", () => {
+    const md = "# Grok30m changelog\n\nintro\n\n## 2.1.0\n\n- old\n";
+    const next = prependGrok30mChangelog(md, "2.1.1", "4.6.0");
+    expect(next).toContain("## 2.1.1");
+    expect(next).toContain("Merge community 4.6.0");
+    expect(next.indexOf("## 2.1.1")).toBeLessThan(next.indexOf("## 2.1.0"));
   });
 });

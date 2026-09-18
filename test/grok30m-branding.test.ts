@@ -20,6 +20,16 @@ describe("Grok30m identity", () => {
     };
   };
 
+  it("desk posts reach the editor tab, not only the hidden sidebar chat", () => {
+    const start = sidebar.indexOf("private post(message: HostMsg)");
+    const end = sidebar.indexOf("private postGrokUpdateStatus", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = sidebar.slice(start, end);
+    expect(body).toContain("webviewFor");
+    expect(body).toMatch(/if \(chat\) chat\.postMessage\(message\)/);
+  });
+
   it("welcome names Grok30m and links the 30m fork", () => {
     expect(sidebar).toContain('"Grok30m"');
     expect(sidebar).toContain("30m fork of Grok Build (Community)");

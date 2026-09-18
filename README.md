@@ -6,14 +6,9 @@
 
 > **Not affiliated with or endorsed by xAI or Paweł Huryn.** *Grok*, *Grok Build*, and *xAI* are trademarks of xAI.
 
-Settings → About and **Grok30m: Check for Updates** show whether community has pulled ahead of the tag this build merged. To pull a newer community release in:
+A daily GitHub Action (`.github/workflows/sync-community.yml`) checks community **releases** (a few seconds, no `npm ci`). Only when a new tag exists does it merge, reapply session tabs, and publish a vsix to [GitHub Releases](https://github.com/thirtym/grok30m/releases/latest). Installed copies pick that up via **Grok30m: Check for Updates** / `grok.autoUpdate`. If a merge would drop the tabs, tests fail and an issue is opened — nothing is published.
 
-```bash
-git checkout grok30m
-./scripts/sync-upstream.sh
-# bump COMMUNITY_BASE_VERSION in src/community-sync.ts to the tag you merged
-npm test && npm run package
-```
+Manual equivalent: `npm run compile && node scripts/sync-community.mjs --plan` (or `--apply`).
 
 Two ways to use the same agent UI on top of the **Grok Build CLI**:
 

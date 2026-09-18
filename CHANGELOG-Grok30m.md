@@ -9,8 +9,10 @@ Full upstream history: [README.upstream.md](README.upstream.md) and the [upstrea
 
 - **Merge community 4.5.2** (Changes view, prompt-cache fix, Codex steer, model/effort chip, CLI updates from Settings, cloud/phone sign-in).
 - **Grok30m UX kept:** editor-tab chat, Sessions sidebar, hide automated sessions.
+- **Editor-tab chat leaves Starting.** Host messages go to the open tab, not the hidden sidebar view.
 - **Chrome says Grok30m** (activity bar, command palette, Settings, About). Community is only listed as the upstream this build is based on.
 - **About and Check for Updates show community status.** Settings → About fetches the latest community release and says up to date or behind. Check for Updates always includes that line. Startup still toasts once when community pulls ahead.
+- **Auto-publish when community moves.** Daily Action checks for a new community release (no install on idle). When one exists it merges, keeps editor-tab chat (invariant tests), and attaches a vsix to GitHub Releases so installs can actually update.
 
 ## 2.0.3
 

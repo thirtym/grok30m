@@ -11,8 +11,8 @@ export const COMMUNITY_RELEASES_PAGE =
   `https://github.com/${COMMUNITY_GITHUB_REPO}/releases`;
 
 /**
- * Community tag last merged into Grok30m. Bump this in the same change that
- * merges `upstream` — About and the startup notice both read it.
+ * Community tag last merged into Grok30m. The auto-sync Action rewrites this
+ * in the same commit that merges the tag.
  */
 export const COMMUNITY_BASE_VERSION = "4.5.2";
 
@@ -82,4 +82,72 @@ export function communityPeekStatusText(peek: {
   }
   if (peek.latest) return `Community ${peek.latest} — up to date.`;
   return `Merged community ${peek.base}.`;
+}
+
+export type CommunityReleaseRef = Pick<GithubRelease, "tag_name" | "name" | "draft" | "prerelease">;
+
+/** Oldest published community tag newer than `baseVersion`. One step per sync. */
+export function nextCommunityRelease(
+  baseVersion: string,
+  releases: CommunityReleaseRef[],
+): { tag: string; version: string } | undefined {
+  const base = parseGrokVersion(baseVersion);
+  if (!base) return undefined;
+  const newer: { tag: string; version: string; tuple: [number, number, number] }[] = [];
+  for (const release of releases) {
+    if (release.draft || release.prerelease) continue;
+    const version = releaseTagVersion(release);
+    const tuple = parseGrokVersion(version);
+    if (!tuple) continue;
+    if (compareVersionTuple(tuple, base) <= 0) continue;
+    const tag = (release.tag_name || `v${version}`).startsWith("v")
+      ? (release.tag_name || `v${version}`)
+      : `v${version}`;
+    newer.push({ tag, version, tuple });
+  }
+  newer.sort((a, b) => compareVersionTuple(a.tuple, b.tuple));
+  const next = newer[0];
+  return next ? { tag: next.tag, version: next.version } : undefined;
+}
+
+export function bumpPatchVersion(version: string): string {
+  const tuple = parseGrokVersion(version);
+  if (!tuple) throw new Error(`unparseable version ${version}`);
+  return `${tuple[0]}.${tuple[1]}.${tuple[2] + 1}`;
+}
+
+export function replaceCommunityBaseVersion(source: string, next: string): string {
+  const updated = source.replace(
+    /export const COMMUNITY_BASE_VERSION = "[^"]+";/,
+    `export const COMMUNITY_BASE_VERSION = "${next}";`,
+  );
+  if (updated === source) {
+    throw new Error("COMMUNITY_BASE_VERSION assignment not found");
+  }
+  return updated;
+}
+
+export function replaceCommunityBaseVersionTest(source: string, next: string): string {
+  const updated = source.replace(
+    /expect\(COMMUNITY_BASE_VERSION\)\.toBe\("[^"]+"\);/,
+    `expect(COMMUNITY_BASE_VERSION).toBe("${next}");`,
+  );
+  if (updated === source) {
+    throw new Error("COMMUNITY_BASE_VERSION test assertion not found");
+  }
+  return updated;
+}
+
+export function prependGrok30mChangelog(
+  existing: string,
+  grokVersion: string,
+  communityVersion: string,
+): string {
+  const section =
+    `## ${grokVersion}\n\n` +
+    `- **Merge community ${communityVersion}** (auto-sync).\n` +
+    `- **Grok30m UX kept:** editor-tab chat, Sessions sidebar, hide automated sessions.\n\n`;
+  const idx = existing.search(/\n## /);
+  if (idx === -1) return section + existing;
+  return existing.slice(0, idx + 1) + section + existing.slice(idx + 1);
 }
