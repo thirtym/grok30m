@@ -293,6 +293,11 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
         }
       }
       break;
+    case "sessionsReady":
+      break;
+    case "setHideAutoSessions":
+      if (!isBoolean(raw.value)) return null;
+      break;
     case "listRepoSessions":
       if (!isString(raw.cwd)) return null;
       if (!opt(raw.limit, isNumber)) return null;
