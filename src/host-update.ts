@@ -23,7 +23,7 @@ import {
   communityPeekStatusText,
   shouldNoticeCommunityLag,
 } from "./community-sync";
-import { peekCommunityLag, peekExtensionUpdate } from "./release-peek";
+import { peekCommunityLag, peekExtensionUpdate, type CommunityPeek } from "./release-peek";
 import { httpsDownloadFile, httpsGetJson } from "./http-get";
 
 export { peekCommunityLag, peekExtensionUpdate };
