@@ -30,6 +30,7 @@ const defer = () => {
 
 function harness(provider: "codex" | "claude") {
   const host = Object.create(GrokSidebar.prototype) as any;
+  host.pendingConfirms = new Map();
   const local = new Session();
   local.provider = provider;
   local.activeSessionId = "local-thread";
@@ -45,7 +46,7 @@ function harness(provider: "codex" | "claude") {
   const other = new Session();
   other.provider = "grok";
   for (const session of [local, phone, background, other]) {
-    session.client = { disposeForUpdate: vi.fn(async () => {}) } as any;
+    session.client = { setHumanWaitActive: vi.fn(), disposeForUpdate: vi.fn(async () => {}) } as any;
   }
   const store: Record<string, any> = {
     [CACHE]: { [provider]: { models: [{ modelId: "old-model" }], cliVersion: "0.149.0" } },
@@ -377,6 +378,7 @@ describe.each(["codex", "claude"] as const)("%s explicit CLI update", (provider)
 describe("grok explicit CLI update", () => {
   function grokHarness(check: () => { stdout: string; stderr: string }) {
     const host = Object.create(GrokSidebar.prototype) as any;
+  host.pendingConfirms = new Map();
     const focused = new Session();
     focused.provider = "grok";
     focused.activeSessionId = "grok-thread";

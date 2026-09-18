@@ -109,6 +109,7 @@ import {
   registryIdFromUrlPath,
 } from "../src/desktop/resource-registry";
 import { parseWebviewMsg } from "../src/desktop/webview-msg-validate";
+import { WEBVIEW_MESSAGE_TYPES } from "../src/protocol";
 import {
   deliverSuggestedFileSave,
   planSuggestedSaveDialog,
@@ -1252,6 +1253,31 @@ describe("app-resource serve policy (no credential leak)", () => {
     });
     expect(lexicalOnly).toBe(true);
     expect(appResourceMayServe(auth, roots)).toBe(false);
+  });
+});
+
+describe("webview message schema validation — every type is registered", () => {
+  // The per-message tests below were each written AFTER a type shipped dead on
+  // the desktop app, and they only ever cover the type someone remembered. On
+  // 2026-09-14 seven were missing at once — gitStatus/gitFileDiff/gitRun (the
+  // whole Changes panel), updateCodex/updateClaude, refreshContextDetails and
+  // refreshSubscriptionUsage — so the git panel and both popover refreshes were
+  // dead on desktop while VS Code, which does not load this gate, was fine.
+  //
+  // TypeScript cannot catch it: the switch ends in `default: return null`, so
+  // omitting a case is exhaustive as far as the compiler is concerned. This
+  // asserts on the SOURCE instead, which is the only place the omission exists.
+  it("gives every WebviewMsg type a case label in the validator", () => {
+    const src = fs.readFileSync(
+      fileURLToPath(new URL("../src/desktop/webview-msg-validate.ts", import.meta.url)),
+      "utf8",
+    );
+    const labelled = new Set(
+      [...src.matchAll(/case "([^"]+)":/g)].map((m) => m[1]),
+    );
+    const missing = WEBVIEW_MESSAGE_TYPES.filter((type) => !labelled.has(type));
+    expect(missing, `webview-msg-validate.ts drops these on the desktop app: ${missing.join(", ")}`)
+      .toEqual([]);
   });
 });
 

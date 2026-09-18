@@ -20,6 +20,7 @@ import type { AcpProvider, BackendSessionListEntry } from "./acp-backend";
 import { isAdapterProvider, isAcpProvider, ACP_PROVIDERS } from "./acp-backend";
 import { CODEX_ACP_ADAPTER_VERSION, CodexBackend, isCodexCredentialError } from "./codex-backend";
 import { locateCodexCli, resolveCodexHome } from "./codex-cli-locator";
+import { readCodexSubscriptionWindows } from "./codex-usage";
 import { CODEX_MANAGED_VERSION, codexManagedRoot, installManagedCodex } from "./codex-managed-installer";
 import { CLI_NPM_PACKAGE, cliUpdatePlan, selfUpdateArgs } from "./cli-update-plan";
 import { warmCodexModelCache } from "./codex-model-cache";
@@ -86,7 +87,9 @@ import {
 import { buildReapCandidates, selectReapable, computeDot, Dot } from "./session-pool";
 import { resolveVoiceKey, extractGrokAuthKey, parseVoiceCommand, buildSttKeyterms, voiceSettingForRepo, voiceSettingWriteTarget, sanitizeVoiceSendPhrase, sanitizeVoiceKeyterms, voiceConfiguredFingerprint, DEFAULT_SEND_PHRASE, MAX_RECORDING_SECONDS } from "./voice";
 import { VoiceRecorder, transcribeAudio, resolveWindowsAudioDevice } from "./voice-recorder";
-import { PcmVoiceStreamer, VoiceStreamer } from "./voice-streamer";
+import { PcmVoiceStreamer, PcmSttStream, createPcmVoiceStreamer, VoiceStreamer } from "./voice-streamer";
+import { pickSttBackend, resolveOpenAiVoiceKey, SttBackend, SttPreference, VoiceBackendState, parseFinalVoiceCommand } from "./voice";
+import { OPENAI_STT_MODEL } from "./openai-voice";
 import { summarizeForSpeech } from "./speech-summary";
 import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
 import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isResumeNotFound, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
@@ -172,6 +175,7 @@ import {
   type TelemetrySession,
 } from "./telemetry";
 import { randomUUID } from "node:crypto";
+import { SubscriptionUsageBinding, SubscriptionUsageCache, subscriptionCredentialContext, type SubscriptionWindow } from "./subscription-usage";
 import { execGrokCli } from "./cli-process";
 import { listGitWorktreePaths } from "./git-worktree-list";
 import {
@@ -583,7 +587,11 @@ const OAUTH_SHADOW_WARNING_KEY = "grok.oauthShadowWarningShown";
 interface RemoteVoiceEntry {
   credentialCwd: string;
   session: Session;
-  streamer: PcmVoiceStreamer;
+  streamer: PcmSttStream;
+  backend: SttBackend;
+  key: string;
+  model: string;
+  starting?: Promise<void>;
   ingress: RemotePcmIngress;
   phrase: string;
   keyterms: string[];
@@ -828,7 +836,9 @@ export class GrokSidebar {
   private terminalManager = new TerminalManager();
   private voiceRecorder = new VoiceRecorder();
   private voiceTempPath?: string;
+  private voiceBatchCtx?: { backend: SttBackend; key: string };
   private voiceStreamer?: VoiceStreamer;
+  private voiceStoppingStreamer?: VoiceStreamer;
   private voiceFinalizing = false;
   /** Invalidates async voice callbacks after a manual discard or session swap. */
   private voiceGeneration = 0;
@@ -836,6 +846,8 @@ export class GrokSidebar {
   // message = one clean utterance) without re-resolving the mic device.
   private voiceStreamCtx?: {
     key: string;
+    backend: SttBackend;
+    model: string;
     ffmpegPath: string;
     device?: string;
     phrase: string;
@@ -984,6 +996,8 @@ export class GrokSidebar {
     "setSummarizeRepliesAloud",
     "setVoiceSendPhrase",
     "setVoiceKeyterms",
+    "setVoiceBackend",
+    "configureOpenAiVoice",
     "setTelemetryEnabled",
     "setThumbsFeedback",
     "openGlobalConfig",
@@ -1688,6 +1702,7 @@ export class GrokSidebar {
 
   private setProviderConnectedInMemory(provider: AcpProvider, connected: boolean): void {
     const current = this.providerConnections();
+    if (!connected || !current[provider]) this.invalidateSubscriptionUsage(provider);
     this.providerConnectionState = { ...current, [provider]: connected };
     if (!connected && isAdapterProvider(provider)) {
       const history = this.adapterHistory(provider);
@@ -1727,10 +1742,32 @@ export class GrokSidebar {
     const current = this.providerNeedsLogin ?? {};
     if (!!current[provider] === needsLogin) return;
     this.providerNeedsLogin = { ...current, [provider]: needsLogin };
+    if (needsLogin) this.invalidateSubscriptionUsage(provider);
     // A recovered account must be able to re-list at once; the freshness stamp
     // would otherwise hold the empty catalog for its full back-off window.
     if (!needsLogin && isAdapterProvider(provider)) this.adapterHistory(provider)?.at.clear();
+    // And it must be able to RECOVER again. `authRecoveryTried` survives a
+    // startSession on purpose (#58: an entitlement failure must not pay a
+    // restart+resend on every prompt), and only a clean turn re-arms it -- which
+    // a conversation holding a process built on a dead token can never have. So
+    // a session that spent its recovery kept a dead client forever, and signing
+    // in changed nothing about the conversation the sign-in was asked for.
+    // A sign-in actually completing is new information, and it is exactly the
+    // thing `authRecoveryTried` was standing in for the absence of. Re-arming
+    // here costs the next send one process restart and a resend, which is the
+    // recovery doing its job, rather than a second restart path of its own.
+    if (!needsLogin) this.rearmAuthRecovery(provider);
     this.postProviderState();
+  }
+
+  /** Every session on this provider may try the token dance once more. */
+  private rearmAuthRecovery(provider: AcpProvider): void {
+    const rearm = (session: Session | undefined) => {
+      if (session?.provider === provider) session.authRecoveryTried = false;
+    };
+    rearm(this.focused);
+    for (const session of this.pool) rearm(session);
+    for (const session of this.remoteClients.detachedActiveValues()) rearm(session);
   }
 
   private async warmConnectedCodexModels(): Promise<boolean> {
@@ -2133,6 +2170,21 @@ export class GrokSidebar {
         ? await this.deviceLoginCredentialReady(provider)
         : await this.reprobeProviderCredentials(provider)) {
         this.host.appendLine(`[${provider}] device login: credential verified`);
+        // Say it about the needs-login flag too, and not only about `connected`.
+        // For grok and codex this is a no-op -- `reprobeProviderCredentials`
+        // above already lowered it -- but Claude's check is
+        // `probeClaudeAuthStatus`, which answers the question without going
+        // through the probe that clears. Nothing else covered that: a phone
+        // sign-in ends here, and `adoptSessionsForConnectedProvider` leaves a
+        // conversation that still has a client alone by design.
+        //
+        // If this CLI is wrong about its own sign-in, the next prompt raises the
+        // flag again a second later, which is the bounded failure. The
+        // unbounded one is the other direction: the account stays flagged after
+        // a sign-in the app itself just called verified, the card comes back,
+        // and (since the flag is also what re-arms auth recovery) the next send
+        // reuses the process built on the dead token. A refresh does not fix it.
+        this.setProviderNeedsLogin(provider, false);
         // Promote on evidence, exactly as the Providers refresh does. The probe
         // just proved the account works; without this the persisted `connected`
         // flag stays false, so Settings keeps offering Connect and never offers
@@ -2681,6 +2733,8 @@ export class GrokSidebar {
     const configChanges = this.host.onDidChangeConfiguration((e) => {
       if (
         e.affectsConfiguration("grok.voiceApiKey") ||
+        e.affectsConfiguration("grok.voiceOpenAiApiKey") ||
+        e.affectsConfiguration("grok.voiceBackend") ||
         e.affectsConfiguration("grok.ffmpegPath") ||
         e.affectsConfiguration("grok.voiceSendPhrase") ||
         e.affectsConfiguration("grok.voiceKeyterms")
@@ -2786,7 +2840,16 @@ export class GrokSidebar {
       resolveGrokHome(process.env),
       "auth.json",
     );
-    const refreshVoiceConfigured = () => this.postVoiceConfigured();
+    const refreshVoiceConfigured = () => {
+      this.postVoiceConfigured();
+      // No request here: a running CLI may still hold the previous login.
+      // Publish cleared snapshots now; a new process binds the new account.
+      for (const session of new Set([this.focused, ...this.pool])) {
+        if (session.subscriptionUsage && !session.subscriptionUsage.current()) {
+          this.emit(session, { type: "subscriptionUsage", windows: [] });
+        }
+      }
+    };
     authWatcher.onDidCreate(refreshVoiceConfigured);
     authWatcher.onDidChange(refreshVoiceConfigured);
     authWatcher.onDidDelete(refreshVoiceConfigured);
@@ -3750,6 +3813,7 @@ Only continue if you trust this code.`,
 
     function commitVerdict(): void {
       session.pendingExitPlans.delete(requestId);
+      sidebar.syncHumanWait(session);
       sidebar.persistPlanVerdict(session, verdict, planText);
       // Same rule as answering a permission or a question: a plan verdict is
       // activity, but it only resumes the turn if nothing else is outstanding.
@@ -4040,6 +4104,7 @@ Only continue if you trust this code.`,
   private persistPermissionAnswer(session: Session, requestId: number | string, optionId: string): void {
     const pending = session.pendingPermissions.get(requestId);
     session.pendingPermissions.delete(requestId);
+    this.syncHumanWait(session);
     if (!pending) return;
     const sid = session.activeSessionId ?? session.client?.sessionId;
     if (!sid) return;
@@ -4144,6 +4209,7 @@ Only continue if you trust this code.`,
         name: o.name,
       })),
     }));
+    this.syncHumanWait(session);
     this.emit(session, {
       type: "permissionRequest",
       req: {
@@ -4535,9 +4601,7 @@ Only continue if you trust this code.`,
     // would refuse to answer the card still on the reader's screen, leaving
     // that agent blocked with no way back short of restarting the session.
     if (!turnIsInFlight(session)) {
-      session.pendingQuestions.clear();
-      session.pendingPermissions.clear();
-      session.pendingExitPlans.clear();
+      this.clearPendingHumanRequests(session);
     }
     if (session.replaying || session.suppressContent) return;
     session.liveFeedbackEligible = true;
@@ -9798,6 +9862,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return undefined;
     }
     session.buffer = [];
+    session.subscriptionUsage = undefined;
     session.status = "idle";
     // The replacement session has no turn, whatever the old one was doing. This
     // matters most in the case the token exists for: a `prompt()` that never
@@ -9811,6 +9876,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // new/resumed/restarted session (covers New Session, history resume, and
     // model/effort restarts — all of which route through here).
     this.stopVoiceInput(session);
+    this.clearPendingHumanRequests(session);
+    this.drainPendingConfirms(session);
     session.client = undefined;
     // Detach and dispose as one structural operation. Nothing that can return
     // belongs between these lines: the old ACP callbacks remain live until the
@@ -9857,8 +9924,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.sessionInfoUnsupported = false;
     session.sawCompactNotification = false;
     session.lastPlanText = "";
-    session.pendingExitPlans.clear();
-    session.pendingQuestions.clear();
     session.inFlightPlanComments.clear();
     if (session.planModeRecovery?.warningTimer) clearTimeout(session.planModeRecovery.warningTimer);
     session.planModeRecovery = undefined;
@@ -9987,6 +10052,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         : { backend: this.createProviderBackend(session.provider) }),
     });
     session.client = client;
+    this.syncHumanWait(session);
     // A replacement process may have gained the capability after a CLI update.
     session.lastSessionInfoAt = 0;
     session.lastSessionInfoUsed = undefined;
@@ -10282,6 +10348,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("toolCallUpdate", (u) => {
       if (gen !== session.gen) return;
+      this.closeQuestionsForToolCall(session, u);
       emitToolCallEvent("toolCallUpdate", u);
     });
     client.on("plan", (u) => {
@@ -10352,6 +10419,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         ...(typeof used === "number" && Number.isFinite(used) && used > 0 ? { used } : {}),
         ...(typeof window === "number" && Number.isFinite(window) && window > 0 ? { window } : {}),
       });
+    });
+    client.on("subscriptionUsage", (windows: SubscriptionWindow[]) => {
+      if (gen !== session.gen || session.client !== client || session.replaying) return;
+      session.subscriptionUsage?.observe(windows);
+      this.publishSubscriptionUsage(session);
     });
     client.on("adapterUsageUpdate", (used: number, window?: number) => {
       if (gen !== session.gen) return;
@@ -10476,7 +10548,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return;
       // Questions are read-only and need a human — surface them in every mode
       // (plan/YOLO included); there's no sensible auto-answer.
-      session.pendingQuestions.add(req.id);
+      session.pendingQuestions.set(req.id, req.toolCallId);
+      this.syncHumanWait(session);
       this.emit(session, { type: "questionRequest", req });
       this.setStatus(session, "needs-you");
     });
@@ -10493,6 +10566,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // replaced attempt's client away from the current attempt's pipe.
       if (session.priming) {
         if (session.client === client) {
+          this.clearPendingHumanRequests(session);
+          this.drainPendingConfirms(session);
           session.client = undefined;
           this.pool.delete(session);
         }
@@ -10702,6 +10777,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Throw into the classifier instead: the retry budget owns transient
       // startup deaths, and the final failure surfaces like any other.
       if (session.client !== client) throw new Error("the provider exited during startup");
+      this.bindSubscriptionUsage(session, env);
+      void this.refreshSubscriptionUsage(session);
       // Session is live — unlock the composer and flush anything typed during
       // the startup window (#37).
       session.priming = false;
@@ -10709,7 +10786,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.pool.add(session);
       this.touch(session);
       this.reapPool(); // enforce the LRU cap now that the pool grew
-      this.setProviderNeedsLogin(session.provider, false);
+      // NOT `setProviderNeedsLogin(provider, false)` here. Starting a process
+      // and loading a session does not exercise the credential: measured on the
+      // owner's cloud host 2026-09-14, session/create + session/load + replay
+      // all completed cleanly against a dead Claude token and the prompt one
+      // second later answered "Authentication required". This line ran inside
+      // recoverAuthAndResend's own restart, so every send cleared the account
+      // flag on its way to failing -- the sign-in card blinked out at the
+      // moment it was most needed. Only an accepted credential clears it now;
+      // see the clean-turn site in handleSend.
       this.emit(session, { type: "setBusy", value: false });
       // A draft this conversation lost to a provider sign-out comes back with
       // it, before the queue flushes — the composer is where it was typed.
@@ -10735,6 +10820,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         /timed out: (initialize|session\/(new|load))|exited \(code null\)/i.test(msg);
       const userFacing = credentialFailure || stdioRegression || replayBegan || attempt >= startSpawnAttempts;
       client.removeAllListeners("exit");
+      this.clearPendingHumanRequests(session);
+      this.drainPendingConfirms(session);
       client.dispose();
       session.client = undefined;
       if (!userFacing) {
@@ -11030,6 +11117,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "cancel": {
         const cancelled = session.turnToken;
+        this.clearPendingHumanRequests(session);
         await session.client?.cancel("user Stop click");
         if (cancelled) this.armCancelRecovery(session, cancelled);
         break;
@@ -11163,9 +11251,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // what a mismatch means is an answer for somebody else's conversation,
         // and dropping it is right. Ignoring it cannot hang the caller either:
         // the real answer still resolves, and an abandoned confirm already
-        // fails closed when the webview goes away.
+        // fails closed on session teardown or replacement.
         if (pending && pending.session === session) {
           this.pendingConfirms.delete(msg.id);
+          this.emit(session, { type: "uiConfirmResolved", requestId: msg.id });
           pending.resolve(msg.ok === true);
         }
         break;
@@ -11175,6 +11264,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "workflowControl":
         await this.controlWorkflow(msg.action, msg.displayName, session);
+        break;
+      case "refreshSubscriptionUsage":
+        void this.refreshSubscriptionUsage(session);
         break;
       case "refreshContextDetails":
         if (session.provider === "grok") {
@@ -11353,6 +11445,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
               pending.plan,
             );
             session.pendingPermissions.delete(msg.requestId);
+            this.syncHumanWait(session);
           } else {
             // Persist it (title + outcome) so a cold reload replays a collapsed card —
             // the CLI doesn't replay request_permission on session/load.
@@ -11378,18 +11471,32 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // turn ended. Answering it again would write a duplicate JSON-RPC
         // response and drag a settled session back to `working` — with no turn
         // left to ever end it, which on a rented machine bills for ever.
-        if (!session.pendingQuestions.delete(msg.requestId)) break;
+        if (!session.pendingQuestions.delete(msg.requestId)) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
+          break;
+        }
+        this.syncHumanWait(session);
         if (session.client?.respondQuestion(msg.requestId, msg.answers ?? {}, msg.annotations ?? {})) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "accepted" });
           // Answering a QUESTION is not answering a permission card that is
           // also outstanding — the agent stays blocked on it, so `working`
           // would be wrong and would hold a rented machine awake indefinitely.
           this.noteAnswered(session);
+        } else {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
         }
         break;
       case "questionCancel":
-        if (!session.pendingQuestions.delete(msg.requestId)) break;
+        if (!session.pendingQuestions.delete(msg.requestId)) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
+          break;
+        }
+        this.syncHumanWait(session);
         if (session.client?.respondQuestionCancelled(msg.requestId)) {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "accepted" });
           this.noteAnswered(session);
+        } else {
+          this.emit(session, { type: "questionResolved", requestId: msg.requestId, outcome: "stale" });
         }
         break;
       case "setModel": {
@@ -11694,6 +11801,28 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         );
         break;
       }
+      case "setVoiceBackend": {
+        if (!["auto", "xai", "openai"].includes(msg.value)) break;
+        const cfg = this.host.getConfiguration("grok", messageCwd);
+        await cfg.update("voiceBackend", msg.value,
+          voiceSettingWriteTarget(cfg.inspect("voiceBackend"), this.host.isInWorkspace(messageCwd)));
+        this.postVoiceConfigured();
+        break;
+      }
+      case "configureOpenAiVoice": {
+        const value = await this.host.showInputBox({
+          title: "OpenAI voice API key",
+          prompt: "An OpenAI API-platform key is required; Codex / ChatGPT sign-in does not include transcription. Saved in host settings. Empty clears the override.",
+          password: true,
+          placeHolder: "OpenAI API key",
+        });
+        if (value === undefined) break;
+        const cfg = this.host.getConfiguration("grok", messageCwd);
+        await cfg.update("voiceOpenAiApiKey", value.trim(),
+          voiceSettingWriteTarget(cfg.inspect("voiceOpenAiApiKey"), this.host.isInWorkspace(messageCwd)));
+        this.postVoiceConfigured();
+        break;
+      }
       case "setTelemetryEnabled":
         await this.host.getConfiguration("grok")
           .update("telemetry.enabled", !!msg.value, "global");
@@ -11749,6 +11878,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         // Official CLI owns login. For Claude this is `claude auth login`
         // without --claudeai — we never implement or proxy Claude.ai OAuth.
+        // Connecting an account and RENEWING one are different errands, and
+        // only the second is about the conversation on screen. Read the flag
+        // before the probe below can clear it.
+        const renewing = !!this.providerNeedsLogin?.[provider];
         const loginArgs = provider === "claude" ? ["auth", "login"] : ["login"];
         const term = this.host.createTerminal({
           name: `${providerDisplayName(provider)} Login`,
@@ -11777,7 +11910,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // remote branch above returns before here — TypeScript pointed out the
         // comparison could no longer be false, which is the check that the two
         // paths really are separate rather than merely intended to be.
-        if (session.hasHistory && this.workspaceRoot()) {
+        //
+        // A RENEWAL is the exception, and it is the case the composer's
+        // lapsed-account card asks for: that card sits on a conversation whose
+        // replies are being refused and offers to fix THAT conversation, so
+        // parking it to make room for a panel answers a question nobody asked.
+        // The panel below is posted either way; on a live transcript the
+        // welcome hold declines to paint it, which is the same hold that made
+        // this card necessary. The terminal is the flow there.
+        if (session.hasHistory && this.workspaceRoot() && !renewing) {
           await this.newFocusedSession(origin);
         }
         // ALWAYS show this provider's login panel, and say the terminal was
@@ -13289,7 +13430,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         };
       }
       const entries = result.sessions.map((entry) => adapterListEntry(entry, stableOverrides, provider));
-      this.setProviderNeedsLogin(provider, false);
+      // Same reasoning as startSession's: listing sessions reads this machine's
+      // own files and succeeds with any token at all. On the owner's host a
+      // phone reconnect swept four project folders at 10:05:40, spawning an
+      // adapter per folder, and each success wiped the needs-login the failing
+      // conversation had just raised. The catch below still LOWERS the verdict
+      // from a listing -- a listing that fails with a credential error is real
+      // evidence -- but a listing that succeeds is evidence of nothing.
+      // (Kept on the grok/probe paths, which make a call the account must
+      // authorize; this one does not.)
       history.cache.set(key, entries);
       history.at.set(key, Date.now());
       await this.updateSessionMeta((current) => {
@@ -14511,6 +14660,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return undefined;
   }
 
+  /** Deliberately separate from the xAI resolver used by summarizeSpeech. */
+  private resolveSttApiKey(cwd: string, backend: SttBackend): string | undefined {
+    if (backend === "xai") return this.resolveVoiceApiKey(cwd);
+    return resolveOpenAiVoiceKey({
+      setting: this.voiceSetting(cwd, "voiceOpenAiApiKey", ""),
+      env: { ...process.env, ...this.readDotEnv(cwd) },
+    });
+  }
+
+  private voiceBackendState(cwd: string, provider: AcpProvider): VoiceBackendState {
+    const raw = this.voiceSetting<string>(cwd, "voiceBackend", "auto");
+    const preference: SttPreference = raw === "xai" || raw === "openai" ? raw : "auto";
+    const state = { provider, preference, hasXai: !!this.resolveSttApiKey(cwd, "xai"), hasOpenAi: !!this.resolveSttApiKey(cwd, "openai") };
+    return { ...state, backend: pickSttBackend(state), backends: {
+      grok: pickSttBackend({ ...state, provider: "grok" }) ?? null,
+      codex: pickSttBackend({ ...state, provider: "codex" }) ?? null,
+      claude: pickSttBackend({ ...state, provider: "claude" }) ?? null,
+    } };
+  }
+
   /** Tell the webview whether a voice API key is resolvable, so the mic button
    *  can show a "needs setup" hint up front instead of only failing on click. */
   /** Chat-panel zoom factor (1.0 = 100%). Clamped to the declared 60–300% range. */
@@ -14695,12 +14864,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.lastVoiceConfiguredByCwd.set(normalizeRepoPath(cwd), value);
   }
 
-  private voiceConfiguredMsg(cwd: string, value: boolean): Extract<HostMsg, { type: "voiceConfigured" }> {
+  private voiceConfiguredMsg(cwd: string, value: boolean, provider: AcpProvider = this.focused.provider): Extract<HostMsg, { type: "voiceConfigured" }> {
     return {
       type: "voiceConfigured",
       value,
       sendPhrase: this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE),
       keyterms: sanitizeVoiceKeyterms(this.voiceSetting(cwd, "voiceKeyterms", [])),
+      backendState: this.voiceBackendState(cwd, provider),
     };
   }
 
@@ -14735,14 +14905,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postVoiceConfigured(): void {
     const cwd = this.sessionCwd(this.focused);
-    const configured = !!this.resolveVoiceApiKey(cwd);
-    const localMsg = this.voiceConfiguredMsg(cwd, configured);
+    const configured = !!this.voiceBackendState(cwd, this.focused.provider).backend;
+    const localMsg = this.voiceConfiguredMsg(cwd, configured, this.focused.provider);
     // Refresh = rebuild: only the cwds this pass actually resolved stay in the
     // map. Point-writes between refreshes (voice-start failure paths) are
     // fresh by definition; accumulation is what made stale `true` immortal.
     this.lastVoiceConfiguredByCwd.clear();
     this.rememberVoiceConfigured(cwd, configured);
-    this.deliverVoiceConfigured("local", localMsg, () => this.postLocal(localMsg));
+    this.deliverVoiceConfigured("local", localMsg, () => {
+      this.postLocal(localMsg);
+      void this.settingsEditor?.webview.postMessage(localMsg);
+    });
     for (const clientId of this.remoteClients.clients()) {
       // Scope = the project whose config we resolved. Classification is "scope"
       // so a closed/re-homed tab cannot receive the prior project's prefs.
@@ -14757,9 +14930,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         ? this.sessionCwd(active)
         : this.remoteClients.cwdIfPresent(clientId);
       if (!remoteCwd) continue;
-      const remoteConfigured = !!this.resolveVoiceApiKey(remoteCwd);
+      const provider = active?.provider ?? this.defaultProviderForProject(remoteCwd);
+      const remoteConfigured = !!this.voiceBackendState(remoteCwd, provider).backend;
       this.rememberVoiceConfigured(remoteCwd, remoteConfigured);
-      const remoteMsg = this.voiceConfiguredMsg(remoteCwd, remoteConfigured);
+      const remoteMsg = this.voiceConfiguredMsg(remoteCwd, remoteConfigured, provider);
       this.deliverVoiceConfigured(`remote:${clientId}`, remoteMsg, () => {
         this.sendRemoteClient(clientId, remoteMsg, remoteCwd);
       });
@@ -14803,25 +14977,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** Show actionable guidance for setting up the voice API key. */
   private async promptVoiceKeySetup(): Promise<void> {
-    if (!this.connectedProviders().includes("grok")) {
-      const pick = await this.host.showInformationMessage(
-        "Voice needs Grok connected. It uses the same xAI account for speech-to-text.",
-        "Connect Grok",
-      );
-      if (pick === "Connect Grok") {
-        if (this.host.canOpenSettingsEditor) await this.openSettingsEditor("providers");
-      }
-      return;
-    }
-    const pick = await this.host.showErrorMessage(
-      "Voice control needs an xAI Speech-to-Text key. Sign in with `grok login` and it reuses that token automatically — or set grok.voiceApiKey, or GROK_VOICE_API_KEY / XAI_API_KEY in your workspace .env for a dedicated console.x.ai key.",
+    const pick = await this.host.showInformationMessage(
+      "Voice needs a credential for the selected backend. Set an OpenAI API key (grok.voiceOpenAiApiKey / OPENAI_API_KEY), or use an xAI key / Grok sign-in. Codex and ChatGPT sign-in do not include transcription API access.",
       "Open Settings",
       "Get a Key",
     );
     if (pick === "Open Settings") {
-      await this.host.openSettings("grok.voiceApiKey");
+      if (this.host.canOpenSettingsEditor) await this.openSettingsEditor("voice");
+      else await this.host.openSettings("grok.voice");
     } else if (pick === "Get a Key") {
-      await this.host.openExternal("https://console.x.ai");
+      await this.host.openExternal("https://platform.openai.com/api-keys");
     }
   }
 
@@ -14888,11 +15053,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async handleVoiceStart(session: Session = this.focused): Promise<void> {
-    const generation = ++this.voiceGeneration;
     const cwd = this.sessionCwd(session);
     const credentialCwd = this.sessionCwd(session);
-    const key = this.resolveVoiceApiKey(credentialCwd);
-    if (!key) {
+    const backend = this.voiceBackendState(credentialCwd, session.provider).backend;
+    const key = backend && this.resolveSttApiKey(credentialCwd, backend);
+    if (!key || !backend) {
       void this.promptVoiceKeySetup();
       this.postLocal({ type: "voiceError" });
       return;
@@ -14901,6 +15066,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.rejectVoiceStart();
       return;
     }
+    const generation = ++this.voiceGeneration;
     this.localVoiceCredentialCwd = credentialCwd;
     const cfg = this.host.getConfiguration("grok");
     // Resolve before spawning. A stripped GUI PATH, a Cellar directory pasted
@@ -14925,12 +15091,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const device = cfg.get<string>("voiceInputDevice", "") || undefined;
 
     // Streaming (default): live transcription over the STT WebSocket, so "grok
-    // send" can submit hands-free without a stop-click. Batch is the fallback.
+    // send" can submit hands-free without a stop-click. Batch is opt-in.
     if (cfg.get<boolean>("voiceStreaming", true)) {
-      await this.startVoiceStream(key, ffmpegPath, device, cwd, generation);
+      await this.startVoiceStream(key, ffmpegPath, device, cwd, generation, backend);
       return;
     }
 
+    this.voiceBatchCtx = { backend, key };
     const tmp = path.join(os.tmpdir(), `grok-voice-${Date.now()}.wav`);
     try {
       await this.voiceRecorder.start({ ffmpegPath, outputPath: tmp, device, log: (m) => this.host.appendLine(m) });
@@ -14973,6 +15140,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     device: string | undefined,
     cwd: string,
     generation: number,
+    backend: SttBackend,
   ): Promise<void> {
     const phrase = this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
     const keyterms = buildSttKeyterms(
@@ -14986,7 +15154,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       try { resolved = await resolveWindowsAudioDevice(ffmpegPath, (m) => this.host.appendLine(m)); } catch { /* streamer surfaces it */ }
     }
     if (generation !== this.voiceGeneration) return;
-    this.voiceStreamCtx = { key, ffmpegPath, device: resolved, phrase, keyterms, language, generation };
+    const model = this.voiceSetting(cwd, "voiceOpenAiModel", OPENAI_STT_MODEL);
+    this.voiceStreamCtx = { key, backend, model, ffmpegPath, device: resolved, phrase, keyterms, language, generation };
     this.voiceFinalizing = false;
     await this.openVoiceStream();
   }
@@ -15001,7 +15170,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // reusing a possibly-stale cached one (Codex #7). Keep the old key if the
     // fresh read comes back empty — it'll 401 with the source-aware guidance.
     const cwd = this.localVoiceCredentialCwd ?? this.workspaceRoot();
-    const fresh = this.resolveVoiceApiKey(cwd);
+    const fresh = this.resolveSttApiKey(cwd, ctx.backend);
     if (fresh) ctx.key = fresh;
     const streamer = new VoiceStreamer();
     this.voiceStreamer = streamer;
@@ -15029,7 +15198,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (!this.voiceFinalizing) {
         if (/\b(401|403)\b|rejected/i.test(e.message)) {
           void this.host.showErrorMessage(e.message, "Open Settings").then((pick) => {
-            if (pick === "Open Settings") void this.host.openSettings("grok.voiceApiKey");
+            if (pick === "Open Settings") void this.host.openSettings(ctx.backend === "openai" ? "grok.voiceOpenAiApiKey" : "grok.voiceApiKey");
           });
         } else {
           this.host.showErrorMessage(`Voice transcription failed: ${e.message}`);
@@ -15047,6 +15216,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await streamer.start({
         ffmpegPath: ctx.ffmpegPath,
         apiKey: ctx.key,
+        backend: ctx.backend,
+        model: ctx.model,
         device: ctx.device,
         keyterms: ctx.keyterms,
         language: ctx.language,
@@ -15070,7 +15241,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // (re-login or set a dedicated key); offer the settings shortcut.
         const pick = await this.host.showErrorMessage(msg, "Open Settings");
         if (pick === "Open Settings") {
-          await this.host.openSettings("grok.voiceApiKey");
+          await this.host.openSettings(ctx.backend === "openai" ? "grok.voiceOpenAiApiKey" : "grok.voiceApiKey");
         }
       } else {
         this.host.showErrorMessage(msg);
@@ -15102,18 +15273,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.voiceFinalizing = true;
     const streamer = this.voiceStreamer;
     this.voiceStreamer = undefined;
+    const ctx = this.voiceStreamCtx;
     this.voiceStreamCtx = undefined;
     if (!streamer) { this.voiceFinalizing = false; return; }
+    this.voiceStoppingStreamer = streamer;
     this.postLocal({ type: "voiceState", status: "transcribing" });
     let finalText = "";
-    try { finalText = await streamer.stop(); } catch { finalText = streamer.transcript; }
+    let completed = true;
+    try { finalText = await streamer.stop(); } catch (err) {
+      completed = false;
+      finalText = streamer.transcript;
+      if (generation === this.voiceGeneration) void this.host.showErrorMessage((err as Error).message);
+    }
+    if (this.voiceStoppingStreamer === streamer) this.voiceStoppingStreamer = undefined;
     if (generation !== this.voiceGeneration) {
       this.voiceFinalizing = false;
       return;
     }
     const cwd = this.localVoiceCredentialCwd ?? this.workspaceRoot();
-    const phrase = this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
-    const { text, send } = parseVoiceCommand(finalText, phrase);
+    const phrase = ctx?.phrase ?? this.voiceSetting(cwd, "voiceSendPhrase", DEFAULT_SEND_PHRASE);
+    const { text, send } = parseFinalVoiceCommand(finalText, completed ? streamer.finalizedTranscript : "", phrase);
     this.voiceFinalizing = false;
     this.releaseVoice(this.localVoiceCwd);
     this.localVoiceCwd = undefined;
@@ -15130,6 +15309,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private stopVoiceInput(session?: Session): void {
     if (!session || session === this.focused) {
       const wasActive =
+        !!this.localVoiceCwd ||
         !!this.voiceStreamer ||
         !!this.voiceStreamCtx ||
         this.voiceRecorder.active ||
@@ -15137,12 +15317,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         !!this.voiceTempPath;
       this.voiceGeneration += 1;
       this.voiceStreamer?.cancel();
+      this.voiceStoppingStreamer?.cancel();
+      this.voiceStoppingStreamer = undefined;
       this.voiceStreamer = undefined;
       this.voiceStreamCtx = undefined;
       this.voiceFinalizing = false;
       this.voiceRecorder.cancel();
       try { if (this.voiceTempPath) fs.unlinkSync(this.voiceTempPath); } catch { /* best effort */ }
       this.voiceTempPath = undefined;
+      this.voiceBatchCtx = undefined;
       this.releaseVoice(this.localVoiceCwd);
       this.localVoiceCwd = undefined;
       this.localVoiceCredentialCwd = undefined;
@@ -15157,7 +15340,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
-  /** Stop recording, transcribe via xAI STT, and send the text to the composer. */
+  /** Stop recording, transcribe with the pinned backend, and fill the composer. */
   private async handleVoiceStop(): Promise<void> {
     const generation = this.voiceGeneration;
     // Streaming path: finalize the live stream.
@@ -15166,11 +15349,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       return;
     }
     if (!this.voiceRecorder.active) {
+      if (this.localVoiceCwd) this.stopVoiceInput();
       this.postLocal({ type: "voiceError" });
       return;
     }
     const cwd = this.localVoiceCredentialCwd ?? this.workspaceRoot();
-    const key = this.resolveVoiceApiKey(cwd);
+    const batch = this.voiceBatchCtx;
+    const key = batch && (this.resolveSttApiKey(cwd, batch.backend) || batch.key);
     if (!key) {
       this.voiceRecorder.cancel();
       this.releaseVoice(this.localVoiceCwd);
@@ -15199,7 +15384,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const tempPath = this.voiceTempPath;
     this.postLocal({ type: "voiceState", status: "transcribing" });
     try {
-      const raw = await transcribeAudio(wavPath, key, (m) => this.host.appendLine(m));
+      const raw = await transcribeAudio(wavPath, key, (m) => this.host.appendLine(m), batch?.backend);
       if (generation !== this.voiceGeneration) return;
       // Strip a trailing "grok send" (configurable) so dictation can submit
       // hands-free. The webview inserts `text` and, if `send`, fires the send.
@@ -15219,9 +15404,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     } finally {
       try { if (tempPath) fs.unlinkSync(tempPath); } catch { /* best effort */ }
       if (this.voiceTempPath === tempPath) this.voiceTempPath = undefined;
-      this.releaseVoice(this.localVoiceCwd);
-      this.localVoiceCwd = undefined;
-      this.localVoiceCredentialCwd = undefined;
+      if (this.voiceBatchCtx === batch) {
+        this.voiceBatchCtx = undefined;
+        this.releaseVoice(this.localVoiceCwd);
+        this.localVoiceCwd = undefined;
+        this.localVoiceCredentialCwd = undefined;
+      }
     }
   }
 
@@ -15229,9 +15417,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     clientId: string,
     entry: RemoteVoiceEntry,
   ): Promise<void> {
-    const key = this.resolveVoiceApiKey(entry.credentialCwd);
-    if (!key) throw new Error("Voice control needs an xAI Speech-to-Text key on the host.");
-    const streamer = new PcmVoiceStreamer();
+    const key = this.resolveSttApiKey(entry.credentialCwd, entry.backend) || entry.key;
+    entry.key = key;
+    const streamer = createPcmVoiceStreamer(entry.backend);
     entry.streamer = streamer;
     const current = () => this.remoteVoice.get(clientId) === entry && entry.streamer === streamer;
     streamer.on("partial", (ev: { text: string; speechFinal: boolean }) => {
@@ -15241,7 +15429,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         { type: "voicePartial", text: ev.text },
         entry.credentialCwd,
       );
-      if (ev.speechFinal && entry.phrase) {
+      if (!entry.finalizing && ev.speechFinal && entry.phrase) {
         const parsed = parseVoiceCommand(ev.text, entry.phrase);
         if (parsed.send) void this.commitRemoteVoice(clientId, parsed.text);
       }
@@ -15256,6 +15444,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     await streamer.start({
       apiKey: key,
+      model: entry.model,
       keyterms: entry.keyterms,
       language: entry.language,
       log: (m) => this.host.appendLine(`[remote] ${m}`),
@@ -15271,23 +15460,23 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         return;
       }
     }
-    this.sendRemoteClient(clientId, { type: "voiceState", status: "listening" });
+    if (!entry.finalizing) this.sendRemoteClient(clientId, { type: "voiceState", status: "listening" });
   }
 
   private async handleRemoteVoiceStart(clientId: string, session: Session): Promise<void> {
     const credentialCwd = this.sessionCwd(session);
-    if (!this.resolveVoiceApiKey(credentialCwd)) {
+    const backend = this.voiceBackendState(credentialCwd, session.provider).backend;
+    const key = backend && this.resolveSttApiKey(credentialCwd, backend);
+    if (!backend || !key) {
       this.rememberVoiceConfigured(credentialCwd, false);
-      const payload = this.voiceConfiguredMsg(credentialCwd, false);
+      const payload = this.voiceConfiguredMsg(credentialCwd, false, session.provider);
       this.deliverVoiceConfigured(`remote:${clientId}`, payload, () => {
         this.sendRemoteClient(clientId, payload, credentialCwd);
       });
       this.sendRemoteClient(clientId, { type: "voiceError" });
       this.sendRemoteClient(clientId, {
         type: "error",
-        text: this.connectedProviders().includes("grok")
-          ? "Voice control needs an xAI Speech-to-Text key on the host."
-          : "Voice needs Grok connected. It uses the same xAI account for speech-to-text.",
+        text: "Voice needs a credential for the selected backend on the host: an OpenAI API key, or an xAI key / Grok sign-in. Codex sign-in does not include transcription API access.",
       });
       return;
     }
@@ -15311,7 +15500,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     entry = {
       credentialCwd,
       session,
-      streamer: new PcmVoiceStreamer(),
+      streamer: createPcmVoiceStreamer(backend),
+      backend,
+      key,
+      model: this.voiceSetting(credentialCwd, "voiceOpenAiModel", OPENAI_STT_MODEL),
       ingress,
       phrase,
       keyterms,
@@ -15320,7 +15512,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     };
     this.remoteVoice.set(clientId, entry);
     try {
-      await this.startRemotePcm(clientId, entry);
+      await (entry.starting = this.startRemotePcm(clientId, entry));
     } catch (e) {
       if (this.remoteVoice.get(clientId) !== entry) return;
       this.failRemoteVoice(clientId, (e as Error).message);
@@ -15362,7 +15554,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       entry.credentialCwd,
     );
     try {
-      await this.startRemotePcm(clientId, entry);
+      await (entry.starting = this.startRemotePcm(clientId, entry));
     } catch (e) {
       if (this.remoteVoice.get(clientId) !== entry) return;
       this.failRemoteVoice(clientId, (e as Error).message);
@@ -15374,19 +15566,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // A cancelled stream can still emit an ended/error callback while its stop
     // promise is settling. Its entry identity is the generation guard; do not
     // turn that late completion into a new client-visible event.
-    if (!entry || entry.finalizing) return;
+    if (!entry) return;
+    if (cancel) { this.dropRemoteVoice(clientId); return; }
+    if (entry.finalizing) return;
     entry.finalizing = true;
-    entry.ingress.close();
-    this.sendRemoteClient(clientId, { type: "voiceState", status: cancel ? "idle" : "transcribing" });
+    this.sendRemoteClient(clientId, { type: "voiceState", status: "transcribing" });
     let transcript = "";
-    if (cancel) entry.streamer.cancel();
-    else {
-      try { transcript = await entry.streamer.stop(); } catch { transcript = entry.streamer.transcript; }
+    let completed = true;
+    try { await entry.starting; } catch { /* start path reports the failure */ }
+    if (this.remoteVoice.get(clientId) !== entry) return;
+    entry.ingress.close();
+    try { transcript = await entry.streamer.stop(); } catch (err) {
+      completed = false;
+      transcript = entry.streamer.transcript;
+      if (this.remoteVoice.get(clientId) === entry) this.sendRemoteClient(clientId, { type: "error", text: (err as Error).message });
     }
     if (this.remoteVoice.get(clientId) !== entry) return;
     this.remoteVoice.delete(clientId);
-    if (cancel) return;
-    const { text, send } = parseVoiceCommand(transcript, entry.phrase);
+    const { text, send } = parseFinalVoiceCommand(transcript, completed ? entry.streamer.finalizedTranscript : "", entry.phrase);
     if (!text && !send) {
       this.sendRemoteClient(clientId, { type: "voiceError" });
       return;
@@ -15538,6 +15735,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Host ownership begins only after the snapshot's generation check. Re-focus
     // can replay the card without consuming this pending request.
     session.pendingExitPlans.set(req.id, { planText: plan });
+    this.syncHumanWait(session);
     session.lastPlanText = "";
     this.emit(session, {
       type: "exitPlanRequest",
@@ -15611,8 +15809,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * because only the HOST knows whether files are at stake — hence the
    * round-trip.
    *
-   * Resolves false if the webview goes away before answering (reload, session
-   * teardown): a lost confirm must fail closed, never silently revert files.
+   * Session teardown/replacement resolves false: a lost confirm must fail
+   * closed, never silently revert files. The first answer from any surface
+   * holding the session dismisses the modal on every other surface.
    */
   private confirmInChat(
     session: Session,
@@ -15623,6 +15822,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.pendingConfirms.set(id, { session, resolve });
       this.emit(session, { type: "uiConfirmRequest", id, ...opts });
     });
+  }
+
+  private drainPendingConfirms(session: Session): void {
+    for (const [requestId, pending] of this.pendingConfirms) {
+      if (pending.session !== session) continue;
+      this.pendingConfirms.delete(requestId);
+      this.emit(session, { type: "uiConfirmResolved", requestId });
+      pending.resolve(false);
+    }
   }
 
   private async createPlanReviewSnapshot(plan: string, sessionId?: string): Promise<{ path: string; name: string }> {
@@ -16401,6 +16609,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // the push that makes the row's position true rather than asserted.
       this.noteSessionActivity(session);
       session.authRecoveryTried = false; // a clean turn re-arms token auto-recovery
+      // A served turn is the only proof the account works that this app ever
+      // actually has. It is what now clears the flag the two sites above stopped
+      // clearing, and it is self-healing: the first reply after a sign-in takes
+      // the card down, and nothing takes it down before one arrives.
+      this.setProviderNeedsLogin(session.provider, false);
       this.maybeGenerateTitle(session);
       this.postSessionName(session);
     } catch (err) {
@@ -16485,7 +16698,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const credential = session.client?.isCredentialError(err) === true || isCredentialError(err);
     if (!credential && !isAuthErrorText(errorText)) return false;
     const resumeId = beginAuthRecovery(session);
-    if (!resumeId) return false;
+    if (!resumeId) {
+      // One recovery per failure streak, so every send after the first declines
+      // here -- and those are the ones a person makes while wondering why
+      // nothing works. Strict classification only: entitlement wording must
+      // never label an account signed-out, because a sign-in cannot fix it.
+      if (credential) this.setProviderNeedsLogin(session.provider, true);
+      return false;
+    }
     if (!credential) {
       this.host.appendLine(`[auth] reloading session without resending: ${errorText}`);
       await this.startSession(resumeId, session);
@@ -16501,8 +16721,27 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const gen = session.gen;
     if (gen !== session.gen) return true;
 
-    session.userMessageCount += 1;
-    this.emit(session, { type: "userMessage", text: displayText, chips });
+    // The restart above wiped the transcript and replayed it from the agent's
+    // own record, so this bubble may already be back. Claude persists the user
+    // turn BEFORE the call it then refuses, and `session/load` republishes it as
+    // a user_message_chunk (the userMessageChunk handler forwards those while
+    // replaying, by design) -- so re-emitting unconditionally put the prompt on
+    // screen twice, which is what the owner saw as "doubling my prompts".
+    //
+    // `replayUserRaw` is the replay's own accumulator for the user message it
+    // is currently in, and `inUserMessage` is still true only if the transcript
+    // ENDED on a user turn -- a reply of any kind clears it. A transcript
+    // ending on our own text is precisely the refused turn.
+    //
+    // An inexact match re-emits, which is today's behaviour: the failure
+    // direction is a duplicated bubble, never a prompt the person cannot see.
+    const replayRestoredIt = session.inUserMessage
+      && session.replayUserRaw.trim() === displayText.trim();
+    if (!replayRestoredIt) {
+      // The replay already counted the turn it restored; only count ours.
+      session.userMessageCount += 1;
+      this.emit(session, { type: "userMessage", text: displayText, chips });
+    }
     this.emit(session, { type: "agentStart" });
     // The resend is a turn in its own right — it gets its own token, and the
     // outer turn's `finally` can no longer end it (the tokens differ).
@@ -16520,6 +16759,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.noteLiveTurnEnded(session);
       this.setStatus(session, "done");
       session.authRecoveryTried = false; // recovered — re-arm for a future expiry
+      this.setProviderNeedsLogin(session.provider, false); // and the token really is good
       this.maybeGenerateTitle(session);
       this.postSessionName(session);
     } catch (err2) {
@@ -16548,6 +16788,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.emit(session, { type: "agentError", text: errorDetail(e2) });
         this.noteLiveTurnEnded(session);
         this.setStatus(session, "error");
+        // The account flag, not only the overlay. The overlay is the empty-state
+        // card, and the renderer deliberately refuses to paint it over a live
+        // conversation (welcomeHoldActive) -- which is exactly where a mid-turn
+        // expiry happens, so on a phone the whole guidance was a red line of the
+        // vendor's own prose. This flag is what every view already reads to turn
+        // its affordances into a sign-in, and nothing was setting it here.
+        this.setProviderNeedsLogin(session.provider, true);
         this.post({ type: "onboarding", state: this.onboardingForSession(session) });
       } else {
         // Entitlement/billing wording (or anything else) on a fresh process is
@@ -16908,6 +17155,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  the mode picker on reconnect. */
   private static readonly TRANSIENT_TYPES = new Set([
     "restoreComposer", "focusInput", "findInSession", "openModePopover",
+    "uiConfirmRequest", "uiConfirmResolved",
+    "subscriptionUsage",
     // Replayed mid-buffer it would stamp the then-current footer, not the live
     // one. `sessionUiSnapshot` restores eligibility after historyReplay ends.
     "turnFeedbackAck",
@@ -17113,7 +17362,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const clientIds = this.remoteClients.clientsForActiveValue(session);
     if (clientIds.length === 0) return;
-    const snapshot = bracketRemoteSnapshot(session.buffer);
+    const snapshot = [
+      ...bracketRemoteSnapshot(session.buffer),
+      { type: "subscriptionUsage" as const, windows: session.subscriptionUsage?.snapshot() ?? [] },
+    ];
     for (const clientId of clientIds) {
       for (const message of snapshot) this.sendRemoteClient(clientId, message, scope);
     }
@@ -17265,7 +17517,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         session.cwd = cwd;
         session.activeSessionId = id;
         // sessionId is required for sessionReadyForPrompt (flush + send).
-        session.client = { dispose() {}, sessionId: id } as AcpClient;
+        session.client = { dispose() {}, setHumanWaitActive(_active: boolean) {}, sessionId: id } as AcpClient;
         session.hasHistory = hasHistory;
         session.chips = chips;
         session.buffer.push(...messages);
@@ -17276,7 +17528,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const session = this.newLocalSession();
         session.cwd = cwd;
         session.activeSessionId = id;
-        session.client = { dispose() {}, sessionId: id } as AcpClient;
+        session.client = { dispose() {}, setHumanWaitActive(_active: boolean) {}, sessionId: id } as AcpClient;
         session.hasHistory = true;
         this.pool.add(session);
       },
@@ -17302,7 +17554,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         session.cwd = cwd;
         session.activeSessionId = id;
         // Priming: client may exist without a session id (spawn window).
-        session.client = { dispose() {} } as AcpClient;
+        session.client = { dispose() {}, setHumanWaitActive(_active: boolean) {} } as AcpClient;
         session.priming = true;
         session.queuedSends = [{ text: queuedText, chips: [] }];
         session.queuedSendRequiresRelay = true;
@@ -17321,6 +17573,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           sessionId: id,
           availableCommands: [],
           dispose() {},
+          setHumanWaitActive(_active: boolean) {},
           prompt: async (blocks: Parameters<AcpClient["prompt"]>[0]) => {
             prompts += 1;
             lastBlocks = blocks;
@@ -17362,6 +17615,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           cancel: () => { cancelled = true; },
         } as PcmVoiceStreamer;
         this.remoteVoice.set(clientId, {
+          backend: "xai", key: "test", model: OPENAI_STT_MODEL,
           credentialCwd: this.sessionCwd(session),
           session,
           streamer,
@@ -17841,6 +18095,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         { type: "clearMessages" },
         ...(identity ? [identity] : []),
         ...bracketRemoteSnapshot(session.buffer),
+        { type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] },
       ];
       for (const m of replay) {
         this.sendRemoteSession(session, m);
@@ -18219,6 +18474,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private detachClient(session: Session): AcpClient | undefined {
     const client = session.client;
     session.gen++;
+    this.clearPendingHumanRequests(session);
+    this.drainPendingConfirms(session);
     session.client = undefined;
     session.turnToken = undefined;
     // ITS COMMANDS GO WITH IT.
@@ -18359,7 +18616,45 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Pending {@link refreshSessionOrderAfterTurn} timers, so dispose can clear them. */
   private turnOrderTimers = new Set<ReturnType<typeof setTimeout>>();
 
-  /** True when any live pool member is mid-turn or waiting on the user. */
+  private syncHumanWait(session: Session): void {
+    session.client?.setHumanWaitActive(
+      session.pendingQuestions.size > 0
+      || session.pendingPermissions.size > 0
+      || session.pendingExitPlans.size > 0,
+    );
+  }
+
+  private closeQuestionsForToolCall(
+    session: Session,
+    call: { toolCallId?: unknown; status?: unknown } | null | undefined,
+  ): void {
+    const toolCallId = call?.toolCallId;
+    if (typeof toolCallId !== "string" || !toolCallId
+      || (call?.status !== "completed" && call?.status !== "failed")) return;
+    let closed = false;
+    for (const [requestId, pendingToolCallId] of session.pendingQuestions) {
+      if (pendingToolCallId !== toolCallId) continue;
+      session.pendingQuestions.delete(requestId);
+      this.emit(session, { type: "questionResolved", requestId, outcome: "closed" });
+      closed = true;
+    }
+    if (!closed) return;
+    // Answers and CLI abandonment produce the same terminal status. It proves
+    // closure, not its reason; neither the tool's prose nor a timeout is needed.
+    this.syncHumanWait(session);
+    if (turnIsInFlight(session)) this.noteAnswered(session);
+  }
+
+  private clearPendingHumanRequests(session: Session): void {
+    for (const requestId of session.pendingQuestions.keys()) {
+      this.emit(session, { type: "questionResolved", requestId, outcome: "closed" });
+    }
+    session.pendingQuestions.clear();
+    session.pendingPermissions.clear();
+    session.pendingExitPlans.clear();
+    this.syncHumanWait(session);
+  }
+
   /**
    * The agent was waiting on a person and now it is not.
    *
@@ -18384,6 +18679,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.refreshKeepAwake();
   }
 
+  /** True when any live pool member is mid-turn or waiting on the user. */
   private anyTurnInFlight(): boolean {
     for (const s of this.pool) {
       if (hasLiveWork(s)) return true;
@@ -18703,6 +18999,65 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const cwd = this.sessionCwd(session);
     const usage = readContextUsage({ fs: defaultFs, grokHome: resolveGrokHome(process.env), cwd, id });
     if (usage) this.emit(session, { type: "contextUsage", used: usage.used, window: usage.window });
+  }
+
+  private subscriptionUsageCaches?: Map<string, SubscriptionUsageCache>;
+
+  private bindSubscriptionUsage(session: Session, env: NodeJS.ProcessEnv): void {
+    const provider = session.provider;
+    const cwd = this.sessionCwd(session);
+    const key = subscriptionCredentialContext(provider, env);
+    const caches = this.subscriptionUsageCaches ??= new Map();
+    // Claude can authenticate via an opaque OS keychain. Keep its observations
+    // process-local so a replacement cannot inherit a different login's window.
+    // Grok and Codex both write their login to a file the key already hashes,
+    // so a swap changes the key and the shared cache is safe for them.
+    let cache = provider === "claude" ? new SubscriptionUsageCache() : caches.get(key);
+    if (!cache) caches.set(key, cache = new SubscriptionUsageCache());
+    session.subscriptionUsage = new SubscriptionUsageBinding(cache, key, () =>
+      subscriptionCredentialContext(provider, provider === "grok"
+        ? { ...process.env, ...this.readDotEnv(cwd) } : process.env));
+  }
+
+  private invalidateSubscriptionUsage(provider: AcpProvider): void {
+    for (const [key, cache] of this.subscriptionUsageCaches ?? []) {
+      if (key.startsWith(`${provider}:`)) {
+        cache.invalidate();
+        this.subscriptionUsageCaches!.delete(key);
+      }
+    }
+    const sessions = new Set([this.focused, ...(this.pool ?? []),
+      ...(this.remoteClients?.clients() ?? []).map((id) => this.remoteClients.active(id))]);
+    for (const session of sessions) {
+      if (session?.provider !== provider || !session.subscriptionUsage) continue;
+      session.subscriptionUsage.invalidate();
+      this.publishSubscriptionUsage(session);
+    }
+  }
+
+  private publishSubscriptionUsage(session: Session): void {
+    this.emit(session, { type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] });
+  }
+
+  private async refreshSubscriptionUsage(session: Session): Promise<void> {
+    const binding = session.subscriptionUsage;
+    const client = session.client;
+    this.publishSubscriptionUsage(session);
+    if (!binding) return;
+    // Claude has no pull at all: its windows arrive on the rate-limit event
+    // that rides a turn, so `observe()` is the only writer and there is
+    // nothing to refresh here.
+    if (session.provider === "codex") {
+      // A file read, not an RPC — Codex's adapter does not forward the account
+      // windows it receives, so the rollout is the only structured source.
+      await binding.refresh(async () => readCodexSubscriptionWindows({
+        codexHome: resolveCodexHome(process.env),
+      }));
+    } else if (session.provider === "grok") {
+      if (!client?.sessionId) return;
+      await binding.refresh(() => client.getSubscriptionUsage());
+    } else return;
+    if (session.client === client && session.subscriptionUsage === binding) this.publishSubscriptionUsage(session);
   }
 
   /** Publish a control-plane session/info snapshot without touching accounting. */
@@ -20408,9 +20763,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       snap.push({ type: "submitQueuedSend", ...session.queuedSendDispatch });
     }
     const voiceCwd = sessionCwdOk ? sessionCwd : this.workspaceRoot();
-    const voiceConfigured = !!this.resolveVoiceApiKey(voiceCwd);
+    const voiceProvider = sessionCwdOk && session ? session.provider : this.defaultProviderForProject(voiceCwd);
+    const voiceConfigured = !!this.voiceBackendState(voiceCwd, voiceProvider).backend;
     this.rememberVoiceConfigured(voiceCwd, voiceConfigured);
-    const voicePayload = this.voiceConfiguredMsg(voiceCwd, voiceConfigured);
+    const voicePayload = this.voiceConfiguredMsg(voiceCwd, voiceConfigured, voiceProvider);
     this.seedPostedVoiceConfigured(`remote:${clientId}`, voicePayload);
     snap.push(voicePayload);
     const activeVoice = this.remoteVoice.get(clientId);
@@ -20585,16 +20941,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         processingSound: cfg.get("processingSound", false),
         readRepliesAloud: cfg.get("readRepliesAloud", false),
         summarizeRepliesAloud: cfg.get("summarizeRepliesAloud", true),
-        voiceConfigured: this.lastVoiceConfiguredByCwd.get(
-          normalizeRepoPath(this.workspaceRoot() || ""),
-        ) === true,
+        voiceConfigured: !!this.voiceBackendState(this.sessionCwd(this.focused), this.focused.provider).backend,
+        voiceBackendState: this.voiceBackendState(this.sessionCwd(this.focused), this.focused.provider),
         voiceSendPhrase: this.voiceSetting(
-          this.workspaceRoot(),
+          this.sessionCwd(this.focused),
           "voiceSendPhrase",
           DEFAULT_SEND_PHRASE,
         ),
         voiceKeyterms: sanitizeVoiceKeyterms(
-          this.voiceSetting(this.workspaceRoot(), "voiceKeyterms", []),
+          this.voiceSetting(this.sessionCwd(this.focused), "voiceKeyterms", []),
         ),
         telemetryEnabled: cfg.get("telemetry.enabled", true),
         thumbsFeedback: cfg.get("thumbsFeedback", false),
@@ -20657,12 +21012,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 <body class="settings-page">
   <div id="settings-root"></div>
   <script nonce="${nonce}">window.__grokSettingsBoot = ${bootJson};</script>
+  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
   <script nonce="${nonce}" src="${mediaUri("settings.js")}"></script>
   <script nonce="${nonce}">
     (function () {
       var vscode = acquireVsCodeApi();
       var boot = window.__grokSettingsBoot || {};
       var tts = !!(window.speechSynthesis && window.SpeechSynthesisUtterance);
+      window.GrokVoiceSettings.install(window.GrokSettings);
       var surface = window.GrokSettings.mount(document.getElementById("settings-root"), {
         snapshot: boot.snapshot,
         env: Object.assign({ ttsAvailable: tts }, boot.env || {}),
@@ -20674,6 +21031,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       window.addEventListener("message", function (e) {
         var msg = e.data;
         if (!msg || !msg.type || !surface) return;
+        if (msg.type === "voiceConfigured") {
+          surface.update({ voiceConfigured: !!msg.value, voiceBackendState: msg.backendState,
+            voiceSendPhrase: msg.sendPhrase, voiceKeyterms: msg.keyterms });
+        }
         if (msg.type === "grokUpdateStatus") {
           var next = { grokUpdate: {
             current: msg.current, latest: msg.latest,

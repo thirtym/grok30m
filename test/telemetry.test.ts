@@ -1108,6 +1108,8 @@ describe("sidebar session_start wiring", () => {
     sidebar.focused.cwd = "/repo";
     sidebar.sessionCwd = vi.fn(() => "/repo");
     sidebar.resolveVoiceApiKey = vi.fn(() => "key");
+    sidebar.defaultProviderForProject = () => "grok";
+    sidebar.readDotEnv = () => ({});
     sidebar.voiceSetting = vi.fn((_c: string, _k: string, fb: unknown) => fb);
     sidebar.postLocal = vi.fn();
     sidebar.remoteClients = new RemoteClientState<Session>("/repo");
@@ -1124,6 +1126,8 @@ describe("sidebar session_start wiring", () => {
     sidebar.focused.cwd = "/desk";
     sidebar.sessionCwd = vi.fn((session: Session) => session.cwd || "/desk");
     sidebar.resolveVoiceApiKey = vi.fn(() => "key");
+    sidebar.defaultProviderForProject = () => "grok";
+    sidebar.readDotEnv = () => ({});
     sidebar.voiceSetting = vi.fn((_c: string, _k: string, fb: unknown) => fb);
     sidebar.postLocal = vi.fn();
     sidebar.sendRemoteClient = vi.fn();

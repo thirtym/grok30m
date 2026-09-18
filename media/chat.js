@@ -10,6 +10,7 @@
       setAppPurpose: ["appPurpose", "this app to " + (message.value === "coding" ? "Coding" : "Knowledge work")],
       setVoiceSendPhrase: ["voiceSendPhrase", "the voice send phrase to “" + message.value + "”"],
       setVoiceKeyterms: ["voiceKeyterms", "voice keyterms to “" + (Array.isArray(message.value) ? message.value.join(", ") : "") + "”"],
+      setVoiceBackend: ["voiceBackend", "the transcription backend to “" + message.value + "”"],
       setTelemetryEnabled: ["telemetryEnabled", "anonymous analytics to " + (message.value ? "on" : "off")],
       setThumbsFeedback: ["thumbsFeedback", "feedback buttons to " + (message.value ? "on" : "off")],
     };
@@ -68,6 +69,7 @@
       if (msg.type === "voiceConfigured") {
         if (pending.field === "voiceSendPhrase") value = msg.sendPhrase;
         if (pending.field === "voiceKeyterms") value = msg.keyterms;
+        if (pending.field === "voiceBackend") value = msg.backendState && msg.backendState.preference;
       }
       if (msg.type === "repos" && pending.message.cwd) {
         const repo = (msg.entries || []).find((entry) => sameCwd(entry.cwd, pending.message.cwd));
@@ -537,6 +539,9 @@
 
   const state = {
     welcomeVisible: true,
+    // Which provider the composer's sign-in card is currently offering, so the
+    // moment it clears can be told from the moment it is merely replaced.
+    signInCardFor: "",
     currentModelId: null,
     activeProvider: "grok",
     providersKnown: false,
@@ -631,6 +636,10 @@
     // running turn hears you now, and it does not. See steerableProvider().
     lastTurnUsage: null, // last prompt's billing split (#53), for the donut popover
     sessionUsage: null, // session-cumulative billing — summed by the host, not grok
+    subscriptionWindows: [], // latest account capacity; never part of the transcript
+    // Whether this HOST has ever sent `subscriptionUsage`. A host property, not
+    // a session one, so a new conversation does not un-learn it.
+    subscriptionUsageKnown: false,
     // Structured session/info addends, bound to the `used` they arrived with.
     // Occupancy-only frames keep this; an open popover re-fetches session/info.
     contextBreakdown: null,
@@ -2140,6 +2149,7 @@
     // by the host. Render the cached snapshot immediately, then re-render when
     // a fresh structured response arrives.
     vscode.postMessage({ type: "refreshContextDetails" });
+    vscode.postMessage({ type: "refreshSubscriptionUsage" });
     renderContextPopover();
   }
 
@@ -2243,7 +2253,89 @@
     }
     contextPopover.appendChild(act);
 
-    // KNOWLEDGE WORK STOPS HERE: the number and the action on it, nothing else.
+    const subscription = document.createElement("section");
+    subscription.className = "subscription-usage";
+    subscription.setAttribute("aria-label", "Subscription usage across your account");
+    section("Subscription usage · account", subscription);
+    // Lines, not paragraphs: several notes about ONE meter are one remark on
+    // several lines, and giving each its own element gave each its own gap.
+    const note = (text, parent = subscription) => {
+      const el = document.createElement("div");
+      el.className = "popover-fineprint";
+      const lines = Array.isArray(text) ? text : [text];
+      lines.forEach((line, i) => {
+        if (i) el.appendChild(document.createElement("br"));
+        el.appendChild(document.createTextNode(line));
+      });
+      parent.appendChild(el);
+    };
+    const validDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
+    const windows = state.subscriptionWindows.filter((window) =>
+      window && typeof window.usedPercent === "number" && Number.isFinite(window.usedPercent)
+      && window.usedPercent >= 0 && window.usedPercent <= 100
+      && typeof window.label === "string" && window.label.trim()
+      && typeof window.periodType === "string" && window.periodType.trim()
+      && validDate(window.observedAt)
+      && (window.periodStart === undefined || validDate(window.periodStart))
+      && (window.periodEnd === undefined || validDate(window.periodEnd)));
+    if (!windows.length) {
+      // Claude has no pull: its account window rides the rate-limit event that
+      // comes back with a reply, so a session that has not spoken yet has
+      // nothing to show and "nothing reported" reads as a broken panel. The
+      // first version of this said so in two clauses and wrapped to three lines
+      // on a phone; WHY Claude has nothing is our problem, not the reader's, and
+      // what they can do about it is the whole message.
+      note(state.activeProvider === "claude"
+        ? "Fills in after the next reply."
+        : "No subscription usage reported yet.");
+    }
+    const formatPercent = (value) => new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value);
+    const formatDate = (value) => new Date(value).toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    });
+    for (const window of windows) {
+      const row = document.createElement("div");
+      row.className = "subscription-window";
+      info(window.label, `${formatPercent(window.usedPercent)}% used · ${formatPercent(100 - window.usedPercent)}% left`, row);
+      const meter = document.createElement("div");
+      meter.className = "subscription-fullness";
+      meter.setAttribute("role", "meter");
+      meter.setAttribute("aria-label", `${window.label} subscription used`);
+      meter.setAttribute("aria-valuemin", "0");
+      meter.setAttribute("aria-valuemax", "100");
+      meter.setAttribute("aria-valuenow", String(window.usedPercent));
+      const fill = document.createElement("i");
+      fill.style.width = window.usedPercent + "%";
+      meter.appendChild(fill);
+      row.appendChild(meter);
+      note([window.periodEnd
+        ? `${Date.parse(window.periodEnd) > Date.now() ? "Resets" : "Reported reset"} ${formatDate(window.periodEnd)}`
+        : "Reset time not reported.",
+      `Observed ${formatDate(window.observedAt)}`], row);
+      subscription.appendChild(row);
+    }
+    if (windows.length && state.activeProvider === "claude") note("Latest reported window; other limits may apply.");
+    // CAPABILITY DETECTION: did the frame that feeds this section ever arrive?
+    //
+    // The phone's client is always as new as the relay deploy while the host is
+    // whatever the person installed, so this section meets hosts that never
+    // heard of `subscriptionUsage`. Those drop `refreshSubscriptionUsage` in
+    // silence, and the section then sat there promising numbers that could not
+    // come -- telling a Claude user to wait for a reply that cannot fill it
+    // (review, 2026-09-14). A host that DOES know the frame sends it at session
+    // start with empty windows, so its arrival is the honest test and the
+    // deliberate empty states above survive it.
+    //
+    // The gate is on the APPEND, not an early return: the two lines that make
+    // this popover visible are the last thing the function does, and the
+    // comment further down records what returning early from here cost last
+    // time. Building a handful of detached nodes and dropping them is the
+    // cheaper mistake.
+    if (state.subscriptionUsageKnown) contextPopover.appendChild(subscription);
+
+    // KNOWLEDGE WORK STOPS HERE: the numbers and the action on them, nothing
+    // else. Context occupancy and account capacity both answer "can I keep
+    // going?", which is a question in either purpose.
     //
     // Everything below is the technical account — system prompt, reasoning
     // overhead, tool definitions, per-turn token and cost rows. That is the
@@ -2258,7 +2350,8 @@
     // function does, so returning early skipped them and the donut simply did
     // nothing in the default mode. Found by review; my own test read
     // textContent off the hidden element and passed, which is the same mistake
-    // as proving a package exists instead of proving the thing works.
+    // as proving a package exists instead of proving the thing works. Anything
+    // added ABOVE this line inherits that trap — assert on a SHOWN popover.
     if (!isCodingPurpose()) { showContextPopover(); return; }
 
     // Snapshot addends are internally consistent (overhead from snapshot.used).
@@ -2517,6 +2610,7 @@
     return new Promise((resolve) => {
       const overlay = document.createElement("div");
       overlay.className = "confirm-overlay";
+      if (opts.requestId !== undefined) overlay.dataset.confirmReqId = String(opts.requestId);
       const panel = document.createElement("div");
       panel.className = "confirm-panel";
       const title = document.createElement("div");
@@ -2535,12 +2629,17 @@
       cancelBtn.type = "button";
       cancelBtn.className = "confirm-btn";
       cancelBtn.textContent = "Cancel";
+      let settled = false;
       const done = (v) => {
+        if (settled) return;
+        settled = true;
         document.removeEventListener("keydown", onKey, true);
         overlay.remove();
         unmarkModalAbove(overlay);
-        resolve(opts.booleanResult ? v === "confirm" : v);
+        resolve(v === undefined ? undefined : opts.booleanResult ? v === "confirm" : v);
       };
+      // Host consumption dismisses without sending another decision.
+      overlay._resolveConfirm = () => done(undefined);
       const onKey = (e) => {
         if (e.key === "Escape") { e.stopPropagation(); done("cancel"); }
       };
@@ -3093,6 +3192,7 @@
       voiceConfigured: !!state.voiceConfigured,
       voiceSendPhrase: typeof state.voiceSendPhrase === "string" ? state.voiceSendPhrase : "grok send",
       voiceKeyterms: Array.isArray(state.voiceKeyterms) ? state.voiceKeyterms : [],
+      voiceBackendState: state.voiceBackendState,
       telemetryEnabled: state.telemetryEnabled,
       thumbsFeedback: !!state.thumbsFeedback,
       promptNav: !!state.promptNav,
@@ -3282,6 +3382,12 @@
       }
       return false;
     },
+    // Not a layer, and deliberately not part of `depth`/`dismissTop`: a toolbar
+    // popover does not own Back. The shell needs it because a phone opens the
+    // projects drawer OVER the conversation, and a model/mode/context popover
+    // left hanging there belongs to the screen underneath — the drawer is the
+    // page's own layer, so only the page knows it opened.
+    closePopovers() { closePopovers(); },
   };
   let lastLayerDepth = window.afkpilotLayers.depth;
   function reportLayerDepth() {
@@ -3328,6 +3434,7 @@
 
   function openSettingsOverlay(opener, opts) {
     const api = window.GrokSettings;
+    window.GrokVoiceSettings?.install(api);
     if (!api || typeof api.mount !== "function") return;
     closeSettingsOverlay();
     closePopovers();
@@ -9154,7 +9261,8 @@
     "userMessage", "agentStart", "thoughtChunk", "messageChunk", "media",
     "userMessageChunk", "historyBatch", "toolCall", "toolCallUpdate",
     "permissionRequest", "permissionOptions", "permissionResolved",
-    "exitPlanRequest", "planResolved", "questionRequest", "planNotice",
+    "exitPlanRequest", "planResolved", "questionRequest", "questionResolved", "planNotice",
+    "subscriptionUsage",
     "autoCompactNotice", "planBlocked", "promptComplete", "commandOutput",
     "agentReset", "agentError", "agentEnd", "exit", "sessionContext",
     "xaiNotification", "subagentUpdate", "childStream", "runProgress",
@@ -9471,7 +9579,9 @@
     state.historyEventCount = 0;
     state.lastTurnUsage = null;
     state.sessionUsage = null;
+    state.subscriptionWindows = [];
     state.contextBreakdown = null;
+    if (!contextPopover.hidden) renderContextPopover();
     state.suppressReplayTurn = false;
     state.skipUserBubble = false;
     cancelPendingSpeech();
@@ -12402,6 +12512,116 @@
     el.append(title, body, btn);
   }
 
+  /**
+   * A lapsed account is only actionable if the person is told where to act.
+   *
+   * "Sign in" normally lives on the empty-state welcome card, and that card
+   * deliberately refuses to paint over a live conversation (welcomeHoldActive)
+   * -- which is exactly where a token expires. What the owner saw on a phone
+   * was the vendor's own "Authentication required" in red and nothing else: no
+   * account row, no button, no mention of signing in. So the offer goes where
+   * the failure is, directly above the composer that is about to fail again.
+   *
+   * The composer is NOT frozen the way a superseded session freezes it. This
+   * flag is our bookkeeping about somebody else's credential; locking a person
+   * out of their own conversation over it is worse than one more refused send.
+   */
+  /**
+   * "Your sign-in worked", where the person is actually looking.
+   *
+   * Nothing else says it: `providerState` only un-hides affordances, and the
+   * agent's refusal stays on screen until something else is appended.
+   */
+  function noteSignInRecovered(provider) {
+    // An empty transcript is already telling the whole story through the
+    // onboarding panel -- and `addPlanNotice` hides that panel to make room,
+    // which would trade a confirmation for the connect UI itself.
+    if (state.welcomeVisible) return;
+    addPlanNotice(providerDisplayName(provider) + " is signed in again.", ICON.check);
+  }
+
+  function renderProviderSignInCard() {
+    const composer = document.querySelector(".composer");
+    let el = document.getElementById("provider-signin-card");
+    const provider = state.providersKnown && providerNeedsLogin(state.activeProvider)
+      ? state.activeProvider : "";
+    // The card going away because the account was RENEWED is the only proof the
+    // sign-in worked that this view ever gets: the refusal that sent them here
+    // is still the last thing in the transcript, so a wizard that closes in
+    // silence reads as a failure (owner, 2026-09-14). Recognise the transition
+    // here, where both halves are already known, and say so once.
+    //
+    // Deliberately a CLIENT-side line, not a host message: "was the error
+    // visible in THIS view?" is a question only this view can answer, and a
+    // restored conversation repaints from the host's buffer -- so the line is
+    // gone the next time the conversation loads, which is what he asked for.
+    const wasUp = state.signInCardFor;
+    state.signInCardFor = provider;
+    // `wasUp !== provider` alone would also fire when the active provider is
+    // switched away from a still-expired account, so re-read the flag itself.
+    if (wasUp && wasUp !== provider && !providerNeedsLogin(wasUp)) {
+      noteSignInRecovered(wasUp);
+    }
+    if (!provider || !composer) {
+      if (el) el.remove();
+      return;
+    }
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "provider-signin-card";
+      el.className = "provider-signin-card";
+      composer.insertBefore(el, composer.firstChild);
+    }
+    const name = providerDisplayName(provider);
+    // Capability, never a version check: a host built before remote sign-in
+    // drops `runGrokLogin` silently, and a button that does nothing is worse
+    // than the honest dead end. Same rule the connect panel already follows.
+    const canSignIn = !IS_REMOTE || !!(state.hostCaps && state.hostCaps.remoteAgentSignIn);
+    // A sign-in already running is not an offer to make one. The code entry
+    // closes the moment the code is submitted, but verifying it takes a second
+    // or two -- and the card underneath went straight back to "Sign in", which
+    // reads as "that did not work, try again" at the exact moment it IS working
+    // (owner, from a phone, 2026-09-14).
+    //
+    // STATUS ONLY. The connect panel's liveness test also counts `preflight`,
+    // and copying that here was wrong: it answers "does the wizard own the
+    // panel", not "is a sign-in running". Codex preflight advice rides along on
+    // EVERY later frame of the flow (sidebar.ts, `entry.send`) including
+    // `failed`, and the first Codex tap on a cloud workspace is preflight with
+    // nothing started at all -- so the card said "Signing in…" with no way back
+    // to the button, over an account nobody was signing in to (review, round 1).
+    const status = (state.deviceLoginByProvider[provider] || {}).status;
+    const signingIn = status === "starting" || status === "waiting" || status === "verifying";
+    el.replaceChildren();
+    const title = document.createElement("p");
+    title.className = "provider-signin-title";
+    title.textContent = name + " needs you to sign in again";
+    const body = document.createElement("p");
+    body.className = "provider-signin-body";
+    // What it MEANS, not what happened: the refusals are visible above, and
+    // what the reader needs to know is that they stop once this is done.
+    body.textContent = canSignIn
+      ? "The account is still linked — its sign-in expired, so replies are refused until you renew it."
+      : name + " can only be signed in on the computer running this workspace. Sign in there, then refresh this view.";
+    el.append(title, body);
+    if (!canSignIn) return;
+    if (signingIn) {
+      // Keep the row rather than dropping it: the card holding its height
+      // stops the composer jumping under a thumb that is still near it.
+      const busy = document.createElement("p");
+      busy.className = "provider-signin-busy";
+      busy.textContent = "Signing in…";
+      el.appendChild(busy);
+      return;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "provider-signin-btn";
+    btn.textContent = "Sign in";
+    btn.onclick = () => { vscode.postMessage({ type: "runGrokLogin", provider }); };
+    el.appendChild(btn);
+  }
+
   function enterSessionSuperseded(id, cwd) {
     if (!id) return;
     state.sessionSuperseded = { id, cwd: cwd || sessionSupersededCwd(id) };
@@ -13086,12 +13306,12 @@
     scrollToBottom();
   }
 
-  function addPlanNotice(text) {
+  function addPlanNotice(text, icon) {
     clearWelcome();
     hideGrokking();
     const el = document.createElement("div");
     el.className = "plan-notice";
-    el.innerHTML = `${ICON.listTree}<span>${escapeHtml(text)}</span>`;
+    el.innerHTML = `${icon || ICON.listTree}<span>${escapeHtml(text)}</span>`;
     appendTranscriptChild(el);
     scrollToBottom();
   }
@@ -14363,10 +14583,8 @@
   // Inline card for grok's x.ai/ask_user_question. Renders each question with
   // its options; single-select with one question resolves on click (like the
   // permission card), otherwise the user picks across questions and submits.
-  // The host replies with { outcome: "accepted", answers } — keyed by question
-  // text — which unblocks grok's tool mid-turn. On answer the card COLLAPSES to
-  // the question + a clear green "✓ <chosen>" so it's obvious grok received it
-  // (the bare grey-out gave no such signal).
+  // Submit settles immediately, including against an old host. A host
+  // questionResolved refines that state; it cannot prove the CLI consumed it.
   function addQuestionCard(req) {
     clearWelcome();
     hideGrokking();
@@ -14384,6 +14602,7 @@
     });
     const el = document.createElement("div");
     el.className = "card question";
+    el.dataset.questionReqId = String(req.id);
 
     const title = buildQuestionHead(el, "Grok is asking");
 
@@ -14401,6 +14620,10 @@
 
     let submitBtn;
     let skip;
+    let submitted = false;
+    let skipped = false;
+    let recoveryAnswers;
+    let resolution;
     const updateSubmit = () => {
       if (!submitBtn) return;
       const built = buildQuestionAnswers(questions, effectiveSelections());
@@ -14409,23 +14632,69 @@
     };
     // Collapse the card to its answered/skipped representation: drop the option
     // buttons + Submit + Skip, retitle, and append the chosen answer per block.
-    const collapse = (skipped) => {
+    const collapse = () => {
+      if (el.classList.contains("resolved")) return;
+      // Retain even a half-written or deselected Other draft. The CLI answer
+      // map can trim selected text; recovery must keep what the user typed.
+      recoveryAnswers = selections.map((picked, qi) =>
+        [...picked, ...(otherText[qi] ? [otherText[qi]] : [])].join(", "));
       el.classList.add("resolved");
-      title.textContent = skipped ? "Skipped" : "You answered";
+      title.textContent = skipped ? "Skipped" : "Submitted";
       const actions = el.querySelector(".card-actions");
       if (actions) actions.remove();
       if (skip) skip.remove();
       [...el.querySelectorAll(".question-block")].forEach((block, qi) => {
         const opts = block.querySelector(".question-options");
         if (opts) opts.remove();
-        block.appendChild(answerLineEl(skipped ? "" : (effectiveSelections()[qi] || []).join(", ")));
+        const labels = submitted ? effectiveSelections()[qi].join(", ") : recoveryAnswers[qi];
+        const answer = answerLineEl(labels);
+        if (!labels && !skipped) answer.textContent = "No answer entered";
+        if (skipped && labels) answer.textContent = "Draft: " + labels;
+        block.appendChild(answer);
+        if (submitted && otherText[qi] && !otherSelected[qi]) {
+          const draft = answerLineEl(otherText[qi]);
+          draft.textContent = "Draft: " + otherText[qi];
+          block.appendChild(draft);
+        }
       });
     };
+    const offerRecovery = () => {
+      if (el.querySelector(".question-recover")) return;
+      const recover = document.createElement("button");
+      recover.className = "question-recover";
+      recover.textContent = "Add answers to composer";
+      recover.disabled = !recoveryAnswers.some((answer) => answer.length > 0);
+      recover.onclick = () => {
+        const block = questions.map((q, qi) => recoveryAnswers[qi]
+          ? questionText(q) + "\n" + recoveryAnswers[qi] : "").filter(Boolean).join("\n\n");
+        if (!block) return;
+        input.value = input.value ? input.value + "\n\n" + block : block;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.focus();
+        input.selectionStart = input.selectionEnd = input.value.length;
+      };
+      el.appendChild(recover);
+    };
+    el._resolveQuestion = (outcome) => {
+      if (!["accepted", "stale", "closed"].includes(outcome)) return;
+      // Once stale, a duplicate/reordered acknowledgement cannot resurrect it.
+      if (resolution === "stale" || resolution === outcome) return;
+      resolution = outcome;
+      collapse();
+      if (outcome === "stale" || !submitted && !skipped) {
+        title.textContent = "Question is no longer open";
+        offerRecovery();
+      } else if (outcome === "accepted") {
+        title.textContent = skipped ? "Skipped" : "You answered";
+      }
+    };
     const submit = () => {
+      if (el.classList.contains("resolved")) return;
       const { answers, allAnswered } = buildQuestionAnswers(questions, effectiveSelections());
       if (!allAnswered || otherSelected.some((selected, qi) => selected && !otherText[qi].trim())) return;
+      submitted = true;
+      collapse();
       vscode.postMessage({ type: "questionAnswer", requestId: req.id, answers, annotations: {} });
-      collapse(false);
     };
 
     questions.forEach((q, qi) => {
@@ -14563,8 +14832,10 @@
     skip.className = "question-skip";
     skip.textContent = "Skip";
     skip.onclick = () => {
+      if (el.classList.contains("resolved")) return;
+      skipped = true;
+      collapse();
       vscode.postMessage({ type: "questionCancel", requestId: req.id });
-      collapse(true);
     };
     el.appendChild(skip);
 
@@ -15559,6 +15830,9 @@
   // setup failure (no API key, ffmpeg missing), sends "voiceError" to reset us.
   function renderMic() {
     if (!micBtn) return;
+    if (state.voiceBackendState?.backends) {
+      state.voiceConfigured = !!state.voiceBackendState.backends[state.activeProvider || "grok"];
+    }
     micBtn.classList.toggle("listening", state.mic === "listening");
     micBtn.classList.toggle("transcribing", state.mic === "transcribing");
     micBtn.classList.toggle("connecting", state.mic === "connecting");
@@ -15582,24 +15856,35 @@
       micBtn.innerHTML = ICON.spinner;
       micBtn.title = "Transcribing…";
       micBtn.disabled = true;
-    } else if (IS_REMOTE && !state.voiceConfigured && !voiceNeedsGrokAccount()) {
-      micBtn.innerHTML = ICON.mic;
-      micBtn.title = "Voice dictation is unavailable because the host has no Speech-to-Text credential";
-      micBtn.disabled = true;
     } else {
+      // A remote with no host credential used to be DISABLED here, with the
+      // reason in a `title`. On a phone that is a dead button and nothing
+      // else: there is no hover, so the tooltip never renders, and a tap
+      // produces silence. The host already answers a credential-less start
+      // with a plain error naming what is missing, so the button stays live
+      // and lets it — the same arrangement the desk has always had.
       micBtn.innerHTML = ICON.mic;
       micBtn.title = state.voiceConfigured
         ? "Voice control"
         : voiceNeedsGrokAccount()
           ? "Voice needs Grok connected"
-          : "Voice control — click to set up (needs an xAI API key)";
+          : "Voice control — click to set up (needs an OpenAI or xAI credential)";
       micBtn.disabled = false;
     }
     // "needs setup" dot only when idle, clickable, and no key is configured.
     micBtn.classList.toggle("needs-setup", !micBtn.disabled && state.mic === "idle" && !state.voiceConfigured);
   }
 
+  /** "Connect Grok" is the right advice only when Grok is the missing piece.
+   *  Since a second backend exists, a host can have a credential that this
+   *  provider's pick does not use — and there the host's own error is more
+   *  precise than any wording here, so this stays narrow: nothing usable for
+   *  EITHER vendor, and Grok not connected. Gating on the mere presence of
+   *  `voiceBackendState` (as this did briefly) makes it permanently false,
+   *  because the host always sends that field now. */
   function voiceNeedsGrokAccount() {
+    const backends = state.voiceBackendState;
+    if (backends && (backends.hasXai || backends.hasOpenAi)) return false;
     return !!state.providersKnown && !state.voiceConfigured
       && !state.providers.some((provider) => provider.id === "grok" && provider.connected);
   }
@@ -15841,6 +16126,15 @@
     } else if (state.mic === "idle") {
       if (voiceNeedsGrokAccount()) {
         void explainVoiceNeedsGrok();
+        return;
+      }
+      // The HOST owns the credential and is the only thing that can say which
+      // one is missing — an explicit backend choice with no key for it reads
+      // nothing like "connect Grok". Ask it rather than deciding here, exactly
+      // as the desk does. No microphone is touched on this path, so a tap that
+      // is going to be refused costs no permission prompt.
+      if (!state.voiceConfigured) {
+        vscode.postMessage({ type: "remoteVoiceStart" });
         return;
       }
       void startBrowserMic();
@@ -17281,6 +17575,7 @@
         if (!gearPopover.hidden && state.gearView === "main") renderGearMain();
         if (!addPopover.hidden) renderAddPopover();
         refreshModelControls();
+        renderProviderSignInCard();
         if (!historyPopover.hidden) renderSessionRows();
         renderRail();
         break;
@@ -17467,18 +17762,38 @@
         moveComposerCaret(msg.direction);
         break;
       case "uiConfirmRequest":
+        // A host from before uiConfirmRequest became transient still buffers and
+        // replays it, and reopening a DESTRUCTIVE modal unprompted after a
+        // reconnect is the defect we are fixing. But dropping it silently is not
+        // the answer either: that host is still awaiting this id, with no drain
+        // of its own, so its Edit/Rewind `await confirmInChat` would hang for
+        // ever. Decline it instead — no modal, and the old host fails closed.
+        if (state.replaying) {
+          vscode.postMessage({ type: "uiConfirmAnswer", id: msg.id, ok: false });
+          break;
+        }
         // The host asks; the webview owns the dialog. Always answer, including
         // on dismissal — the host is awaiting this id and a rewind must fail
         // closed rather than hang.
+        if ([...document.querySelectorAll(".confirm-overlay")]
+          .some((el) => el.dataset.confirmReqId === String(msg.id))) break;
         uiConfirm({
+          requestId: msg.id,
           title: msg.title,
           body: msg.body,
           confirmLabel: msg.confirmLabel,
           danger: msg.danger,
         }).then((ok) => {
+          if (ok === undefined) return;
           vscode.postMessage({ type: "uiConfirmAnswer", id: msg.id, ok: !!ok });
         });
         break;
+      case "uiConfirmResolved": {
+        const el = [...document.querySelectorAll(".confirm-overlay")]
+          .find((el) => el.dataset.confirmReqId === String(msg.requestId));
+        if (el) el._resolveConfirm();
+        break;
+      }
       case "truncateMessages": {
         // Rewind/edit: drop only the discarded turns instead of clearing the
         // panel and replaying the whole conversation (which flashed the welcome
@@ -17536,7 +17851,7 @@
         // is gone, neither does the session aggregate.
         state.lastTurnUsage = null;
         if (surviving === 0) state.sessionUsage = null;
-        if (!contextPopover.hidden) openContextPopover();
+        if (!contextPopover.hidden) renderContextPopover();
         hideGrokking();
         hideThinkingIndicator();
         // The newest surviving agent message ends a finished turn, so its
@@ -17622,11 +17937,13 @@
         break;
       }
       case "session": {
+        state.subscriptionWindows = [];
         state.currentModelId = msg.currentModelId;
         state.activeProvider = msg.provider === "codex" || msg.provider === "claude" ? msg.provider : "grok";
         renderQueuedBlocks();
         syncFeedbackButtons();
         syncProviderVoice();
+        renderMic();
         // The nudge is gated on the active provider, and this is the only place
         // that changes — without a repaint here it would linger on the tab the
         // user switched TO until some unrelated render happened to run.
@@ -17636,6 +17953,7 @@
         state.availableModels = msg.models || [];
         if (currentModel()?.reasoningEffort) state.effort = currentModel().reasoningEffort;
         refreshModelControls();
+        renderProviderSignInCard();
         const m = state.availableModels.find((x) => x.modelId === msg.currentModelId && (!x.provider || x.provider === state.activeProvider));
         if (m?.totalContextTokens) state.contextWindow = m.totalContextTokens;
         state.contextBreakdown = null;
@@ -17731,10 +18049,12 @@
         break;
       case "voiceConfigured":
         state.voiceConfigured = !!msg.value;
+        state.voiceBackendState = msg.backendState;
         if (typeof msg.sendPhrase === "string") state.voiceSendPhrase = msg.sendPhrase;
         if (Array.isArray(msg.keyterms)) state.voiceKeyterms = msg.keyterms.filter((t) => typeof t === "string");
         renderMic();
         renderInputHighlight();
+        refreshSettingsOverlay();
         break;
       case "voicePartial":
         if (state.voiceDiscarded) break;
@@ -18098,10 +18418,10 @@
           fillRestoredAnswer(restoredEl, toolUpdateText(msg.call));
           break;
         }
-        // Live: the interactive card already handled the answer; drop the stash so
-        // the chip stays suppressed and we don't fall through to the diff path.
+        // Live: the host resolves the interactive card. Drop the stash so the
+        // chip stays suppressed and we don't fall through to the diff path.
         if (state.questionToolCalls.has(msg.call?.toolCallId)) {
-          if (toolUpdateText(msg.call) || String(msg.call?.status).toLowerCase() === "completed") {
+          if (toolUpdateText(msg.call) || ["completed", "failed"].includes(String(msg.call?.status).toLowerCase())) {
             state.questionToolCalls.delete(msg.call.toolCallId);
           }
           break;
@@ -18274,6 +18594,12 @@
         if (el) resolvePlanCardEl(el, msg.verdict);
         break;
       }
+      case "questionResolved": {
+        const el = liveTranscriptQueryAll(".card.question")
+          .find((c) => c.dataset.questionReqId === String(msg.requestId));
+        if (el) el._resolveQuestion(msg.outcome);
+        break;
+      }
       case "questionRequest":
         addQuestionCard(msg.req);
         if (!state.replaying) {
@@ -18320,6 +18646,11 @@
         // turn ends (research/signals-refresh-probe.cjs), which then updates
         // it via its own meta or the host's contextUsage read.
         if (msg.meta?.totalTokens != null) updateDonut(msg.meta.totalTokens);
+        break;
+      case "subscriptionUsage":
+        state.subscriptionUsageKnown = true;
+        state.subscriptionWindows = Array.isArray(msg.windows) ? msg.windows : [];
+        if (!contextPopover.hidden) renderContextPopover();
         break;
       case "contextUsage":
         // Host-authoritative occupancy: grok's signals.json / live envelope,
@@ -18576,7 +18907,7 @@
         // session total), so keep whatever we have rather than blanking it.
         if (msg.turn) state.lastTurnUsage = msg.turn;
         if (msg.session) state.sessionUsage = msg.session;
-        if (!contextPopover.hidden) openContextPopover(); // live-refresh if open
+        if (!contextPopover.hidden) renderContextPopover();
         break;
       case "setBusy":
         // Host-driven busy state for flows where there's no natural agentEnd
@@ -18619,6 +18950,9 @@
         addSessionContextBanner();
         break;
       case "clearMessages":
+        for (const el of document.querySelectorAll(".confirm-overlay[data-confirm-req-id]")) {
+          el._resolveConfirm();
+        }
         resetForNewSession();
         break;
       case "onboarding":
@@ -18652,6 +18986,11 @@
             // first painted the previous state every time (caught by driving
             // the states in a browser, 2026-08-31).
             syncConnectWizard(msg.provider, msg.device);
+            // The composer card reads the same mirror, and this is the only
+            // frame that moves it. Without this call its "Signing in…" state
+            // waits for the next providerState -- which is the frame that
+            // arrives when the sign-in has already finished.
+            renderProviderSignInCard();
           }
         break;
       case "error":

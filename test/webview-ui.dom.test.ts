@@ -3663,7 +3663,7 @@ describe("context popover — usage breakdown (#53)", () => {
     });
     click(window, $(doc, "donut"));
     const pop = $(doc, "context-popover");
-    const sessionSection = pop.querySelector(".popover-section") as HTMLElement;
+    const sessionSection = pop.querySelector('[data-fold="session"]') as HTMLElement;
     expect(sessionSection.textContent).toBe("Session total");
     expect(sessionSection.nextElementSibling?.textContent).toContain("Input");
 

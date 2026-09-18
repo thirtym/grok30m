@@ -1,6 +1,7 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface } from "node:readline";
 import { EventEmitter } from "node:events";
+import { claudeSubscriptionWindows, grokSubscriptionWindows, type SubscriptionWindow } from "./subscription-usage";
 import * as path from "node:path";
 import {
   collectToolImages,
@@ -192,6 +193,7 @@ export interface QuestionItem {
 export interface QuestionRequest {
   id: number | string;
   sessionId: string;
+  toolCallId?: string;
   questions: QuestionItem[];
 }
 
@@ -288,6 +290,7 @@ export class AcpClient extends EventEmitter {
   private pending = new Map<number, Pending>();
   private readonly backend: AcpBackend;
   private readonly timeouts: AcpTimeouts;
+  private humanWaitActive = false;
   private steering: BackendSteeringCapabilities;
 
   readonly provider: AcpProvider;
@@ -947,6 +950,22 @@ export class AcpClient extends EventEmitter {
     }
   }
 
+  private billingUnsupported = false;
+
+  async getSubscriptionUsage(): Promise<SubscriptionWindow[]> {
+    if (this.provider !== "grok" || this.billingUnsupported) return [];
+    try {
+      return grokSubscriptionWindows(await this.request("_x.ai/billing", {}));
+    } catch (error) {
+      if (isMethodNotFoundError(error)) {
+        this.billingUnsupported = true;
+        this.opts.log("[billing] CLI does not support _x.ai/billing");
+        return [];
+      }
+      throw error;
+    }
+  }
+
   /**
    * List rewind points for this session (P2-9). One point per user prompt;
    * each carries a prompt preview + whether file snapshots exist.
@@ -1073,6 +1092,7 @@ export class AcpClient extends EventEmitter {
    * callers can ignore the returned promise — the kill is still initiated now.
    */
   dispose(timeoutMs = 3000): Promise<void> {
+    this.setHumanWaitActive(false);
     this.rl?.close();
     const proc = this.proc;
     if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
@@ -1190,6 +1210,7 @@ export class AcpClient extends EventEmitter {
             now: Date.now(),
             idleMs: this.timeouts.promptIdleTimeoutMs,
             absoluteMs: this.timeouts.promptAbsoluteTimeoutMs,
+            humanWaitActive: this.humanWaitActive,
           });
           if (!Number.isFinite(waitMs)) return;
         } else {
@@ -1204,6 +1225,19 @@ export class AcpClient extends EventEmitter {
       entry.armTimer = arm;
       arm();
     });
+  }
+
+  /** Human waits suspend idle detection, never the independent absolute cap. */
+  setHumanWaitActive(active: boolean): void {
+    if (this.humanWaitActive === active) return;
+    this.humanWaitActive = active;
+    const now = Date.now();
+    for (const p of this.pending.values()) {
+      if (!p.isPrompt) continue;
+      // Answering starts a fresh idle interval, even after a long absence.
+      if (!active) p.lastActivityAt = now;
+      p.armTimer?.();
+    }
   }
 
   /** Re-arm in-flight `session/prompt` idle timers on live ACP traffic. */
@@ -1270,6 +1304,10 @@ export class AcpClient extends EventEmitter {
     const foreign = isForeignSessionUpdate(sessionId, this.sessionId);
     const normalized = this.backend.normalizeUpdate(u, meta);
     if (!foreign) {
+      if (this.provider === "claude") {
+        const windows = claudeSubscriptionWindows(normalized.update);
+        if (windows !== undefined) this.emit("subscriptionUsage", windows);
+      }
       if (normalized.sessionTitle) {
         this.currentSessionTitle = normalized.sessionTitle;
         this.emit("sessionTitle", normalized.sessionTitle);
@@ -1522,6 +1560,8 @@ export class AcpClient extends EventEmitter {
         const req: QuestionRequest = {
           id,
           sessionId: params?.sessionId ?? this.sessionId ?? "",
+          ...(typeof params?.toolCallId === "string" && params.toolCallId
+            ? { toolCallId: params.toolCallId } : {}),
           questions: Array.isArray(params?.questions) ? params.questions : [],
         };
         this.emit("questionRequest", req);

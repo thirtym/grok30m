@@ -32,6 +32,10 @@ import { pathsEqual } from "../src/worktree";
 const sorted = (a: readonly string[]) => [...a].sort();
 
 describe("remote-policy classification tables", () => {
+  it.each(["questionResolved", "uiConfirmResolved"] as const)("mirrors %s within the owning session scope", (type) => {
+    expect(OUTBOUND_DISPOSITION[type]).toBe("mirror");
+    expect(OUTBOUND_PROJECT_AUTH[type]).toBe("scope");
+  });
   // tsc already forces this via Record<Union["type"], …>; the runtime assert
   // guards the compiled-JS path the same way protocol.test.ts does.
   it("classifies every WebviewMsg type (no drift behind the protocol)", () => {

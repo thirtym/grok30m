@@ -728,11 +728,15 @@ describe("context popover respects the app purpose", () => {
       messageTokens: 12166,
       freeTokens: 495983,
     } as never);
+    // What a host that knows `subscriptionUsage` does at session start, empty
+    // or not. The section is gated on that frame having arrived, so omitting it
+    // would make this a test about an OLD host instead of about the purpose.
+    dispatch(h.window, { type: "subscriptionUsage", windows: [] } as never);
     click(h.window, h.doc.getElementById("donut")!);
     return h.doc.getElementById("context-popover")!;
   };
 
-  it("shows the number and Compact, and nothing else, in knowledge work", () => {
+  it("shows context, Compact and subscription availability in knowledge work", () => {
     const h = bootWebview();
     dispatch(h.window, { type: "initialState", appPurpose: "knowledge", capabilities: {} } as never);
 
@@ -747,6 +751,7 @@ describe("context popover respects the app purpose", () => {
     // What a person writing a document actually asked the donut.
     expect(text).toContain("Context used");
     expect(text).toContain("Compact conversation");
+    expect(text).toContain("No subscription usage reported yet.");
     // The technical account, all of it, absent.
     expect(text).not.toContain("In this window");
     expect(text).not.toContain("System");

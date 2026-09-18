@@ -177,6 +177,8 @@ describe("remote connector host routing", () => {
     h.projectSetupMessage = () => ({ type: "projectSetup" });
     h.githubProjectSetupExtra = () => ({});
     h.resolveVoiceApiKey = () => undefined;
+    h.defaultProviderForProject = () => "grok";
+    h.voiceBackendState = () => ({ provider: "grok", preference: "auto", hasXai: false, hasOpenAi: false, backends: {grok:null,codex:null,claude:null} });
     h.rememberVoiceConfigured = vi.fn();
     h.voiceConfiguredMsg = () => ({ type: "voiceConfigured", configured: false });
     h.seedPostedVoiceConfigured = vi.fn();

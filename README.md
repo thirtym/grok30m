@@ -75,7 +75,7 @@ Type `/imagine <prompt>` (or `/imagine-video <prompt>`) and the result renders *
 
 The **microphone button** dictates speech via [SpaceXAI's Speech-to-Text API](https://docs.x.ai/developers/model-capabilities/audio/speech-to-text) — words appear live as you talk. Say **"grok send"** to submit hands-free and keep dictating; messages spoken while Grok responds queue and flush when it finishes.
 
-It works out of the box once you're signed in (your `grok login` token is reused automatically) — you only need [`ffmpeg`](https://ffmpeg.org) installed to record. Setup, devices, and costs: **[docs/voice-setup.md](docs/voice-setup.md)**.
+Use your existing Grok sign-in or an OpenAI API key. Auto prefers OpenAI for Codex and xAI for Grok/Claude, with credential-based fallback. Local recording requires [`ffmpeg`](https://ffmpeg.org). Setup, devices, and costs: **[docs/voice-setup.md](docs/voice-setup.md)**.
 
 ![Voice control with live transcription in the composer](docs/screenshots/voice_mode.png)
 
@@ -249,7 +249,7 @@ While a device is linked, the extension also **keeps the machine awake** (`caffe
 - **VS Code** 1.106+ (or a compatible editor on the same base — Cursor 3.x qualifies; Antigravity is still on base 1.104 and keeps the last compatible extension version).
 - **The Grok Build CLI** (`grok`) on macOS, Linux, or Windows. The CLI ships a native Windows build, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it).
 - **A login:** either a **SuperGrok or X Premium+** subscription (`grok login`) or an xAI API key. Either subscription unlocks **Grok Build**; with an API key you also get the **grok-4.x** models and **grok-imagine**. (Grok's free tier does **not** include the CLI agent.)
-- **Voice control** is optional and works out of the box once you're signed in — it just needs [`ffmpeg`](https://ffmpeg.org) to record. Setup + advanced options: [docs/voice-setup.md](docs/voice-setup.md).
+- **Voice control** is optional and uses Grok sign-in or an OpenAI API key (Codex sign-in alone does not include transcription) — it just needs [`ffmpeg`](https://ffmpeg.org) to record. Setup + advanced options: [docs/voice-setup.md](docs/voice-setup.md).
 
 ---
 
@@ -326,13 +326,16 @@ Open **Settings** from **+** in VS Code or the rail gear in Desktop and AFK Pilo
 | `grok.thumbsFeedback` | `false` | Show thumbs on a finished Grok turn so you can send a rating to SpaceXAI. Off by default. On, thumbs appear only when this Grok session supports feedback — never on Codex or Claude. Toggle from Settings → General → **Thumbs feedback to SpaceXAI**. |
 | `grok.telemetry.enabled` | `true` | Send anonymous, privacy-first usage telemetry (see [Privacy](#privacy)). Also honors VS Code's global `telemetry.telemetryLevel`. |
 | `grok.chatFontScale` | `100` | Zoom for the chat panel only, as a percent (`150`, `200`, …). Scales the whole chat UI without rescaling the rest of VS Code (unlike `Ctrl/Cmd+Shift+=`). Applies live; supports User (global) and Workspace (local) scope. |
-| `grok.voiceApiKey` | `""` | Optional override key for voice Speech-to-Text. Empty = reuse your `grok login` token automatically, else `GROK_VOICE_API_KEY` / `XAI_API_KEY` from the workspace `.env`. See [docs/voice-setup.md](docs/voice-setup.md). |
+| `grok.voiceBackend` | `"auto"` | Prefer the agent vendor when its credential is available, otherwise use the other. Explicit `xai` / `openai` choices require that credential. |
+| `grok.voiceOpenAiApiKey` | `""` | OpenAI API-platform key override; empty uses `OPENAI_API_KEY`. Codex / ChatGPT sign-in does not include transcription API access. |
+| `grok.voiceOpenAiModel` | `"gpt-live-transcribe"` | OpenAI Realtime transcription model. |
+| `grok.voiceApiKey` | `""` | Optional xAI key override. Empty = `GROK_VOICE_API_KEY` / `XAI_API_KEY` from `.env` or the host environment, then your cached `grok login` token. See [docs/voice-setup.md](docs/voice-setup.md). |
 | `grok.ffmpegPath` | `""` | Path to `ffmpeg` for microphone recording. Empty = use `ffmpeg` from `PATH`. |
 | `grok.voiceInputDevice` | `""` | Microphone device override. Empty = system default (Windows auto-detects the first DirectShow audio device). |
 | `grok.voiceSendPhrase` | `"grok send"` | Spoken phrase that auto-submits when it ends a transcription. Empty = disable hands-free sending. |
-| `grok.voiceKeyterms` | `[]` | Words or phrases that bias streaming recognition toward code and project vocabulary. Sent to SpaceXAI with each streaming connection; up to 100 terms of 50 characters, including the send phrase and `Grok`. |
-| `grok.voiceLanguage` | `""` | Optional language code for streaming text formatting (for example `en`, `fr`, `de`, or `ja`). Empty preserves spoken-form text. |
-| `grok.voiceStreaming` | `true` | Stream transcription live as you speak. `false` = one-shot batch mode. Streaming costs $0.20/hr vs $0.10/hr batch. |
+| `grok.voiceKeyterms` | `[]` | Words or phrases that bias streaming recognition toward code and project vocabulary. Sent to the selected backend with each streaming connection; up to 100 terms of 50 characters, including the send phrase and `Grok`. |
+| `grok.voiceLanguage` | `""` | Optional language code (for example `en`, `fr`, `de`, or `ja`). Controls xAI text formatting and supplies an OpenAI transcription language hint. |
+| `grok.voiceStreaming` | `true` | Stream transcription live as you speak. `false` = one-shot batch mode. Costs depend on backend and model; OpenAI API usage is billed separately. |
 
 </details>
 
@@ -399,7 +402,7 @@ Contributions are welcome.
 
 ## Privacy
 
-**Privacy by design** — no message content, code, or file paths leave your machine automatically. The only automatic report is an anonymous, opt-out `session_start` (turn it off with `grok.telemetry.enabled: false` or VS Code's global `telemetry.telemetryLevel`). It carries an install id plus a low-cardinality settings snapshot, including mode / model / effort, host kind, UI preferences, whether voice input is available, and which agents are connected — **never** message content, code, paths, or free-text settings. The full field list is in [docs/privacy.md](docs/privacy.md). Data leaves only through features you explicitly enable or invoke: Voice input sends audio to SpaceXAI for transcription; the optional **Read simplified summaries** switch in VS Code or AFK Pilot sends the cleaned spoken reply to SpaceXAI for a brief version; optional **Thumbs feedback to SpaceXAI** (off by default) sends a rating on a finished Grok turn; Remote Control relays the chat to your linked devices. Each is disclosed separately from telemetry.
+**Privacy by design** — no message content, code, or file paths leave your machine automatically. The only automatic report is an anonymous, opt-out `session_start` (turn it off with `grok.telemetry.enabled: false` or VS Code's global `telemetry.telemetryLevel`). It carries an install id plus a low-cardinality settings snapshot, including mode / model / effort, host kind, UI preferences, whether voice input is available, and which agents are connected — **never** message content, code, paths, or free-text settings. The full field list is in [docs/privacy.md](docs/privacy.md). Data leaves only through features you explicitly enable or invoke: Voice input sends audio to the selected xAI or OpenAI backend for transcription; the optional **Read simplified summaries** switch in VS Code or AFK Pilot sends the cleaned spoken reply to SpaceXAI for a brief version; optional **Thumbs feedback to SpaceXAI** (off by default) sends a rating on a finished Grok turn; Remote Control relays the chat to your linked devices. Each is disclosed separately from telemetry.
 
 More: [docs/privacy.md](docs/privacy.md).
 

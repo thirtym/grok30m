@@ -48,6 +48,28 @@ function host() {
 }
 
 describe("provider config host dispatch", () => {
+  it("persists the voice backend from standalone Settings to the winning config scope", async () => {
+    const sidebar = host(); const update = vi.fn(async () => {});
+    sidebar.host.getConfiguration = () => ({ update, inspect: () => ({ workspaceValue: "auto" }) });
+    sidebar.host.isInWorkspace = () => true;
+    sidebar.postVoiceConfigured = vi.fn();
+    await sidebar.onSettingsPanelMessage({ type: "setVoiceBackend", value: "openai" });
+    expect(update).toHaveBeenCalledWith("voiceBackend", "openai", "workspace");
+    expect(sidebar.postVoiceConfigured).toHaveBeenCalled();
+  });
+
+  it("uses a dedicated host key dialog instead of the provider login enum", async () => {
+    const sidebar = host(); const update = vi.fn(async () => {});
+    sidebar.host.getConfiguration = () => ({ update, inspect: () => undefined });
+    sidebar.host.isInWorkspace = () => true;
+    sidebar.host.showInputBox = vi.fn(async () => " test-key ");
+    sidebar.postVoiceConfigured = vi.fn();
+    await sidebar.onSettingsPanelMessage({ type: "configureOpenAiVoice" });
+    expect(sidebar.host.showInputBox).toHaveBeenCalledWith(expect.objectContaining({ password: true }));
+    expect(update).toHaveBeenCalledWith("voiceOpenAiApiKey", "test-key", "global");
+    expect(sidebar.postLocal).not.toHaveBeenCalledWith(expect.objectContaining({ value: "test-key" }));
+  });
+
   function settingsHost() {
     const sidebar = host();
     sidebar.state = { get: (_key: string, fallback: unknown) => fallback };
@@ -78,6 +100,8 @@ describe("provider config host dispatch", () => {
     sidebar.projectSetupMessage = () => ({ type: "projectSetup" });
     sidebar.githubProjectSetupExtra = () => ({});
     sidebar.resolveVoiceApiKey = () => undefined;
+    sidebar.defaultProviderForProject = () => "grok";
+    sidebar.voiceBackendState = () => ({ provider: "grok", preference: "auto", hasXai: false, hasOpenAi: false, backends: {grok:null,codex:null,claude:null} });
     sidebar.rememberVoiceConfigured = vi.fn();
     sidebar.voiceConfiguredMsg = () => ({ type: "voiceConfigured", configured: false });
     sidebar.seedPostedVoiceConfigured = vi.fn();
@@ -99,6 +123,7 @@ describe("provider config host dispatch", () => {
     window.document.body.innerHTML = '<div id="settings-root"></div>';
     const messages: any[] = [];
     (window as any).acquireVsCodeApi = () => ({ postMessage: (msg: any) => messages.push(msg) });
+    (window as any).eval(fs.readFileSync(path.resolve(__dirname, "../media/webview-helpers.js"), "utf8"));
     (window as any).eval(fs.readFileSync(path.resolve(__dirname, "../media/settings.js"), "utf8"));
     for (const script of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) {
       if (script[1].trim()) (window as any).eval(script[1]);

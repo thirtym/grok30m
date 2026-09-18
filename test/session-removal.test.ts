@@ -32,6 +32,7 @@ function setup(origin: "local" | "remote", provider: "grok" | "codex" | "claude"
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "summary.json"), JSON.stringify({ num_messages: 0 }));
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.pendingConfirms = new Map();
   const session = new Session();
   session.cwd = cwd;
   session.provider = provider;
@@ -125,6 +126,7 @@ describe.each(["local", "remote"] as const)("abandoning an empty %s session", (o
       const deleted = new Promise<void>((resolve, reject) => { resolveDelete = resolve; rejectDelete = reject; });
       const exited = new Promise<void>((resolve) => { resolveExit = resolve; });
       const client = {
+        setHumanWaitActive: vi.fn(),
         deleteSession: vi.fn(() => deleted),
         dispose: vi.fn(() => exited),
       };

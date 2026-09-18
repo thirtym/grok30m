@@ -23,6 +23,7 @@
 
 import type { ModelInfo, PromptResultMeta, PromptUsage, PermissionRequest, ExitPlanRequest, QuestionRequest } from "./acp";
 import type { FileChip } from "./chips";
+import type { SttPreference, VoiceBackendState } from "./voice";
 import type { RepoListEntry, SessionListEntry } from "./sessions";
 import type { Dot } from "./session-pool";
 import type { RunProgressUpdate } from "./run-progress";
@@ -30,6 +31,7 @@ import type { McpServerView } from "./mcp";
 import type { ConnectorView } from "./mcp-connectors";
 import type { RoutineDraft, RoutineModelOption, RoutineProjectOption, RoutineView } from "./routines";
 import type { GitStatusSnapshot } from "./git-status";
+import type { SubscriptionWindow } from "./subscription-usage";
 
 /**
  * The Changes snapshot as it crosses the wire.
@@ -595,7 +597,7 @@ export type HostMsg =
   | { type: "modeChanged"; modeId: string }
   | { type: "openModePopover" }
   | { type: "voiceState"; status: "listening" | "transcribing" | "idle" }
-  | { type: "voiceConfigured"; value: boolean; sendPhrase?: string; keyterms?: string[] }
+  | { type: "voiceConfigured"; value: boolean; sendPhrase?: string; keyterms?: string[]; backendState?: VoiceBackendState }
   /** Live `grok.telemetry.enabled` so the settings surface stays in sync. */
   | { type: "telemetryEnabled"; value: boolean }
   /** Live `grok.thumbsFeedback` so the settings surface stays in sync. */
@@ -780,6 +782,8 @@ export type HostMsg =
   | { type: "permissionRequest"; req: PermissionRequest }
   | { type: "permissionOptions"; requestId: number | string; options: PermissionRequest["options"] }
   | { type: "permissionResolved"; requestId: number | string; optionId: string }
+  | { type: "questionResolved"; requestId: number | string; outcome: "accepted" | "stale" | "closed" }
+  | { type: "subscriptionUsage"; windows: SubscriptionWindow[] }
   // The host spreads the plan-review snapshot (planPath/planName) into the bare
   // ExitPlanRequest before posting, so the wire shape is wider than acp's type.
   | { type: "exitPlanRequest"; req: ExitPlanRequest & { planPath?: string; planName?: string } }
@@ -944,6 +948,7 @@ export type HostMsg =
    *  reverting files), so the webview can't decide to show `uiConfirm` itself.
    *  `id` correlates the answer; the host awaits a promise keyed on it. */
   | { type: "uiConfirmRequest"; id: string; title: string; body?: string; confirmLabel: string; danger?: boolean }
+  | { type: "uiConfirmResolved"; requestId: string }
   // nextOffset = the index offset the next load-more should request — ids CONSUMED
   // from the on-disk index, not entries shown (hidden subagent sessions occupy
   // slots without producing rows).
@@ -1201,6 +1206,8 @@ export type WebviewMsg =
   | { type: "setVoiceSendPhrase"; value: string }
   /** Persist `grok.voiceKeyterms` (user dictionary terms only). */
   | { type: "setVoiceKeyterms"; value: string[] }
+  | { type: "setVoiceBackend"; value: SttPreference }
+  | { type: "configureOpenAiVoice" }
   /** Persist `grok.telemetry.enabled`. Desktop toggle; remotes do not send this. */
   | { type: "setTelemetryEnabled"; value: boolean }
   /** Persist `grok.thumbsFeedback`. Host-owned; remotes honour the desk value. */
@@ -1445,6 +1452,7 @@ export type WebviewMsg =
   | { type: "workflowControl"; action: "pause" | "resume" | "stop"; displayName: string }
   /** Read-only Grok context snapshot for the open donut popover. */
   | { type: "refreshContextDetails" }
+  | { type: "refreshSubscriptionUsage" }
   // Relay account (gear "AFK Pilot" section, local webview only): start the
   // device-link flow / drop the device token / open the relay web portal.
   | { type: "remoteSignIn" }
@@ -1472,13 +1480,14 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   thoughtChunk: true, messageChunk: true, media: true, userMessageChunk: true,
   historyReplay: true, historyBatch: true, permissionHistoryQueue: true, planHistoryQueue: true,
   toolCall: true, toolCallUpdate: true, permissionRequest: true, permissionOptions: true,
-  permissionResolved: true, exitPlanRequest: true, planResolved: true, questionRequest: true,
+  permissionResolved: true, exitPlanRequest: true, planResolved: true, questionRequest: true, questionResolved: true,
+  subscriptionUsage: true,
   planNotice: true, autoCompactNotice: true, planBlocked: true, promptComplete: true, contextUsage: true, agentReset: true,
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true, hostNotice: true,
   xaiNotification: true, subagentUpdate: true, childStream: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true, promptNav: true, expandDiffCard: true,
   soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, hostReachable: true, hostLink: true,
-  setAllToolDetails: true, focusInput: true, findInSession: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true,
+  setAllToolDetails: true, focusInput: true, findInSession: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true, uiConfirmResolved: true,
   sessions: true, sessionRemoved: true, repoSessions: true, pinnedSessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, feedbackAvailability: true, turnFeedbackAck: true, usage: true,
 };
@@ -1504,12 +1513,13 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   readProviderConfig: true, writeProviderConfig: true, restartProviderSession: true,
   gitStatus: true, gitFileDiff: true, gitRun: true,
   pasteImage: true, uploadFile: true, voiceStart: true,
-  voiceStop: true, remoteVoiceStart: true, remoteVoiceChunk: true,
+  voiceStop: true, setVoiceBackend: true, configureOpenAiVoice: true, remoteVoiceStart: true, remoteVoiceChunk: true,
   remoteVoiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
   steerSend: true, turnFeedback: true, forkSession: true,
   newWorktreeSession: true, applyWorktree: true, removeWorktree: true,
   rewindSession: true, editLastMessage: true, uiConfirmAnswer: true, workflowControl: true,
   refreshContextDetails: true,
+  refreshSubscriptionUsage: true,
   remoteSignIn: true, remoteSignOut: true, unlinkRemoteDevice: true, openRemotePortal: true,
   openUpdateRelease: true, restartToUpdate: true,
 };

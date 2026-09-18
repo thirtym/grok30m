@@ -24,6 +24,7 @@ vi.mock("../src/acp", async (importOriginal) => {
   const { EventEmitter } = await import("node:events");
   const actual = await importOriginal<typeof import("../src/acp")>();
   class FakeAcpClient extends EventEmitter {
+    setHumanWaitActive = vi.fn();
     provider = "grok" as const;
     usesClientPlanGate = false;
     sessionId: string | undefined;

@@ -23,6 +23,7 @@ vi.mock("../src/acp", async (importOriginal) => {
   const { EventEmitter } = await import("node:events");
   const actual = await importOriginal<typeof import("../src/acp")>();
   class FakeAcpClient extends EventEmitter {
+    setHumanWaitActive = vi.fn();
     provider: "grok" | "codex" | "claude";
     usesClientPlanGate = false;
     sessionId: string | undefined;
@@ -176,6 +177,65 @@ function onboardings(sidebar: any): HostMsg[] {
 }
 
 describe("startSession bounded spawn retry", () => {
+  it.each(["completed", "failed"])("the live tool update handler closes a question on %s", async (status) => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    const client = await sidebar.startSession(undefined, session);
+    session.turnToken = {};
+    client.emit("questionRequest", { id: 0, toolCallId: "call-colour", questions: [{ question: "Which colour?" }] });
+    expect(session.pendingQuestions.get(0)).toBe("call-colour");
+    expect(session.status).toBe("needs-you");
+    client.emit("toolCallUpdate", { toolCallId: "call-colour", status });
+    expect(session.pendingQuestions.size).toBe(0);
+    expect(client.setHumanWaitActive).toHaveBeenLastCalledWith(false);
+    expect(session.status).toBe("working");
+    expect(sidebar.posted.filter((m: HostMsg) => m.type === "questionResolved"))
+      .toEqual([{ type: "questionResolved", requestId: 0, outcome: "closed" }]);
+    session.turnToken = undefined;
+  });
+
+  it("ignores a replaced client's terminal update even when tool and request ids are reused", async () => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    const first = await sidebar.startSession(undefined, session);
+    first.emit("questionRequest", { id: 0, toolCallId: "reused", questions: [] });
+    const replacement = await sidebar.startSession(undefined, session);
+    replacement.emit("questionRequest", { id: 0, toolCallId: "reused", questions: [] });
+    sidebar.posted.length = 0;
+    first.emit("toolCallUpdate", { toolCallId: "reused", status: "completed" });
+    expect(session.pendingQuestions.get(0)).toBe("reused");
+    expect(sidebar.posted).toEqual([]);
+    replacement.emit("toolCallUpdate", { toolCallId: "reused", status: "completed" });
+    expect(session.pendingQuestions.size).toBe(0);
+    expect(sidebar.posted).toContainEqual({ type: "questionResolved", requestId: 0, outcome: "closed" });
+  });
+
+  it("tracks arriving human requests and closes them and confirmations before replacing the client", async () => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    const first = await sidebar.startSession(undefined, session);
+    session.planModeAvailable = true;
+    vi.spyOn(sidebar, "createPlanReviewSnapshot").mockResolvedValue({ path: "/plan", name: "Plan" });
+    first.emit("questionRequest", { id: "question", questions: [{ question: "Q?" }] });
+    expect(first.setHumanWaitActive).toHaveBeenLastCalledWith(true);
+    first.emit("permissionRequest", {
+      id: "permission", toolCall: { title: "Read?", kind: "read" },
+      options: [{ optionId: "yes", kind: "allow_once", name: "Allow" }],
+    });
+    first.emit("exitPlanRequest", { id: "plan", plan: "Plan" });
+    await vi.waitFor(() => expect(session.pendingExitPlans.size).toBe(1));
+    expect(session.pendingPermissions.size).toBe(1);
+    const confirm = sidebar.confirmInChat(session, { title: "Revert?", confirmLabel: "Rewind" });
+    const replacement = await sidebar.startSession(undefined, session);
+    await expect(confirm).resolves.toBe(false);
+    expect(replacement).not.toBe(first);
+    expect(first.setHumanWaitActive).toHaveBeenLastCalledWith(false);
+    expect(replacement.setHumanWaitActive).toHaveBeenLastCalledWith(false);
+    expect(session.pendingQuestions.size + session.pendingPermissions.size + session.pendingExitPlans.size).toBe(0);
+    expect(sidebar.posted).toContainEqual({ type: "questionResolved", requestId: "question", outcome: "closed" });
+    expect(sidebar.posted.some((m: HostMsg) => m.type === "uiConfirmResolved")).toBe(true);
+  });
+
   it.each([
     ["grok", undefined, "high"],
     ["claude", "low", "low"],
