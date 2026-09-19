@@ -92,6 +92,8 @@ export function bootWebview(opts: {
   ready?: boolean;
   remote?: boolean;
   vscode?: boolean;
+  /** Grok30m Sessions sidebar: chat HTML has no #history-btn. */
+  sessionsSidebar?: boolean;
   postMessage?: (message: Posted) => unknown;
   beforeScripts?: (window: Window) => void;
 } = {}): Harness {
@@ -114,6 +116,7 @@ export function bootWebview(opts: {
     const newBtn = doc.getElementById("new-btn");
     newBtn?.parentElement?.insertBefore(slot, newBtn.nextSibling);
   }
+  if (opts.sessionsSidebar) doc.getElementById("history-btn")?.remove();
   // What the relay's chat.html sets before loading chat.js. Gates the remote-only
   // affordances (repo switcher) and suppresses the host-only ones.
   if (opts.remote) (window as any).grokRemoteClient = true;

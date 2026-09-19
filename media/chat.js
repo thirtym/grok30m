@@ -1349,7 +1349,10 @@
   }
 
   newBtn.innerHTML = ICON.squarePen;
-  historyBtn.innerHTML = ICON.clock;
+  // Grok30m Sessions sidebar omits #history-btn from the chat tab. Community
+  // always ships the button; assigning here without a guard killed boot on
+  // that HTML and left the welcome stuck on "Starting".
+  if (historyBtn) historyBtn.innerHTML = ICON.clock;
   ensureVisibleNewSession();
   // "Continue remotely", one tap from the chat instead of buried in the gear
   // menu — the desk is where someone decides to get up and keep going on
@@ -20144,7 +20147,7 @@
   const welcomeAboutLink = $("welcome-about-link");
   if (welcomeAboutLink) welcomeAboutLink.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openAboutPanel(); };
   addBtn.onclick = (e) => { e.stopPropagation(); openAddPopover(); };
-  historyBtn.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
+  if (historyBtn) historyBtn.onclick = (e) => { e.stopPropagation(); openHistoryPopover(); };
   repoBtn.onclick = (e) => {
     e.stopPropagation();
     if (repoSwitcherLocked()) return;

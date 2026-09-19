@@ -42,6 +42,13 @@ describe("Grok30m session tabs (fork invariants)", () => {
     expect(body).toMatch(/if \(chat\) chat\.postMessage\(message\)/);
   });
 
+  it("chat.js does not assume the in-tab history button exists", () => {
+    const chat = readFileSync(path.join(root, "media", "chat.js"), "utf8");
+    expect(sidebar).toContain('this.useSessionsSidebar() ? "" : `<button id="history-btn"');
+    expect(chat).toMatch(/if \(historyBtn\) historyBtn\.innerHTML/);
+    expect(chat).toMatch(/if \(historyBtn\) historyBtn\.onclick/);
+  });
+
   it("keeps a per-session editor webview on Session and Host", () => {
     expect(session).toMatch(/panel\?: HostEditorWebview/);
     expect(host).toContain("openEditorWebview");

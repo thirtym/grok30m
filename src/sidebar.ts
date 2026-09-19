@@ -2907,7 +2907,9 @@ export class GrokSidebar {
   private grokConfig(): { get<T>(key: string, defaultValue: T): T } | undefined {
     const get = this.host?.getConfiguration;
     if (typeof get !== "function") return undefined;
-    return get.call(this.host, "grok");
+    const cfg = get.call(this.host, "grok") as { get?: unknown } | undefined;
+    if (!cfg || typeof cfg.get !== "function") return undefined;
+    return cfg as { get<T>(key: string, defaultValue: T): T };
   }
 
   private usesPanelTabs(): boolean {
@@ -3023,7 +3025,8 @@ export class GrokSidebar {
 
   private bindChatPanel(panel: HostEditorWebview, session: Session): void {
     session.panel = panel;
-    panel.webview.html = this.getHtml(panel.webview);
+    // Subscribe before assigning html: a restored or cached editor webview can
+    // run scripts in the same turn, and a lost `ready` leaves Starting forever.
     panel.webview.onDidReceiveMessage((raw) => {
       const m = raw as WebviewMsg;
       if (m.type === "ready" && session.client) {
@@ -3037,6 +3040,7 @@ export class GrokSidebar {
         void this.host.showErrorMessage(`Grok: ${m.type} failed — ${text}`);
       });
     });
+    panel.webview.html = this.getHtml(panel.webview);
     panel.onDidDispose(() => {
       if (session.panel === panel) session.panel = undefined;
     });
@@ -3452,7 +3456,10 @@ See design doc for the full state machine diagram.`;
 
   private postMode(session: Session = this.focused): void {
     const message: HostMsg = { type: "modeChanged", modeId: this.displayMode(session) };
-    if (session === this.focused) this.view?.webview.postMessage(message);
+    if (session === this.focused) {
+      const webview = this.webviewFor(session);
+      if (webview) webview.postMessage(message);
+    }
     this.sendRemoteSession(session, message);
   }
 
@@ -8203,7 +8210,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const mime = m.mimeType || guessMediaMime(m.path);
       // Trusted session media: stream from disk when the webview can.
-      const webview = this.view?.webview;
+      const webview = this.webviewFor(session);
       if (webview) {
         const src = webview.asWebviewUri(Uri.file(m.path));
         // Copy image needs PIXELS, and a webview cannot read them back out of an
@@ -17091,8 +17098,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postChips(session: Session = this.focused): void {
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
-    if (session === this.focused && this.view) {
-      const webview = this.view.webview;
+    const webview = session === this.focused ? this.webviewFor(session) : undefined;
+    if (webview) {
       const localMessage: HostMsg = { type: "chips", chips: this.localPreviewChips(session, webview) };
       void webview.postMessage(localMessage);
     }
@@ -17218,7 +17225,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     const chat = this.webviewFor(this.focused);
     if (chat) chat.postMessage(message);
-    else this.view?.webview.postMessage(message);
+    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
@@ -17238,7 +17245,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.postTap?.("local", message);
     const chat = this.webviewFor(this.focused);
     if (chat) chat.postMessage(message);
-    else this.view?.webview.postMessage(message);
+    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     this.postToSessions(message);
   }
@@ -18763,7 +18770,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = session.activeSessionId;
     if (!id) return;
     const message: HostMsg = { type: "sessionDot", id, dot: this.dotForId(id) };
-    this.view?.webview.postMessage(message);
+    const chat = this.webviewFor(this.focused);
+    if (chat) chat.postMessage(message);
+    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
