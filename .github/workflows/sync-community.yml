@@ -15,6 +15,7 @@ on:
 permissions:
   contents: write
   issues: write
+  actions: write
 
 concurrency:
   group: sync-community
@@ -120,4 +121,16 @@ jobs:
             gh issue comment "$EXISTING" --body "$BODY"
           else
             gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Queue the next community release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/sync-community.mjs --plan > /tmp/grok30m-sync-plan.json
+          ACTION=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/grok30m-sync-plan.json","utf8")).action)')
+          if [ "$ACTION" = "sync" ]; then
+            gh workflow run sync-community.yml --ref grok30m
           fi
