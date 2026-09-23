@@ -331,6 +331,8 @@ export interface HostEditorWebview extends HostDisposable {
   readonly webview: HostWebview;
   reveal(): void;
   onDidDispose(listener: () => void): HostDisposable;
+  /** Fires when the user shows or leaves this editor tab. */
+  onDidChangeViewState?(listener: (active: boolean) => void): HostDisposable;
   setTitle?(title: string): void;
 }
 

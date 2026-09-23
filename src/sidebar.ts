@@ -3023,14 +3023,31 @@ export class GrokSidebar {
     this.bindChatPanel(panel, session);
   }
 
+  private claimPanelSession(session: Session): void {
+    if (this.focused === session) return;
+    // The tab the user is in, not a replay. focusSession() clears the webview
+    // and would wipe the composer they are about to paste into.
+    this.focused = session;
+    this.touch(session);
+    this.markRead(session);
+    this.updatePanelTitle(session);
+  }
+
   private bindChatPanel(panel: HostEditorWebview, session: Session): void {
     session.panel = panel;
     // Subscribe before assigning html: a restored or cached editor webview can
     // run scripts in the same turn, and a lost `ready` leaves Starting forever.
+    panel.onDidChangeViewState?.((active) => {
+      if (active) this.claimPanelSession(session);
+    });
     panel.webview.onDidReceiveMessage((raw) => {
       const m = raw as WebviewMsg;
+      // Blur of the tab being left must not steal focus back. Every other
+      // message is from the tab the user is acting in — including paste and send.
+      if (!(m.type === "composerFocus" && m.focused === false)) {
+        this.claimPanelSession(session);
+      }
       if (m.type === "ready" && session.client) {
-        this.focused = session;
         this.rehydrateWebviewFromFocused();
         return;
       }

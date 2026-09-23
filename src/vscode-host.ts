@@ -311,6 +311,9 @@ export function createVsCodeHost(
         onDidDispose(listener) {
           return panel.onDidDispose(listener);
         },
+        onDidChangeViewState(listener) {
+          return panel.onDidChangeViewState((e) => listener(e.webviewPanel.active));
+        },
         dispose() {
           panel.dispose();
         },

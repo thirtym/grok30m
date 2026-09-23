@@ -49,6 +49,18 @@ describe("Grok30m session tabs (fork invariants)", () => {
     expect(chat).toMatch(/if \(historyBtn\) historyBtn\.onclick/);
   });
 
+  it("a paste or send in an editor tab binds that tab's session", () => {
+    const start = sidebar.indexOf("private bindChatPanel(");
+    const end = sidebar.indexOf("private getSessionsHtml(", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = sidebar.slice(start, end);
+    expect(body).toContain("claimPanelSession");
+    expect(body.indexOf("claimPanelSession")).toBeLessThan(body.indexOf("this.onMessage"));
+    expect(body).toContain('m.type === "composerFocus" && m.focused === false');
+    expect(host).toContain("onDidChangeViewState");
+  });
+
   it("keeps a per-session editor webview on Session and Host", () => {
     expect(session).toMatch(/panel\?: HostEditorWebview/);
     expect(host).toContain("openEditorWebview");
