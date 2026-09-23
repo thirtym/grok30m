@@ -5,6 +5,11 @@ Upstream base at fork time: [`56d2b4f`](https://github.com/phuryn/grok-build-vsc
 
 Full upstream history: [README.upstream.md](README.upstream.md) and the [upstream repo](https://github.com/phuryn/grok-build-vscode).
 
+## 2.1.3
+
+- **Merge community 4.6.1** (auto-sync).
+- **Grok30m UX kept:** editor-tab chat, Sessions sidebar, hide automated sessions.
+
 ## 2.1.2
 
 - **Editor tab leaves Starting.** Sessions sidebar omits the in-tab history button; chat.js no longer throws on that missing node, so `ready` reaches the host.
