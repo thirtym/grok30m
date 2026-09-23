@@ -57,6 +57,10 @@ jobs:
     if: needs.check.outputs.action == 'sync'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # gh prefers a remote named "upstream" over origin. The community fetch
+    # remote must not use that name, and releases/issues stay on this repo.
+    env:
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
         with:

@@ -18,6 +18,9 @@ const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const COMMUNITY_GITHUB_REPO = "phuryn/grok-build-vscode";
 const UPSTREAM_URL = `https://github.com/${COMMUNITY_GITHUB_REPO}.git`;
+// Not "upstream": gh treats that remote name as the repo to publish to,
+// which made `gh release create` 403 against community instead of this fork.
+const COMMUNITY_REMOTE = "community";
 
 const argv = process.argv.slice(2);
 const args = new Set(argv);
@@ -132,9 +135,9 @@ function plan(forcedTag) {
 }
 
 function ensureUpstream() {
-  const remotes = git(["remote"]);
-  if (!remotes.split("\n").includes("upstream")) {
-    git(["remote", "add", "upstream", UPSTREAM_URL]);
+  const remotes = git(["remote"]).split("\n");
+  if (!remotes.includes(COMMUNITY_REMOTE)) {
+    git(["remote", "add", COMMUNITY_REMOTE, UPSTREAM_URL]);
   }
 }
 
@@ -186,7 +189,7 @@ function applySync(decision) {
     process.exit(1);
   }
   ensureUpstream();
-  git(["fetch", "upstream", "--no-tags", `+refs/tags/${decision.communityTag}:refs/tags/${decision.communityTag}`]);
+  git(["fetch", COMMUNITY_REMOTE, "--no-tags", `+refs/tags/${decision.communityTag}:refs/tags/${decision.communityTag}`]);
   try {
     git(["merge", "--no-edit", decision.communityTag]);
   } catch {
