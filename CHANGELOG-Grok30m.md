@@ -5,6 +5,10 @@ Upstream base at fork time: [`56d2b4f`](https://github.com/phuryn/grok-build-vsc
 
 Full upstream history: [README.upstream.md](README.upstream.md) and the [upstream repo](https://github.com/phuryn/grok-build-vscode).
 
+## 2.1.5
+
+- **Paste stays in the tab you pasted into.** Switching editor tabs now makes that session the one the host sends to.
+
 ## 2.1.4
 
 - **Merge community 4.7.0** (auto-sync).

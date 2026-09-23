@@ -2,7 +2,7 @@
   "name": "grok30m",
   "displayName": "Grok30m",
   "description": "Grok30m — fork of the community Grok Build VS Code client with Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
-  "version": "2.1.4",
+  "version": "2.1.5",
   "publisher": "grok30m",
   "author": {
     "name": "Grok30m contributors",
