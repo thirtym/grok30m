@@ -1,21 +1,21 @@
 {
-  "name": "grok-vscode-phuryn",
-  "displayName": "Grok Build for VS Code (Community)",
-  "description": "GUI for Grok Build CLI (incl. Grok 4.7). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI).",
-  "version": "4.11.1",
-  "publisher": "PawelHuryn",
+  "name": "grok30m",
+  "displayName": "Grok30m",
+  "description": "Grok30m — fork of the community Grok Build VS Code client with Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
+  "version": "2.1.10",
+  "publisher": "grok30m",
   "author": {
-    "name": "Paweł Huryn",
-    "url": "https://www.productcompass.pm"
+    "name": "Grok30m contributors",
+    "url": "https://github.com/thirtym/grok30m"
   },
   "license": "FSL-1.1-MIT",
-  "homepage": "https://github.com/phuryn/grok-build-vscode",
+  "homepage": "https://github.com/thirtym/grok30m",
   "bugs": {
-    "url": "https://github.com/phuryn/grok-build-vscode/issues"
+    "url": "https://github.com/thirtym/grok30m/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/phuryn/grok-build-vscode"
+    "url": "https://github.com/thirtym/grok30m.git"
   },
   "engines": {
     "vscode": "^1.106.0"
@@ -42,33 +42,38 @@
   "icon": "resources/grok-icon.png",
   "main": "./out/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onView:grok.sessions",
+    "onWebviewPanel:grok.panel",
+    "onCommand:grok.panel.open",
+    "onCommand:grok.sidebar.open",
+    "onCommand:grok.checkForUpdates"
   ],
   "contributes": {
     "viewsContainers": {
       "secondarySidebar": [
         {
           "id": "grokSidebar",
-          "title": "Grok",
+          "title": "Grok30m",
           "icon": "resources/grok-icon.svg"
         }
       ],
       "activitybar": [
         {
           "id": "grokPrimary",
-          "title": "Grok",
+          "title": "Grok30m",
           "icon": "resources/grok-icon.svg"
         },
         {
           "id": "grokProjects",
-          "title": "Grok",
+          "title": "Grok30m",
           "icon": "resources/grok-icon.svg"
         }
       ],
       "panel": [
         {
           "id": "grokPanel",
-          "title": "Grok",
+          "title": "Grok30m",
           "icon": "resources/grok-icon.svg"
         }
       ]
@@ -78,94 +83,104 @@
         {
           "type": "webview",
           "id": "grok.chat",
-          "name": "Grok"
+          "name": "Chat",
+          "when": "config.grok.preferredLocation == 'sidebar' || !config.grok.sessionsSidebar"
         }
       ],
       "grokProjects": [
         {
           "type": "webview",
           "id": "grok.projects",
-          "name": "Projects"
+          "name": "Projects",
+          "when": "!config.grok.sessionsSidebar"
+        }
+      ],
+      "grokPrimary": [
+        {
+          "type": "webview",
+          "id": "grok.sessions",
+          "name": "Sessions",
+          "when": "config.grok.sessionsSidebar"
         }
       ]
     },
     "commands": [
       {
         "command": "grok.open",
-        "title": "Grok: Open"
+        "title": "Grok30m: Open"
       },
       {
         "command": "grok.moveView",
-        "title": "Grok: Move Chat View"
+        "title": "Grok30m: Move Chat View"
       },
       {
         "command": "grok.newSession",
-        "title": "Grok: New Session"
+        "title": "Grok30m: New Session"
       },
       {
         "command": "grok.newWorktreeSession",
-        "title": "Grok: New Worktree Session"
+        "title": "Grok30m: New Worktree Session"
       },
       {
         "command": "grok.applyWorktree",
-        "title": "Grok: Apply Worktree"
+        "title": "Grok30m: Apply Worktree"
       },
       {
         "command": "grok.removeWorktree",
-        "title": "Grok: Remove Worktree"
+        "title": "Grok30m: Remove Worktree"
       },
       {
         "command": "grok.rewind",
-        "title": "Grok: Rewind Conversation"
+        "title": "Grok30m: Rewind Conversation"
       },
       {
         "command": "grok.compact",
-        "title": "Grok: Compact Conversation"
+        "title": "Grok30m: Compact Conversation"
       },
       {
         "command": "grok.pickModel",
-        "title": "Grok: Pick Model"
+        "title": "Grok30m: Pick Model"
       },
       {
         "command": "grok.toggleMode",
-        "title": "Grok: Toggle Plan / Agent Mode"
+        "title": "Grok30m: Toggle Plan / Agent Mode"
       },
       {
         "command": "grok.sendSelection",
-        "title": "Add Selection to Grok"
+        "title": "Add Selection to Grok30m"
       },
       {
         "command": "grok.sendFile",
-        "title": "Add to Grok chat"
+        "title": "Add to Grok30m chat"
       },
       {
         "command": "grok.insertAtMention",
-        "title": "Grok: Insert @-Mention"
+        "title": "Grok30m: Insert @-Mention"
       },
       {
         "command": "grok.showLogs",
-        "title": "Grok: Show Logs"
+        "title": "Grok30m: Show Logs"
       },
       {
         "command": "grok.settings",
-        "title": "Grok: Settings",
+        "title": "Grok30m: Settings",
         "icon": "$(gear)"
       },
       {
         "command": "grok.expandAllToolDetails",
-        "title": "Grok: Expand All Tool Details (This Session)"
+        "title": "Grok30m: Expand All Tool Details (This Session)"
       },
       {
         "command": "grok.collapseAllToolDetails",
-        "title": "Grok: Collapse All Tool Details (This Session)"
+        "title": "Grok30m: Collapse All Tool Details (This Session)"
       },
       {
         "command": "grok.findInSession",
-        "title": "Grok: Find in Conversation"
+        "title": "Grok30m: Find in Conversation"
       },
       {
         "command": "grok.logout",
-        "title": "Grok: Log Out"
+        "title": "Grok30m: Log Out"
       },
       {
         "command": "grok.linkRemote",
@@ -177,15 +192,27 @@
       },
       {
         "command": "grok._debugDummyPlan",
-        "title": "Grok: Debug — Show dummy plan card (for testing Approve/Reject/Cancel)"
+        "title": "Grok30m: Debug — Show dummy plan card (for testing Approve/Reject/Cancel)"
       },
       {
         "command": "grok.composerForward",
-        "title": "Grok: Composer — Move Forward"
+        "title": "Grok30m: Composer — Move Forward"
       },
       {
         "command": "grok.composerPreviousLine",
-        "title": "Grok: Composer — Move to Previous Line"
+        "title": "Grok30m: Composer — Move to Previous Line"
+      },
+      {
+        "command": "grok.panel.open",
+        "title": "Grok30m: Open in Editor Tab"
+      },
+      {
+        "command": "grok.sidebar.open",
+        "title": "Grok30m: Open in Sidebar"
+      },
+      {
+        "command": "grok.checkForUpdates",
+        "title": "Grok30m: Check for Updates"
       }
     ],
     "keybindings": [
@@ -261,7 +288,7 @@
       ]
     },
     "configuration": {
-      "title": "Grok",
+      "title": "Grok30m",
       "properties": {
         "grok.cliPath": {
           "type": "string",
@@ -503,6 +530,34 @@
           ],
           "default": "gpt-live-transcribe",
           "description": "OpenAI Realtime transcription model. Dictionary terms become model-specific vocabulary hints. The explicit batch mode uses gpt-4o-transcribe."
+        },
+        "grok.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Keep Grok30m current from the public GitHub Releases feed ([thirtym/grok30m](https://github.com/thirtym/grok30m/releases/latest)). Checks on this computer *and* on SSH remotes (each host has its own install). Turn off to only update when you run **Grok30m: Check for Updates**."
+        },
+        "grok.preferredLocation": {
+          "type": "string",
+          "enum": [
+            "panel",
+            "sidebar"
+          ],
+          "enumDescriptions": [
+            "Editor tab — chat stays open while you edit files (Claude Code style)",
+            "Sidebar — original Grok layout with chat in the side panel"
+          ],
+          "default": "panel",
+          "description": "Where Grok chat opens by default."
+        },
+        "grok.sessionsSidebar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show session history in a dedicated Sessions sidebar view instead of the in-chat history dropdown."
+        },
+        "grok.hideAutoSessions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide automated sessions tagged [Auto:review], [Auto:deploy], or [Auto:robot] from session history. Toggle live in the Sessions sidebar."
         }
       }
     }
@@ -572,5 +627,8 @@
     "electron-updater": "^6.6.4",
     "jpeg-js": "^0.4.4",
     "ws": "^8.21.0"
-  }
+  },
+  "extensionKind": [
+    "workspace"
+  ]
 }
