@@ -377,6 +377,9 @@ import {
   sessionCatalogDirs,
   sessionDirFor,
 } from "./sessions";
+import { shouldHideAutoSession } from "./session-tags";
+import { COMMUNITY_BASE_VERSION, COMMUNITY_RELEASES_PAGE } from "./community-sync";
+import { peekCommunityLag } from "./release-peek";
 import {
   base64DecodedByteLength,
   isTrustedCodexGeneratedImagePath,
@@ -760,6 +763,10 @@ export class GrokSidebar {
   private view?: HostWebviewView;
   /** Second local consumer of catalog-shaped host messages. Absent until resolved. */
   private projectsRail?: HostWebviewView;
+  /** Dedicated Sessions sidebar (Grok30m). Absent until that view resolves. */
+  private sessionsView?: HostWebviewView;
+  public static readonly panelType = "grok.panel";
+  public static readonly sessionsViewId = "grok.sessions";
   /** The session currently shown in the chat — one member of {@link pool}. */
   private focused = this.newLocalSession();
   /**
@@ -2989,6 +2996,218 @@ export class GrokSidebar {
     this.projectsRail = undefined;
   }
 
+  attachSessionsView(view: HostWebviewView): void {
+    this.sessionsView = view;
+    view.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [
+        Uri.joinPath(this.context.extensionUri, "media"),
+        Uri.joinPath(this.context.extensionUri, "resources"),
+      ],
+    };
+    view.webview.html = this.getSessionsHtml(view.webview);
+    view.webview.onDidReceiveMessage((raw) => {
+      void this.onSessionsMessage(raw as WebviewMsg);
+    });
+    this.postSessionsList();
+  }
+
+  private grokConfig(): { get<T>(key: string, defaultValue: T): T } | undefined {
+    const get = this.host?.getConfiguration;
+    if (typeof get !== "function") return undefined;
+    const cfg = get.call(this.host, "grok") as { get?: unknown } | undefined;
+    if (!cfg || typeof cfg.get !== "function") return undefined;
+    return cfg as { get<T>(key: string, defaultValue: T): T };
+  }
+
+  private usesPanelTabs(): boolean {
+    return this.grokConfig()?.get<"panel" | "sidebar">("preferredLocation", "panel") === "panel";
+  }
+
+  useSessionsSidebar(): boolean {
+    return this.grokConfig()?.get<boolean>("sessionsSidebar", true) ?? true;
+  }
+
+  hideAutoSessions(): boolean {
+    return this.grokConfig()?.get<boolean>("hideAutoSessions", true) ?? false;
+  }
+
+  private webviewFor(session: Session): HostWebview | undefined {
+    if (this.usesPanelTabs()) {
+      return session.panel?.webview
+        ?? (session === this.focused ? this.view?.webview : undefined);
+    }
+    return session === this.focused ? this.view?.webview : undefined;
+  }
+
+  async openPreferred(): Promise<void> {
+    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
+    else await this.host.revealChatView();
+    if (this.useSessionsSidebar()) {
+      try {
+        await this.host.revealChatView();
+      } catch { /* Sessions lives in its own activity-bar view */ }
+    }
+  }
+
+  openPanel(): void {
+    this.ensurePanelForSession(this.focused);
+  }
+
+  async openSidebar(): Promise<void> {
+    await this.host.revealChatView();
+  }
+
+  private postToSessions(message: HostMsg): void {
+    if (message.type !== "sessions" && message.type !== "sessionDot") return;
+    void this.sessionsView?.webview.postMessage(message);
+  }
+
+  private async onSessionsMessage(msg: WebviewMsg): Promise<void> {
+    switch (msg.type) {
+      case "sessionsReady":
+        this.postSessionsList();
+        break;
+      case "listSessions":
+        this.postSessionsList({
+          offset: msg.offset,
+          limit: msg.limit,
+          query: msg.query,
+          providerCursor: msg.providerCursor,
+        });
+        break;
+      case "setHideAutoSessions":
+        void this.host.getConfiguration("grok").update("hideAutoSessions", !!msg.value);
+        this.postSessionsList();
+        break;
+      case "resumeSession":
+        await this.openSession(msg.id);
+        this.revealChat();
+        break;
+      case "renameSession":
+        this.renameSession(msg.id, msg.name, "local");
+        break;
+      case "deleteSession":
+        await this.deleteSession(msg.id, msg.name, "local");
+        break;
+      case "clearAllSessions":
+        await this.clearAllSessions(this.historyCwdFor("local"), "local");
+        break;
+      case "newSession":
+        await this.newFocusedSession("local");
+        this.revealChat();
+        break;
+    }
+  }
+
+  private revealChat(): void {
+    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
+    else void this.host.revealChatView?.();
+  }
+
+  private panelTitleFor(session: Session): string {
+    const name = this.sessionDisplayName(session).trim();
+    return name || "Grok30m";
+  }
+
+  private updatePanelTitle(session: Session): void {
+    session.panel?.setTitle?.(this.panelTitleFor(session));
+  }
+
+  private ensurePanelForSession(session: Session, title?: string): void {
+    if (!this.usesPanelTabs() || typeof this.host.openEditorWebview !== "function") return;
+    if (!this.context?.extensionUri) return;
+    if (session.panel) {
+      session.panel.reveal();
+      this.updatePanelTitle(session);
+      return;
+    }
+    const panel = this.host.openEditorWebview({
+      viewType: GrokSidebar.panelType,
+      title: title ?? this.panelTitleFor(session),
+      localResourceRoots: this.chatLocalResourceRoots(),
+    });
+    if (!panel) return;
+    this.bindChatPanel(panel, session);
+  }
+
+  private claimPanelSession(session: Session): void {
+    if (this.focused === session) return;
+    // The tab the user is in, not a replay. focusSession() clears the webview
+    // and would wipe the composer they are about to paste into.
+    this.focused = session;
+    this.touch(session);
+    this.markRead(session);
+    this.updatePanelTitle(session);
+  }
+
+  private bindChatPanel(panel: HostEditorWebview, session: Session): void {
+    session.panel = panel;
+    // Subscribe before assigning html: a restored or cached editor webview can
+    // run scripts in the same turn, and a lost `ready` leaves Starting forever.
+    panel.onDidChangeViewState?.((active) => {
+      if (active) this.claimPanelSession(session);
+    });
+    panel.webview.onDidReceiveMessage((raw) => {
+      const m = raw as WebviewMsg;
+      // Blur of the tab being left must not steal focus back. Every other
+      // message is from the tab the user is acting in — including paste and send.
+      if (!(m.type === "composerFocus" && m.focused === false)) {
+        this.claimPanelSession(session);
+      }
+      if (m.type === "ready" && session.client) {
+        this.rehydrateWebviewFromFocused();
+        return;
+      }
+      void this.onMessage(m, "local").catch((e) => {
+        const text = (e as Error)?.message ?? String(e);
+        this.host.appendLine(`[webview] ${m.type} failed: ${text}`);
+        void this.host.showErrorMessage(`Grok: ${m.type} failed — ${text}`);
+      });
+    });
+    panel.webview.html = this.getHtml(panel.webview);
+    panel.onDidDispose(() => {
+      if (session.panel === panel) session.panel = undefined;
+    });
+  }
+
+  private getSessionsHtml(webview: HostWebview): string {
+    const nonce = getNonce();
+    const mediaUri = (file: string) =>
+      webview.asWebviewUri(Uri.joinPath(this.context.extensionUri, "media", file));
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
+<style>html, body { background: var(--vscode-sideBar-background); }</style>
+<link rel="stylesheet" href="${mediaUri("sessions.css")}" />
+</head>
+<body>
+  <div class="sessions-root">
+    <div class="sessions-header">
+      <span class="sessions-title">Sessions</span>
+      <button id="sessions-new-btn" class="sessions-new-btn" title="New session"></button>
+    </div>
+    <div class="sessions-search-wrap">
+      <input id="sessions-search" class="sessions-search" type="text" placeholder="Search sessions…" />
+    </div>
+    <label class="sessions-filter-auto" title="Hide automated sessions">
+      <input id="sessions-hide-auto" type="checkbox" checked />
+      <span>Hide automated</span>
+    </label>
+    <div id="sessions-list" class="sessions-list"></div>
+    <div id="sessions-footer" class="sessions-footer" hidden>
+      <button id="sessions-clear-btn" class="sessions-clear-all" title="Delete all sessions in this workspace's history"></button>
+    </div>
+  </div>
+  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
+  <script nonce="${nonce}" src="${mediaUri("sessions.js")}"></script>
+</body>
+</html>`;
+  }
+
   private chatLocalResourceRoots(): Uri[] {
     return [
       Uri.joinPath(this.context.extensionUri, "media"),
@@ -3362,7 +3581,10 @@ See design doc for the full state machine diagram.`;
 
   private postMode(session: Session = this.focused): void {
     const message: HostMsg = { type: "modeChanged", modeId: this.displayMode(session) };
-    if (session === this.focused) this.view?.webview.postMessage(message);
+    if (session === this.focused) {
+      const webview = this.webviewFor(session);
+      if (webview) webview.postMessage(message);
+    }
     this.sendRemoteSession(session, message);
   }
 
@@ -8210,7 +8432,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const mime = m.mimeType || guessMediaMime(m.path);
       // Trusted session media: stream from disk when the webview can.
-      const webview = this.view?.webview;
+      const webview = this.webviewFor(session);
       if (webview) {
         const src = webview.asWebviewUri(Uri.file(m.path));
         // Copy image needs PIXELS, and a webview cannot read them back out of an
@@ -13535,17 +13757,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? offset + entries.length
       : Math.max(offset + entries.length, combinedPage?.providerCursor.grokOffset ?? 0);
     const total = query ? (merged?.length ?? 0) : (grok?.total ?? 0) + adapter.length;
+    const hideAuto = this.hideAutoSessions();
+    const visible = hideAuto
+      ? entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined))
+      : entries;
+    const visibleDots: Record<string, Dot> = {};
+    for (const entry of visible) visibleDots[entry.id] = this.dotForId(entry.id);
     return {
       type: "sessions",
-      entries,
+      entries: visible,
       activeId,
-      dots,
+      dots: visibleDots,
       offset,
-      total,
+      total: hideAuto ? visible.length : total,
       hasMore: query ? nextOffset < total : combinedPage?.hasMore ?? false,
       nextOffset,
       ...(!query && combinedPage ? { providerCursor: combinedPage.providerCursor } : {}),
       query,
+      hideAutoSessions: hideAuto,
     };
   }
 
@@ -13783,6 +14012,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
+    const hideAuto = this.hideAutoSessions();
     // Stale per-tab / selected cwds must not scan a closed project's catalog.
     const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
@@ -13831,16 +14061,22 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     let pageEntries: SessionListEntry[];
     let total: number;
     let nextOffset: number;
-    if (query) {
-      // Search needs names for everything, so read (cache-backed) the whole list once, then filter.
+    const filterAuto = (entries: SessionListEntry[]) => {
+      if (!hideAuto) return entries;
+      return entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined));
+    };
+    if (query || hideAuto) {
+      // Search and hide-auto need names, so read (cache-backed) the whole list once, then filter.
       const all = this.readEntriesCachedMulti(index.map((e) => e.id), mtimeById, cwdById, overrides, grokHome, log)
         .filter((e) => e.kind !== "subagent");
       all.sort((a, b) => b.updatedAt - a.updatedAt);
-      const matched = all.filter(
-        (e) =>
-          e.displayName.toLowerCase().includes(query) ||
-          (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
-      );
+      const matched = filterAuto(query
+        ? all.filter(
+            (e) =>
+              e.displayName.toLowerCase().includes(query) ||
+              (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
+          )
+        : all);
       total = matched.length;
       pageEntries = matched.slice(offset, offset + limit);
       nextOffset = offset + pageEntries.length;
@@ -13928,6 +14164,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       hasMore,
       nextOffset,
       query: opts?.query ?? "",
+      hideAutoSessions: hideAuto,
     };
   }
 
@@ -17433,7 +17670,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    */
   private rehydrateWebviewFromFocused(): void {
     const session = this.focused;
-    const wv = this.view?.webview;
+    const wv = this.webviewFor(session);
     if (!wv) return;
     this.touch(session);
     this.markRead(session);
@@ -17489,8 +17726,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postChips(session: Session = this.focused): void {
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
-    if (session === this.focused && this.view) {
-      const webview = this.view.webview;
+    const webview = session === this.focused ? this.webviewFor(session) : undefined;
+    if (webview) {
       const localMessage: HostMsg = { type: "chips", chips: this.localPreviewChips(session, webview) };
       void webview.postMessage(localMessage);
     }
@@ -17615,7 +17852,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    this.view?.webview.postMessage(message);
+    const chat = this.webviewFor(this.focused);
+    if (chat) chat.postMessage(message);
+    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
@@ -17633,8 +17872,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Post to the VS Code webview only (plus catalog mirror to the projects rail). */
   private postLocal(message: HostMsg): void {
     this.postTap?.("local", message);
-    this.view?.webview.postMessage(message);
+    const chat = this.webviewFor(this.focused);
+    if (chat) chat.postMessage(message);
+    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
+    this.postToSessions(message);
   }
 
   /**
@@ -18251,10 +18493,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session === this.focused) {
       this.postTap?.("local", message);
-      const webview = this.view?.webview;
+      const webview = this.webviewFor(session);
       if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
       // Active-session identity for the projects rail (highlight + pin home).
       this.mirrorToProjectsRail(message);
+      this.postToSessions(message);
     }
     if (!session.replaying) this.sendRemoteSession(session, message);
   }
@@ -18279,9 +18522,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.view?.webview;
+    const webview = this.webviewFor(session);
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
+    this.postToSessions(message);
   }
 
   /** Desk-targeted, non-replayable delivery for one-shot notices. */
@@ -18289,9 +18533,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.view?.webview;
+    const webview = this.webviewFor(session);
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
+    this.postToSessions(message);
   }
 
   private async replayLoadedHistory(session: Session, load: () => Promise<void>): Promise<void> {
@@ -18510,7 +18755,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.touch(session);
     this.markRead(session); // opening it clears any unread (green/red) badge
     this.refreshWorkflowCompletions(session);
-    const wv = this.view?.webview;
+    const wv = this.webviewFor(session);
     // Both surfaces need it, and the desk has the same gap the browser does —
     // re-focusing a live conversation never said which agent it belongs to.
     const identity = this.sessionIdentityFrame(session);
@@ -19207,7 +19452,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = session.activeSessionId;
     if (!id) return;
     const message: HostMsg = { type: "sessionDot", id, dot: this.dotForId(id) };
-    this.view?.webview.postMessage(message);
+    const chat = this.webviewFor(this.focused);
+    if (chat) chat.postMessage(message);
+    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
@@ -19685,6 +19932,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // After the sweep, not before: the sweep can retire the empty session this
     // one replaced, and a list built ahead of it would show a row that is gone.
     this.postSessionsList();
+    this.revealChat();
   }
 
   private focusRemoteSession(clientId: string, session: Session, notifyCatalog = true): void {
@@ -20164,6 +20412,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // a conversation is not a request to change which project you are in.
     // Desktop's own selectRepo does the whole switch; this is the half VS Code
     // needs because it has no folder to switch.
+    this.revealChat();
     if (this.host.canSwitchWorkspaceFolder) return;
     const openedIn = this.resolveLocalRepoTarget(this.sessionCwd(this.focused));
     if (openedIn && !pathsEqual(openedIn.cwd, this.selectedRepoCwd || "")) {
@@ -21329,11 +21578,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (category) {
         void this.settingsEditor.webview.postMessage({ type: "settingsCategory", category });
       }
+      void this.refreshCommunityLagOnSettings();
       return;
     }
     const panel = this.host.openEditorWebview({
       viewType: "grok.settings",
-      title: "Grok Settings",
+      title: "Grok30m Settings",
       localResourceRoots: [
         Uri.joinPath(this.context.extensionUri, "media"),
         Uri.joinPath(this.context.extensionUri, "resources"),
@@ -21356,6 +21606,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const text = (e as Error)?.message ?? String(e);
         this.host.appendLine(`[settings] ${msg.type} failed: ${text}`);
       });
+    });
+    void this.refreshCommunityLagOnSettings();
+  }
+
+  private async refreshCommunityLagOnSettings(): Promise<void> {
+    const panel = this.settingsEditor;
+    if (!panel) return;
+    const lag = await peekCommunityLag(this.context.extensionVersion);
+    if (this.settingsEditor !== panel) return;
+    void panel.webview.postMessage({
+      type: "communityLagStatus",
+      base: lag.base,
+      latest: lag.latest || "",
+      behind: lag.behind,
+      error: lag.error || "",
     });
   }
 
@@ -21408,6 +21673,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         providersChecking: this.providerRefreshInFlight,
         githubState: this.githubStatePayload(),
         extVersion: this.context.extensionVersion,
+        communityBase: COMMUNITY_BASE_VERSION,
+        communityLatest: "",
+        communityBehind: false,
+        communityError: "",
+        communityReleasesUrl: COMMUNITY_RELEASES_PAGE,
         cliVersion: this.providerCliVersions.grok || "",
         hostKind: "extension" as const,
         hostName: deviceDisplayName(os.hostname(), process.platform, os.release()),
@@ -21453,7 +21723,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   html, body { background: var(--vscode-editor-background, var(--vscode-sideBar-background)); }
 </style>
 <link rel="stylesheet" href="${mediaUri("settings.css")}" />
-<title>Grok Settings</title>
+<title>Grok30m Settings</title>
 </head>
 <body class="settings-page">
   <div id="settings-root"></div>
@@ -21489,6 +21759,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           } };
           if (msg.current) next.cliVersion = msg.current;
           surface.update(next);
+        }
+        if (msg.type === "communityLagStatus") {
+          surface.update({
+            communityBase: msg.base || "",
+            communityLatest: msg.latest || "",
+            communityBehind: !!msg.behind,
+            communityError: msg.error || "",
+          });
         }
         if (msg.type === "providerState" && Array.isArray(msg.providers)) {
           surface.update({ providers: msg.providers, providersChecking: msg.checking === true });
@@ -21553,9 +21831,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? `
   <aside id="projects-rail" class="projects-rail" aria-label="Projects">
     <div class="rail-top">
-      <span class="rail-brand" title="Grok Build Desktop">
+      <span class="rail-brand" title="Grok30m">
         <span class="mark" style="--rail-mark:url('${railMark}')" aria-hidden="true"></span>
-        <span class="wordmark"><b>Grok</b> <span class="dim">Build</span></span>
+        <span class="wordmark"><b>Grok</b><span class="dim">30m</span></span>
       </span>
       <button id="desk-rail-toggle" class="rail-icon-btn" type="button" title="Hide projects" aria-label="Hide projects" aria-expanded="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>
@@ -21649,7 +21927,7 @@ ${openMain}
     </div>
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>
     <button id="remote-btn" class="icon-btn remote-btn" title="Continue remotely" hidden></button>
-    <button id="history-btn" class="icon-btn" title="Session history"></button>
+    ${this.useSessionsSidebar() ? "" : `<button id="history-btn" class="icon-btn" title="Session history"></button>`}
     <button id="new-btn" class="icon-btn" title="New session"></button>
     ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}
     ${this.host.canSwitchWorkspaceFolder ? "" : `<div id="vscode-session-actions"></div>`}
@@ -21660,8 +21938,8 @@ ${fileShellOpen}
   <main id="messages" class="messages">
     <div class="welcome" id="welcome">
       <span class="welcome-mark" role="img" aria-label="Grok" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
-      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok Build (Community)"}</h2>
-      <p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>
+      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok30m"}</h2>
+      <p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>
       <p id="welcome-version" class="muted welcome-status-busy"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Starting</span></p>
       <div id="welcome-onboarding"></div>
     </div>
