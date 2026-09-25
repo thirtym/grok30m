@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
  * Merge the next community release into grok30m, re-apply the Grok30m
- * manifest (tabs + identity), bump the fork version. CI publishes the vsix.
+ * overlay (session tabs, Sessions sidebar) and manifest, bump the fork version.
+ * A conflict in a file the overlay knows is resolved by taking community's
+ * copy and running the overlay. Anything else aborts with nothing published.
  *
  *   node scripts/sync-community.mjs --plan     # gh + git files only, no compile
  *   node scripts/sync-community.mjs --apply [--tag v4.6.0]  # needs `npm run compile`
@@ -74,13 +76,15 @@ function readBaseVersion() {
 function loadApplyModules() {
   const syncJs = path.join(root, "out", "community-sync.js");
   const manifestJs = path.join(root, "out", "grok30m-manifest.js");
-  if (!existsSync(syncJs) || !existsSync(manifestJs)) {
-    console.error("Run `npm run compile` first (need out/community-sync.js).");
+  const overlayJs = path.join(root, "out", "grok30m-overlay.js");
+  if (!existsSync(syncJs) || !existsSync(manifestJs) || !existsSync(overlayJs)) {
+    console.error("Run `npm run compile` first (need out/community-sync.js and out/grok30m-overlay.js).");
     process.exit(1);
   }
   return {
     ...require(syncJs),
     ...require(manifestJs),
+    ...require(overlayJs),
   };
 }
 
@@ -177,6 +181,21 @@ function bumpSources(communityVersion, grokVersion, mods) {
   writeManifest(grokVersion, applyGrok30mManifest);
 }
 
+function reapplyOverlay(applyGrok30mFile, overlayPaths) {
+  const changed = [];
+  for (const rel of overlayPaths) {
+    const abs = path.join(root, rel);
+    if (!existsSync(abs)) continue;
+    const before = readFileSync(abs, "utf8");
+    const after = applyGrok30mFile(rel, before);
+    if (after !== before) {
+      writeFileSync(abs, after);
+      changed.push(rel);
+    }
+  }
+  if (changed.length) console.log(`Reapplied Grok30m overlay:\n${changed.join("\n")}`);
+}
+
 function applySync(decision) {
   if (decision.action !== "sync") {
     console.log(`Already on community ${decision.base}.`);
@@ -190,27 +209,26 @@ function applySync(decision) {
   }
   ensureUpstream();
   git(["fetch", COMMUNITY_REMOTE, "--no-tags", `+refs/tags/${decision.communityTag}:refs/tags/${decision.communityTag}`]);
+  const overlayPaths = mods.GROK30M_OVERLAY_PATHS;
   try {
     git(["merge", "--no-edit", decision.communityTag]);
   } catch {
     const files = conflictedFiles();
-    const auto = new Set(["package.json", "package-lock.json"]);
+    const auto = new Set(["package.json", "package-lock.json", ...overlayPaths]);
     const leftover = files.filter((f) => !auto.has(f));
     if (leftover.length) {
       try { git(["merge", "--abort"]); } catch { /* still merging */ }
       console.error(`Merge conflicts (not auto-resolved):\n${leftover.join("\n")}`);
       process.exit(2);
     }
-    if (files.includes("package.json")) {
-      git(["checkout", "--theirs", "package.json"]);
-      git(["add", "package.json"]);
-    }
-    if (files.includes("package-lock.json")) {
-      git(["checkout", "--theirs", "package-lock.json"]);
-      git(["add", "package-lock.json"]);
+    for (const file of files) {
+      if (!auto.has(file)) continue;
+      git(["checkout", "--theirs", "--", file]);
+      git(["add", "--", file]);
     }
     git(["commit", "--no-edit"]);
   }
+  reapplyOverlay(mods.applyGrok30mFile, overlayPaths);
   bumpSources(decision.communityVersion, decision.grokVersion, mods);
   execFileSync("npm", ["version", decision.grokVersion, "--no-git-tag-version", "--allow-same-version"], {
     cwd: root,
