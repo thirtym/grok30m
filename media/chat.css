@@ -30,21 +30,37 @@
      nested corners visually concentric and matches the 8px icon buttons. */
   --chat-radius-message: 12px;
   --chat-radius-code: 8px;
-  /* Project folder colours (rail). No raw hex ÔÇö blue IS the theme link token;
-     the other five are fixed oklch hues mixed with --vscode-foreground so
-     contrast polarity follows the theme without a light/dark branch (same
-     reason as --chat-surface-user above: a pure token can vanish when themes
-     map surfaces onto each other). Swatch picker and folder stroke both read
-     these, so a seventh colour is one custom property + one palette id. */
-  --repo-color-blue: var(--vscode-textLink-foreground);
-  --repo-color-teal: color-mix(in oklab, oklch(0.68 0.12 200) 72%, var(--vscode-foreground) 28%);
-  --repo-color-green: color-mix(in oklab, oklch(0.68 0.15 145) 72%, var(--vscode-foreground) 28%);
-  --repo-color-amber: color-mix(in oklab, oklch(0.76 0.14 85) 72%, var(--vscode-foreground) 28%);
-  --repo-color-coral: color-mix(in oklab, oklch(0.68 0.15 30) 72%, var(--vscode-foreground) 28%);
-  --repo-color-purple: color-mix(in oklab, oklch(0.64 0.15 305) 72%, var(--vscode-foreground) 28%);
+  /* Project colours (rail). Six hues dealt out at even intervals around the
+     wheel, at full chroma, with a light-theme branch below.
+
+     They used to be mixed 28% into --vscode-foreground so one set of values
+     would serve both themes without a branch. That bought theme-proofing with
+     chroma and the bill came due: six hues compressed toward one grey, close
+     enough that people could not tell their projects apart — and blue was the
+     worst of it, because blue WAS the link token, about 20° from teal.
+
+     Same six names, so nothing anybody has already picked is thrown away. Mark
+     and swatch picker both read these, so a seventh colour is still one custom
+     property + one palette id. Keep in step with projects-rail.css. */
+  --repo-color-blue: oklch(0.70 0.16 250);
+  --repo-color-teal: oklch(0.75 0.13 195);
+  --repo-color-green: oklch(0.76 0.17 145);
+  --repo-color-amber: oklch(0.80 0.16 80);
+  --repo-color-coral: oklch(0.70 0.19 25);
+  --repo-color-purple: oklch(0.68 0.19 305);
 }
 
 body.vscode-light {
+  /* Darker and more saturated on a light ground — the same hue at the same
+     lightness washes out on white. Amber is the weakest of the twelve at about
+     3.8:1, which clears the 3:1 WCAG asks of a graphical object; it cannot go
+     much darker without turning olive. Keep in step with projects-rail.css. */
+  --repo-color-blue: oklch(0.55 0.17 250);
+  --repo-color-teal: oklch(0.56 0.12 195);
+  --repo-color-green: oklch(0.55 0.15 145);
+  --repo-color-amber: oklch(0.62 0.15 75);
+  --repo-color-coral: oklch(0.56 0.18 25);
+  --repo-color-purple: oklch(0.52 0.20 305);
   --e1: #1a8f7d;
   --e2: #1a85ff;
   --e3: #8250df;
@@ -164,7 +180,22 @@ body {
   --rail-repo-line-height: 1.45;
   --rail-repo-min-height: 34px;
   --rail-indent: 16px;
+  /* Conversations under a PROJECT sit one tier deeper than those under
+     Pinned or Recent, which have no parent to tuck under. The number is
+     not a taste: the project row now leads with a chevron, so its mark
+     moved right by that chevron's width, and a child that did not follow
+     would land LEFT of its own parent and flatten the tree into a list.
+     Same 32px as the VS Code rail, because the two heads are the same
+     geometry -- 4px of head padding, a 16px chevron, a 2px gap, then a
+     26px mark box. Change the chevron and this has to follow. */
+  --rail-indent-nested: 32px;
   --rail-icon-size: 14px;
+  /* The project's mark is sized on its own, not off --rail-icon-size, because
+     it is an IDENTITY rather than an affordance: it is the thing the eye finds
+     when scanning for a project, and the design it comes from draws it at 16.
+     --rail-icon-size stays 14 for what it still feeds -- the worktree branch
+     glyph, and the side bar's action icons. */
+  --rail-mark-size: 16px;
   --rail-row-radius: 5px;
   --rail-hover-bg: var(--vscode-list-hoverBackground);
 }
@@ -587,16 +618,55 @@ body.rail-resizing * {
   border: 0;
   border-radius: 4px;
 }
-/* Folder is an open/closed indicator ÔÇö the whole head is the hit target. */
+/* The disclosure control, split off the mark so the mark could become an
+   identity: a rocket has no open variant. The whole head is still the hit
+   target, so neither of these takes pointer events. 16px is the width the
+   nested indent is calculated from -- change one and --rail-indent-nested
+   has to follow. Without this rule the chevron is a bare inline span and
+   the two states size themselves: chevronRight is 14px and chevronDown is
+   12px, so the mark and the name shifted 2px sideways on every expand. */
+.rail-chevron {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 16px;
+  height: 28px;
+  color: var(--vscode-descriptionForeground);
+  cursor: inherit;
+  pointer-events: none;
+}
+.rail-chevron svg { width: 12px; height: 12px; }
 .rail-twisty { cursor: inherit; pointer-events: none; }
-/* Stroke tint only (SVGs use currentColor). None / missing attr keeps the
-   descriptionForeground from .rail-twisty. */
-.rail-twisty[data-repo-color="blue"] { color: var(--repo-color-blue); }
-.rail-twisty[data-repo-color="teal"] { color: var(--repo-color-teal); }
-.rail-twisty[data-repo-color="green"] { color: var(--repo-color-green); }
-.rail-twisty[data-repo-color="amber"] { color: var(--repo-color-amber); }
-.rail-twisty[data-repo-color="coral"] { color: var(--repo-color-coral); }
-.rail-twisty[data-repo-color="purple"] { color: var(--repo-color-purple); }
+/* One hue, every surface that draws the project's mark: the rail, the
+   composer chip, the switcher rows and the file panel's title. The marks are
+   currentColor, so tinting the host is the whole mechanism. On the chip the
+   attribute sits on the BUTTON, so the rule has to reach the icon rather than
+   the button, or the project name beside it takes the hue too. A missing
+   attribute keeps each host's own descriptionForeground. */
+.rail-twisty[data-repo-color="blue"],
+.repo-chip[data-repo-color="blue"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="blue"],
+.gfp-title-icon[data-repo-color="blue"] { color: var(--repo-color-blue); }
+.rail-twisty[data-repo-color="teal"],
+.repo-chip[data-repo-color="teal"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="teal"],
+.gfp-title-icon[data-repo-color="teal"] { color: var(--repo-color-teal); }
+.rail-twisty[data-repo-color="green"],
+.repo-chip[data-repo-color="green"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="green"],
+.gfp-title-icon[data-repo-color="green"] { color: var(--repo-color-green); }
+.rail-twisty[data-repo-color="amber"],
+.repo-chip[data-repo-color="amber"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="amber"],
+.gfp-title-icon[data-repo-color="amber"] { color: var(--repo-color-amber); }
+.rail-twisty[data-repo-color="coral"],
+.repo-chip[data-repo-color="coral"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="coral"],
+.gfp-title-icon[data-repo-color="coral"] { color: var(--repo-color-coral); }
+.rail-twisty[data-repo-color="purple"],
+.repo-chip[data-repo-color="purple"] .repo-chip-icon,
+.repo-row-icon[data-repo-color="purple"],
+.gfp-title-icon[data-repo-color="purple"] { color: var(--repo-color-purple); }
 .rail-action-btn { cursor: pointer; }
 /* Hover controls sit on the row's own hover surface ÔÇö no darker per-icon chip
    (Codex-style). Focus outline remains for keyboard; active pin is colour-only. */
@@ -604,7 +674,7 @@ body.rail-resizing * {
 .rail-action-btn.active { color: var(--vscode-foreground); background: transparent; }
 .rail-action-btn:focus-visible,
 .rail-more:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -1px; }
-.rail-twisty svg { width: var(--rail-icon-size); height: var(--rail-icon-size); }
+.rail-twisty svg { width: var(--rail-mark-size); height: var(--rail-mark-size); }
 .rail-repo-name {
   display: flex;
   align-items: center;
@@ -815,6 +885,14 @@ body.desk:not(.desk-with-ft) .rail-action-btn { width: 24px; height: 24px; }
    differently depending on which group it sat in. The 4px stays on the
    project lists, where the gap separates whole projects. */
 .rail-sessions { display: flex; flex-direction: column; min-width: 0; gap: 2px; padding: 2px 0 5px 0; }
+/* A conversation drawn UNDER a project (.rail-sessions) tucks under its
+   parent's mark; one drawn under Pinned or Recent (.rail-list) has no
+   parent and keeps the shallow indent. Before this both sat at 16px, so a
+   grandchild lined up with a child and the tree read as a flat list --
+   which is what "the chat room of the parent group is further right than
+   the subgroup's" was describing, on a PHONE screenshot. This rail is the
+   one that screenshot came from. */
+.rail-sessions .rail-session { padding-left: var(--rail-indent-nested); }
 .rail-session {
   position: relative;
   display: flex;
@@ -993,6 +1071,12 @@ body.desk:not(.desk-with-ft) .rail-action-btn { width: 24px; height: 24px; }
     --rail-repo-min-height: 40px;
     --rail-row-font-size: 15px;
     --rail-repo-font-size: 16px;
+    /* The mark rides with the glyphs beside it. Everything else on this row is
+       20px here, and the comment on that rule says why: on a 36px tap target a
+       smaller glyph "read as a different, lesser control". A project's own mark
+       is the last thing that should read as lesser, and at 16 against the
+       compose button's 20 it was the odd one out. */
+    --rail-mark-size: 20px;
   }
   .rail-repo-actions,
   .rail-session-actions {
@@ -1264,6 +1348,12 @@ a:hover {
 .repo-chip.disabled:hover { background: transparent; }
 .repo-chip.browsing { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
 .repo-chip-icon, .repo-chip > svg { display: inline-flex; flex: none; }
+/* The mark carries no width/height of its own (see repo-icons.js), and an
+   unsized <svg> inside a flex host has no intrinsic size to resolve a
+   flex-basis from: it collapses to 0x0 and `flex: none` never grows it, so
+   a missing rule here makes the mark VANISH rather than overflow. 13px is
+   what ICON.folder drew before, so the top bar keeps its geometry. */
+.repo-chip-icon svg { width: 13px; height: 13px; }
 .repo-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---- toolbar popovers ---- */
@@ -4953,6 +5043,10 @@ body.session-superseded .msg-edit-btn {
 }
 .repo-row-main:disabled { cursor: default; }
 .repo-row-icon { display: inline-flex; flex: none; color: var(--vscode-descriptionForeground); }
+/* Same as the chip: viewBox-only marks collapse to 0x0 in a flex host
+   without this. 13px is what ICON.folder drew here before; a worktree row
+   still draws ICON.gitBranch, which brings its own 14px. */
+.repo-row-icon svg { width: 13px; height: 13px; }
 .repo-row-copy { min-width: 0; display: flex; flex-direction: column; }
 .repo-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .repo-row-meta { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 2px; }
@@ -6157,3 +6251,103 @@ body.host-wait-visible { padding-bottom: var(--host-wait-height, 76px); }
 body.host-wait-visible .settings-overlay,
 body.host-wait-visible .gfp-panel.gfp-overlay { bottom: var(--host-wait-height, 76px) !important; }
 .settings-pending { grid-column: 1 / -1; font-size: 12px; opacity: .8; }
+
+/* ── Project mark picker (media/repo-icon-picker.js) ─────────────────────────
+   Ninety-five marks is too many to scan, so the grid is never the first thing
+   you reach: focus lands in the search box and Enter takes the top hit. The
+   tabs are for browsing, the box is for knowing what you want. */
+.repo-icon-picker {
+  position: fixed;
+  z-index: 1000;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 296px;
+  max-width: calc(100vw - 16px);
+  padding: 10px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+  border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border));
+  border-radius: 8px;
+  box-shadow: 0 4px 16px color-mix(in oklab, var(--vscode-widget-shadow) 40%, transparent);
+}
+.repo-icon-search {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 26px;
+  padding: 3px 7px;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  background: var(--vscode-input-background, transparent);
+  border: 1px solid var(--vscode-input-border, var(--vscode-editorWidget-border, transparent));
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+}
+.repo-icon-search:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.repo-icon-tabs { display: flex; flex-wrap: wrap; gap: 3px; }
+.repo-icon-tab {
+  padding: 2px 6px;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.repo-icon-tab:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
+.repo-icon-tab.is-active {
+  color: var(--vscode-foreground);
+  background: color-mix(in oklab, var(--vscode-foreground) 12%, transparent);
+}
+.repo-icon-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.repo-icon-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(32px, 1fr));
+  gap: 2px;
+  /* Eight rows before it scrolls: enough that a whole group is one glance,
+     short enough that the popover still fits above a rail row near the
+     bottom of a short window. */
+  max-height: 272px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.repo-icon-cell {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  padding: 0;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+/* The `display: grid` above is an author rule, and an author `display` beats
+   the UA stylesheet's [hidden] { display: none } outright. Without this the
+   filter sets `hidden` on ninety cells and all ninety-six stay on screen, so
+   both the category tabs and the search box look dead -- which is how they
+   were reported. Eight other elements in this file already carry the same
+   line; the picker's cells were the ones that missed it. */
+.repo-icon-cell[hidden] { display: none; }
+.repo-icon-cell svg { width: 18px; height: 18px; }
+.repo-icon-cell:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+.repo-icon-cell:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.repo-icon-cell.is-selected {
+  color: var(--vscode-foreground);
+  border-color: color-mix(in oklab, var(--vscode-focusBorder) 70%, transparent);
+  background: color-mix(in oklab, var(--vscode-foreground) 10%, transparent);
+}
+/* The default sits first in every tab and is the way back, so it is marked as
+   a different KIND of cell rather than just another glyph. */
+.repo-icon-cell.is-default { border-style: dashed; border-color: color-mix(in oklab, var(--vscode-foreground) 25%, transparent); }
+.repo-icon-empty { padding: 6px 2px; color: var(--vscode-descriptionForeground); font-size: 12px; }
+
+/* Touch: the universal 36px floor. The grid widens with the cells rather than
+   keeping eight cramped columns a thumb cannot hit. */
+@media (hover: none), (pointer: coarse) {
+  .repo-icon-search { min-height: 36px; }
+  .repo-icon-tab { min-height: 32px; }
+  .repo-icon-grid { grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); }
+}

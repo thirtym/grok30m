@@ -952,7 +952,7 @@ export type HostMsg =
   // nextOffset = the index offset the next load-more should request — ids CONSUMED
   // from the on-disk index, not entries shown (hidden subagent sessions occupy
   // slots without producing rows).
-  | { type: "sessions"; entries: SessionListEntry[]; activeId?: string | null; dots: Record<string, Dot>; offset: number; total: number; hasMore: boolean; nextOffset: number; providerCursor?: { grokOffset: number; codexHighWater?: { updatedAt: number; id: string } }; query: string; hideAutoSessions?: boolean }
+  | { type: "sessions"; entries: SessionListEntry[]; activeId?: string | null; dots: Record<string, Dot>; offset: number; total: number; hasMore: boolean; nextOffset: number; providerCursor?: { grokOffset: number; codexHighWater?: { updatedAt: number; id: string } }; query: string }
   /** A known conversation was removed. Drop it from every catalog view without
    *  changing the client's active conversation or requesting a fresh list. */
   | { type: "sessionRemoved"; id: string; cwd: string }
@@ -1259,8 +1259,6 @@ export type WebviewMsg =
   | { type: "refreshProviders" }
   | { type: "retryProviderSession"; provider?: "grok" | "codex" | "claude" }
   | { type: "listSessions"; offset?: number; limit?: number; providerCursor?: { grokOffset: number; codexHighWater?: { updatedAt: number; id: string } }; query?: string }
-  | { type: "sessionsReady" }
-  | { type: "setHideAutoSessions"; value: boolean }
   // Preview rows for a repo the client is NOT currently in — the projects rail
   // shows a few sessions per repo without switching to it. `cwd` is matched
   // against the repo catalog and dropped when it isn't a row, so this never
@@ -1283,6 +1281,12 @@ export type WebviewMsg =
   // so the choice follows the user to a phone rather than living in browser
   // localStorage. Purely a rail affordance; the VS Code repo picker ignores it.
   | { type: "setRepoColor"; cwd: string; color: string }
+  // Project mark for the conversation rail. `icon` is one of the host's mark
+  // ids (media/repo-icons.js / src/repo-icon-ids.ts), or "" for the default
+  // folder. Same capability pattern, persistence and reach as setRepoColor —
+  // a NEW message type rather than a new field on that one, so an older host
+  // drops it instead of half-handling it.
+  | { type: "setRepoIcon"; cwd: string; icon: string }
   // cwd is required to reopen a worktree-isolated session (sessions are keyed
   // by cwd on disk). Omitted → host resolves from meta / workspace root.
   //
@@ -1505,8 +1509,8 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, runInstallCmd: true, runGrokLogin: true,
   cancelDeviceLogin: true, submitDeviceLoginCode: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, updateCodex: true, updateClaude: true, recheckConnection: true, refreshProviders: true, retryProviderSession: true,
-  listSessions: true, sessionsReady: true, setHideAutoSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
-  setRepoArchived: true, setRepoColor: true,
+  listSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
+  setRepoArchived: true, setRepoColor: true, setRepoIcon: true,
   resumeSession: true, renameSession: true, deleteSession: true,
   clearAllSessions: true, pickFile: true, mentionQuery: true, addMentionFile: true,
   listProjectDir: true, readProjectFile: true, writeProjectFile: true,

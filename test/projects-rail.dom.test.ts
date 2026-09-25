@@ -1778,34 +1778,38 @@ describe("projects rail", () => {
       expect(less.textContent).not.toMatch(/\d/);
     });
 
-    it("project rows use folder-closed when collapsed and folder-open when expanded", () => {
+    /**
+     * The chevron says open or closed; the mark says which project. The folder
+     * used to do both, and that is exactly why nothing else could replace it —
+     * a rocket has no open variant.
+     */
+    it("folds on a chevron and leaves the project mark alone", () => {
       const { doc, window } = boot("/work/alpha");
       dispatch(window, sessionsFrame([row("a1", "/work/alpha", "alpha one", 9)]));
       const alpha = () => doc.querySelectorAll(".rail-repo")[repoNames(doc).indexOf("alpha")];
       const twisty = () => alpha().querySelector(".rail-twisty") as HTMLElement;
-      // Expanded: ONE flag drives icon + session list (data-expanded + folder-open).
+      const chevron = () => alpha().querySelector(".rail-chevron") as HTMLElement;
+      const markPath = () => twisty().querySelector("path")?.getAttribute("d");
+      const chevPath = () => chevron().querySelector("path")?.getAttribute("d");
       expect(alpha().getAttribute("data-expanded")).toBe("1");
-      // Shared 24px outline marks are distinguished by their lucide paths.
-      expect(twisty().querySelector("svg")?.getAttribute("fill")).toBe("none");
-      expect(twisty().querySelector("svg")?.getAttribute("stroke")).toBe("currentColor");
-      expect(twisty().innerHTML).toMatch(/m6 14 1\.5-2\.9/);
-      expect(twisty().innerHTML).not.toMatch(/M20 20a2 2/);
+      // Filled Material Symbols on their own grid, not the old 24px outline.
+      expect(twisty().querySelector("svg")?.getAttribute("fill")).toBe("currentColor");
+      expect(twisty().querySelector("svg")?.getAttribute("viewBox")).toBe("0 -960 960 960");
       expect(alpha().querySelector(".rail-sessions")).not.toBe(null);
-      // Icon and list cannot disagree: sessions present ⇒ open icon path.
-      expect(!!alpha().querySelector(".rail-sessions")).toBe(
-        /m6 14 1\.5-2\.9/.test(twisty().innerHTML),
-      );
-      // Folder is an indicator (not a button); the whole head toggles.
+      // The chevron precedes the mark: disclosure first, identity second.
+      const kids = [...alpha().querySelector(".rail-repo-head")!.children].map((e) => e.className);
+      expect(kids.indexOf("rail-chevron")).toBeLessThan(kids.indexOf("rail-twisty"));
+      // Both are indicators, not buttons; the whole head toggles.
       expect(twisty().tagName).toBe("SPAN");
+      expect(chevron().tagName).toBe("SPAN");
+      const openMark = markPath();
+      const openChev = chevPath();
       click(window, alpha().querySelector(".rail-repo-head") as HTMLElement);
-      // Collapsed: the closed mark, no sessions, data-expanded=0.
       expect(alpha().getAttribute("data-expanded")).toBe("0");
-      expect(twisty().innerHTML).toMatch(/M20 20a2 2/);
-      expect(twisty().innerHTML).not.toMatch(/m6 14 1\.5-2\.9/);
       expect(alpha().querySelector(".rail-sessions")).toBe(null);
-      expect(!!alpha().querySelector(".rail-sessions")).toBe(
-        /m6 14 1\.5-2\.9/.test(twisty().innerHTML),
-      );
+      // Only the chevron answers the fold. The mark is the project's identity.
+      expect(chevPath()).not.toBe(openChev);
+      expect(markPath()).toBe(openMark);
     });
 
     it("the whole project header toggles expand; hover actions do not", () => {
@@ -2826,5 +2830,162 @@ describe("the shell can close the renderer's toolbar popovers", () => {
     click(h.window, h.doc.getElementById("donut")!);
     expect(layers.depth).toBe(0);
     expect(layers.dismissTop()).toBe(false);
+  });
+});
+
+/**
+ * The icon picker has to survive the keyboard it raises.
+ *
+ * A resize closes the rail's menus, which is right for a MENU -- it hangs under
+ * a row that has probably moved. It was wrong for a picker the user is working
+ * in, because on a phone the on-screen keyboard IS a resize: the picker focused
+ * its search box, the keyboard opened, the resize fired, and the picker removed
+ * itself the frame after it appeared. The owner saw "something flashes and
+ * disappears", and only for icons -- the colour picker focuses a swatch button,
+ * raises no keyboard, and never hit it.
+ *
+ * No browser gate could catch this. `e2e:screens` drives real Chromium and
+ * opens this very picker, but a headless browser has no software keyboard, so
+ * the resize never fires there. The event is the whole mechanism, so a test
+ * that dispatches it is the honest gate.
+ */
+describe("the project icon picker", () => {
+  const withMarks = (entries = repos) =>
+    entries.map((r) => ({ ...r, color: "", icon: r.cwd === "/work/beta" ? "rocket" : "" }));
+
+  const openPicker = (h: any) => {
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(),
+      selectedCwd: "/work/alpha",
+      activeCwd: "/work/alpha",
+    });
+    const alpha = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+    const menu = openMenu(h.window, alpha.querySelector(".rail-repo-head") as HTMLElement);
+    const item = menuItem(menu, "Set icon");
+    expect(item, "the project menu offers no Set icon").not.toBe(undefined);
+    click(h.window, item as HTMLElement);
+    return h.doc.querySelector(".repo-icon-picker") as HTMLElement;
+  };
+
+  it("stays open when the on-screen keyboard resizes the window", () => {
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    expect(openPicker(h)).not.toBe(null);
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(
+      h.doc.querySelector(".repo-icon-picker"),
+      "the picker closed itself on a resize -- the keyboard is a resize",
+    ).not.toBe(null);
+  });
+
+  it("narrows the grid to one category when a category is clicked", () => {
+    // Half the contract. The other half is CSS -- setting `hidden` on a cell
+    // whose stylesheet declares `display: grid` hides nothing at all -- and no
+    // DOM test can see that, because this harness applies no stylesheet. The
+    // companion assertion lives in repo-icons.test.ts.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const picker = openPicker(h);
+    const cells = () => Array.from(picker.querySelectorAll(".repo-icon-cell")) as HTMLElement[];
+    const shown = () => cells().filter((c) => !c.hidden).length;
+    const all = shown();
+    expect(all, "the picker drew no marks").toBeGreaterThan(20);
+    const tab = Array.from(picker.querySelectorAll(".repo-icon-tab"))
+      .find((t) => t.textContent === "Build") as HTMLElement | undefined;
+    expect(tab, "the picker offers no Build category").not.toBe(undefined);
+    click(h.window, tab as HTMLElement);
+    expect(shown(), "clicking a category did not narrow the grid").toBeLessThan(all);
+    // The default is groupless on purpose: "put it back" must not hide behind
+    // a tab you would have to guess.
+    expect(
+      (picker.querySelector(".repo-icon-cell.is-default") as HTMLElement).hidden,
+      "the default folder hid itself behind a category",
+    ).toBe(false);
+  });
+
+  it("keeps the focus in its search box, so the keyboard it raised can be typed into", () => {
+    // The keyboard IS the resize, so the element that raised it is exactly the
+    // element a resize must not blur. The first version of this fix took the
+    // picker out of the document and put it straight back: the markup after is
+    // identical, and the focus is gone. Dispatching a resize at an UNFOCUSED
+    // picker -- which is what the test above does -- is the one state where
+    // that cannot show, so this asserts on focus and not on the node.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const picker = openPicker(h);
+    const search = picker.querySelector(".repo-icon-search") as HTMLElement;
+    expect(search, "the picker has no search box").not.toBe(null);
+    search.focus();
+    expect(h.doc.activeElement, "the search box would not take focus").toBe(search);
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(
+      h.doc.activeElement,
+      "the resize blurred the search box -- so tapping it raises a keyboard that closes again",
+    ).toBe(search);
+  });
+
+  it("still lets a resize close a menu, which is what that listener is for", () => {
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(),
+      selectedCwd: "/work/alpha",
+      activeCwd: "/work/alpha",
+    });
+    const alpha = h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")];
+    openMenu(h.window, alpha.querySelector(".rail-repo-head") as HTMLElement);
+    expect(h.doc.querySelector(".rail-menu")).not.toBe(null);
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(h.doc.querySelector(".rail-menu")).toBe(null);
+  });
+
+  it("survives the catalog refresh the host sends whenever a file changes", () => {
+    // The rebuild used to close both pickers outright, so on a phone and in
+    // the desktop app the grid vanished while you were reading it -- the same
+    // report the VS Code side bar got, from the same producer: the host
+    // re-sends the catalog whenever the files behind it change, and another
+    // agent writing transcripts drives that every second or two.
+    //
+    // The rebuild here is a repo RENAME, not a sessions frame, for the reason
+    // the VS Code suite records: sessions do not render under a collapsed
+    // project, so "still there" would pass for the wrong reason. A project row
+    // is always drawn, so the renamed label proves the rail really did rebuild
+    // under the open picker.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const picker = openPicker(h);
+    expect(picker).not.toBe(null);
+    const search = picker.querySelector(".repo-icon-search") as HTMLElement;
+    search.focus();
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(repos).map((r) =>
+        r.cwd === "/work/gamma" ? { ...r, label: "renamed" } : r),
+      selectedCwd: "/work/alpha",
+      activeCwd: "/work/alpha",
+    });
+    expect(repoNames(h.doc), "the rail did not rebuild, so this proves nothing")
+      .toContain("renamed");
+    expect(
+      h.doc.querySelector(".repo-icon-picker"),
+      "the rail rebuild closed the picker the user was reading",
+    ).toBe(picker);
+    expect(
+      h.doc.activeElement,
+      "the picker survived but lost its focus -- it was taken out and put back",
+    ).toBe(search);
+  });
+
+  it("closes rather than strands itself when its anchor is gone", () => {
+    // The other half of the rule: follow the anchor while it exists, and give
+    // up when a rebuild has taken the row away, rather than leaving a fixed
+    // popover pointing at nothing.
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    expect(openPicker(h)).not.toBe(null);
+    dispatch(h.window, {
+      type: "repos",
+      entries: withMarks(repos.filter((r) => r.cwd !== "/work/alpha")),
+      selectedCwd: "/work/beta",
+      activeCwd: "/work/beta",
+    });
+    h.window.dispatchEvent(new h.window.Event("resize"));
+    expect(h.doc.querySelector(".repo-icon-picker")).toBe(null);
   });
 });
