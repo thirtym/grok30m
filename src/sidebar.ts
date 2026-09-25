@@ -1,3 +1,5 @@
+import { MuseBackend } from "./muse-backend";
+import { locateMuseCli, parseMuseVersionOutput } from "./muse-cli-locator";
 import type {
   Host,
   HostCancellationToken,
@@ -17,7 +19,7 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { AcpClient, EffortLevel, ExitPlanRequest, PermissionRequest, QuestionRequest } from "./acp";
 import type { AcpProvider, BackendSessionListEntry } from "./acp-backend";
-import { isAdapterProvider, isAcpProvider, ACP_PROVIDERS } from "./acp-backend";
+import { usesAdapterHistory, isInternalProvider, INTERNAL_PROVIDERS, supportsSessionDeletion, supportsHistoryDeletion, supportsModeSwitching, supportsClientMcpServers, usesPerCallContextOccupancy } from "./acp-backend";
 import { CODEX_ACP_ADAPTER_VERSION, CodexBackend, isCodexCredentialError } from "./codex-backend";
 import { locateCodexCli, resolveCodexHome } from "./codex-cli-locator";
 import { readCodexSubscriptionWindows } from "./codex-usage";
@@ -240,7 +242,7 @@ import {
   type QueuedSendEntry,
 } from "./queued-send";
 
-import { matchSlashCommand } from "./slash-filter";
+import { matchProviderSlashCommand } from "./slash-filter";
 import {
   MENTION_INDEX_LIMIT,
   MENTION_INDEX_TTL_MS,
@@ -375,9 +377,6 @@ import {
   sessionCatalogDirs,
   sessionDirFor,
 } from "./sessions";
-import { shouldHideAutoSession } from "./session-tags";
-import { COMMUNITY_BASE_VERSION, COMMUNITY_RELEASES_PAGE } from "./community-sync";
-import { peekCommunityLag } from "./release-peek";
 import {
   base64DecodedByteLength,
   isTrustedCodexGeneratedImagePath,
@@ -452,9 +451,11 @@ import {
   isThumbsRating,
   parseFeedbackEnabledMeta,
 } from "./feedback";
+import { readWorkflowCompletion } from "./workflow-state";
 import {
   parseRunProgressUpdate,
   workflowControlCommand,
+  type RunProgressUpdate,
 } from "./run-progress";
 import {
   APP_PURPOSE_KEY,
@@ -759,10 +760,6 @@ export class GrokSidebar {
   private view?: HostWebviewView;
   /** Second local consumer of catalog-shaped host messages. Absent until resolved. */
   private projectsRail?: HostWebviewView;
-  /** Dedicated Sessions sidebar (Grok30m). Absent until that view resolves. */
-  private sessionsView?: HostWebviewView;
-  public static readonly panelType = "grok.panel";
-  public static readonly sessionsViewId = "grok.sessions";
   /** The session currently shown in the chat — one member of {@link pool}. */
   private focused = this.newLocalSession();
   /**
@@ -788,6 +785,14 @@ export class GrokSidebar {
   private claudeSessionCache = new Map<string, SessionListEntry[]>();
   private claudeSessionCacheAt = new Map<string, number>();
   private claudeSessionRefresh = new Map<string, Promise<void>>();
+  /**
+   * One history process per PROVIDER, reused across every repo — not one per
+   * repo, which is what the projects rail used to cost. `adapterHistoryClient`
+   * carries the measurement that makes a single process sufficient.
+   */
+  private adapterHistoryClients = new Map<AcpProvider, { cliPath: string; client: AcpClient }>();
+  /** Serialises history listings onto that shared process, per provider. */
+  private adapterHistoryQueue = new Map<AcpProvider, Promise<void>>();
   private codexInstallAbort?: AbortController;
   private providerConnectionState: ProviderConnections = {};
   /**
@@ -961,6 +966,13 @@ export class GrokSidebar {
   private cliPath?: string;
   private codexCliPath?: string;
   private claudeCliPath?: string;
+  private museCliPath?: string;
+  private museCliChange?: Promise<void>;
+  private museHistoryStart?: Promise<AcpClient | undefined>;
+  private museHistoryGeneration = 0;
+  private museSessionCache = new Map<string, SessionListEntry[]>();
+  private museSessionCacheAt = new Map<string, number>();
+  private museSessionRefresh = new Map<string, Promise<void>>();
   private readonly providerCliVersions: Partial<Record<AcpProvider, string>> = {};
   /** Accounts that are configured but answered an auth-shaped failure. Not the
    *  same as disconnected: the CLI is installed and the user meant to use it,
@@ -1129,6 +1141,7 @@ export class GrokSidebar {
   private grokVersionProbe?: Promise<string>;
   private codexVersionProbe?: Promise<string>;
   private claudeVersionProbe?: Promise<string>;
+  private museVersionProbe?: Promise<string>;
   private providerCliUpdates: Partial<Record<AcpProvider, { status: "running" | "succeeded" | "failed"; message: string }>> = {};
   private providerCliUpdate?: { provider: AcpProvider; done: Promise<void> };
   private providerModelProbes = new Map<AcpProvider, Set<Promise<boolean>>>();
@@ -1185,6 +1198,7 @@ export class GrokSidebar {
    *  exactly once across every host sharing this `~/.grok`. */
   private readonly routineRuns: RoutineRunStore;
   private routineTimer?: ReturnType<typeof setInterval>;
+  private workflowTimer?: ReturnType<typeof setInterval>;
   /** Last wake time the relay accepted. `undefined` = never published, which is
    *  distinct from `null` = published "nothing scheduled". */
   private publishedWakeAt: number | null | undefined;
@@ -1229,6 +1243,7 @@ export class GrokSidebar {
     void this.sweepImageStaging();
     void this.sweepFileStaging();
     this.startRoutineScheduler();
+    this.startWorkflowCompletionPolling();
   }
 
   /* ------------------------------------------------------------ routines */
@@ -1620,6 +1635,10 @@ export class GrokSidebar {
       this.codexCliPath = located;
       return located;
     }
+    if (provider === "muse") {
+      this.museCliPath = locateMuseCli({ configuredPath: this.host.getConfiguration("grok").get<string>("museCliPath", "") });
+      return this.museCliPath;
+    }
     if (this.claudeCliPath && fs.existsSync(this.claudeCliPath)) return this.claudeCliPath;
     const located = locateClaudeCli({
       configuredPath: this.host.getConfiguration("grok").get<string>("claudeCliPath", ""),
@@ -1628,11 +1647,31 @@ export class GrokSidebar {
     return located;
   }
 
+  private async invalidateMuseCli(): Promise<void> {
+    this.museCliPath = undefined;
+    const exiting: Promise<void>[] = [this.disposeAdapterHistoryClient("muse")];
+    const sessions = new Set([this.focused, ...this.pool, ...this.remoteClients.detachedActiveValues()]);
+    for (const session of sessions) {
+      if (session.provider !== "muse") continue;
+      const client = this.detachClient(session);
+      if (client) exiting.push(client.dispose());
+      session.priming = false;
+      session.status = "idle";
+      this.emit(session, { type: "setBusy", value: false });
+    }
+    await Promise.all(exiting);
+    const { muse: _oldMuse, ...rest } = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
+    await this.state.update(PROVIDER_MODEL_CACHE_KEY, rest);
+    this.museSessionCache.clear(); this.museSessionCacheAt.clear();
+    this.postProviderState();
+  }
+
   private locatedProviders(): Partial<Record<AcpProvider, boolean>> {
     return {
       grok: !!this.locateProvider("grok"),
       codex: !!this.locateProvider("codex"),
       claude: !!this.locateProvider("claude"),
+      muse: !!this.locateProvider("muse"),
     };
   }
 
@@ -1644,6 +1683,9 @@ export class GrokSidebar {
     if (provider === "codex") {
       return { cache: this.codexSessionCache, at: this.codexSessionCacheAt, refresh: this.codexSessionRefresh };
     }
+    if (provider === "muse") return {
+      cache: this.museSessionCache ??= new Map(), at: this.museSessionCacheAt ??= new Map(), refresh: this.museSessionRefresh ??= new Map(),
+    };
     if (provider === "claude") {
       return { cache: this.claudeSessionCache, at: this.claudeSessionCacheAt, refresh: this.claudeSessionRefresh };
     }
@@ -1651,12 +1693,14 @@ export class GrokSidebar {
   }
 
   private allAdapterCatalogs(): Iterable<readonly SessionListEntry[]> {
-    return [...this.codexSessionCache.values(), ...this.claudeSessionCache.values()];
+    return INTERNAL_PROVIDERS.filter(usesAdapterHistory)
+      .flatMap(provider => [...(this.adapterHistory(provider)?.cache?.values() ?? [])]);
   }
 
-  private createProviderBackend(provider: AcpProvider): CodexBackend | ClaudeBackend | undefined {
+  private createProviderBackend(provider: AcpProvider): CodexBackend | ClaudeBackend | MuseBackend | undefined {
     if (provider === "codex") return new CodexBackend();
     if (provider === "claude") return new ClaudeBackend();
+    if (provider === "muse") return new MuseBackend();
     return undefined;
   }
 
@@ -1692,7 +1736,7 @@ export class GrokSidebar {
    * something available the session's own provider is the specific gap to
    * close, so show that.
    */
-  private onboardingForSession(session: Session): "connect-agent" | "auth-required" | "codex-login" | "claude-login" {
+  private onboardingForSession(session: Session): "connect-agent" | "auth-required" | "codex-login" | "claude-login" | "muse-login" {
     if (session.hasHistory) return providerLoginState(session.provider);
     return this.usableProviders().length ? providerLoginState(session.provider) : "connect-agent";
   }
@@ -1721,9 +1765,12 @@ export class GrokSidebar {
     const current = this.providerConnections();
     if (!connected || !current[provider]) this.invalidateSubscriptionUsage(provider);
     this.providerConnectionState = { ...current, [provider]: connected };
-    if (!connected && isAdapterProvider(provider)) {
+    if (!connected && usesAdapterHistory(provider)) {
       const history = this.adapterHistory(provider);
       history?.cache.clear();
+      // The listener outlives a single listing now, so dropping the rows is no
+      // longer enough — the process itself has to go with them.
+      void this.disposeAdapterHistoryClient(provider);
       // A reconnect must re-list immediately. Keeping the old freshness stamp
       // after dropping the rows creates a fresh-but-empty cache for ten seconds.
       history?.at.clear();
@@ -1762,7 +1809,7 @@ export class GrokSidebar {
     if (needsLogin) this.invalidateSubscriptionUsage(provider);
     // A recovered account must be able to re-list at once; the freshness stamp
     // would otherwise hold the empty catalog for its full back-off window.
-    if (!needsLogin && isAdapterProvider(provider)) this.adapterHistory(provider)?.at.clear();
+    if (!needsLogin && usesAdapterHistory(provider)) this.adapterHistory(provider)?.at.clear();
     // And it must be able to RECOVER again. `authRecoveryTried` survives a
     // startSession on purpose (#58: an entitlement failure must not pay a
     // restart+resend on every prompt), and only a clean turn re-arms it -- which
@@ -1858,6 +1905,8 @@ export class GrokSidebar {
   /** Explicit credential observation. Unlike history refresh this never obeys
    * the listing freshness clock, so a completed sign-in is visible at once. */
   private async reprobeProviderCredentials(provider: AcpProvider): Promise<boolean> {
+    // MSP exposes no credential-status operation. A catalog read cannot prove sign-in.
+    if (provider === "muse") return false;
     if (provider === "codex" || provider === "claude") {
       // These throwaway ACP processes hold the binary too. Don't start one
       // during replacement; the updater explicitly re-observes afterward.
@@ -2183,9 +2232,7 @@ export class GrokSidebar {
     const delays = [0, 2_000, 5_000, 10_000, 20_000];
     for (const delay of delays) {
       if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-      if (provider === "claude"
-        ? await this.deviceLoginCredentialReady(provider)
-        : await this.reprobeProviderCredentials(provider)) {
+      if (await this.deviceLoginCredentialReady(provider)) {
         this.host.appendLine(`[${provider}] device login: credential verified`);
         // Say it about the needs-login flag too, and not only about `connected`.
         // For grok and codex this is a no-op -- `reprobeProviderCredentials`
@@ -2256,8 +2303,12 @@ export class GrokSidebar {
    * `claude auth status` `{ loggedIn: true }` is the authority. An unreadable
    * status falls back to the ACP probe rather than failing closed on a CLI
    * that printed something we have not seen.
+   * Muse has no credential-status probe: after a successful `muse login`,
+   * file presence confirms that a credential landed, not that it is valid.
+   * Any later authentication failure uses the normal needs-login path.
    */
   private async deviceLoginCredentialReady(provider: AcpProvider): Promise<boolean> {
+    if (provider === "muse") return this.providerCredentialFilePresent(provider);
     if (provider === "claude") {
       const cliPath = this.locateProvider("claude");
       if (!cliPath) return false;
@@ -2275,6 +2326,7 @@ export class GrokSidebar {
    *  different next actions. */
   private providerCredentialFilePresent(provider: AcpProvider): boolean {
     try {
+      if (provider === "muse") return fs.existsSync(path.join(os.homedir(), ".config", "muse", "auth.json"));
       if (provider === "codex") return fs.existsSync(path.join(resolveCodexHome(), "auth.json"));
       // GROK_HOME, not a hardcoded ~/.grok: the CLI honours it and so does the
       // rest of this host, so hardcoding made the fallback miss a credential
@@ -2359,10 +2411,14 @@ export class GrokSidebar {
     const grokConnected = connected.grok === true && located.grok === true;
     const codexConnected = connected.codex === true && located.codex === true;
     const claudeConnected = connected.claude === true && located.claude === true;
+    const museConnected = connected.muse === true && located.muse === true;
     this.lastProviderConnected = { grok: grokConnected, codex: codexConnected, claude: claudeConnected };
     return {
       type: "providerState",
       providers: [
+        { id: "muse", connected: museConnected,
+          ...(museConnected && versions.muse ? { cliVersion: versions.muse } : {}),
+          ...(needsLogin.muse ? { needsLogin: true } : {}) },
         {
           id: "grok",
           connected: grokConnected,
@@ -2472,7 +2528,7 @@ export class GrokSidebar {
       this.claudeCliPath = undefined;
       // Read AFTER dropping the paths, so a CLI that appeared since boot counts.
       const located = this.locatedProviders();
-      const installed = ACP_PROVIDERS.filter((provider) => located[provider]);
+      const installed = INTERNAL_PROVIDERS.filter((provider) => located[provider]);
       const connectedBefore = this.providerConnections();
       // Failures are the answer here, not an error: a rejected probe is how a
       // lapsed account gets its needsLogin flag. reprobeProviderCredentials
@@ -2493,11 +2549,11 @@ export class GrokSidebar {
         const authenticated = probeCredentials
           ? await this.reprobeProviderCredentials(provider).catch(() => false)
           : false;
-        // Codex and Claude only. Their version is what decides
+        // Adapter CLI versions feed About and, where supported,
         // `updateAvailable`; Grok has its own update check, and re-probing it
         // would re-run the locator this method deliberately leaves alone when
         // a test forces the CLI missing.
-        if (provider === "codex" || provider === "claude") await this.reprobeProviderVersion(provider);
+        if (provider !== "grok") await this.reprobeProviderVersion(provider);
         // Promote on a SUCCESSFUL probe only. This is the sign-in that happened
         // somewhere the desk could not see; the probe is what makes it a fact
         // rather than a guess. Persisted, so it survives a reload the way the
@@ -2725,7 +2781,7 @@ export class GrokSidebar {
   private providerForRequestedModel(modelId: string, fallback: AcpProvider): AcpProvider {
     if (!modelId) return fallback;
     const cache = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
-    const matches = (["grok", "codex", "claude"] as const).filter((provider) =>
+    const matches = INTERNAL_PROVIDERS.filter((provider) =>
       cache[provider]?.models.some((model) => model.modelId === modelId));
     return matches.length === 1 ? matches[0] : fallback;
   }
@@ -2791,6 +2847,10 @@ export class GrokSidebar {
       if (e.affectsConfiguration("grok.codexCliPath")) {
         this.codexCliPath = undefined;
         this.postProviderState();
+      }
+      if (e.affectsConfiguration("grok.museCliPath")) {
+        this.museCliChange = (this.museCliChange ?? Promise.resolve()).then(() => this.invalidateMuseCli());
+        void this.museCliChange.catch(error => this.host.appendLine(`[muse] CLI change: ${errorDetail(error)}`));
       }
       if (e.affectsConfiguration("grok.claudeCliPath")) {
         this.claudeCliPath = undefined;
@@ -2927,218 +2987,6 @@ export class GrokSidebar {
   /** Drop the rail handle when the view is disposed (or re-created). */
   disposeProjectsRailView(): void {
     this.projectsRail = undefined;
-  }
-
-  attachSessionsView(view: HostWebviewView): void {
-    this.sessionsView = view;
-    view.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [
-        Uri.joinPath(this.context.extensionUri, "media"),
-        Uri.joinPath(this.context.extensionUri, "resources"),
-      ],
-    };
-    view.webview.html = this.getSessionsHtml(view.webview);
-    view.webview.onDidReceiveMessage((raw) => {
-      void this.onSessionsMessage(raw as WebviewMsg);
-    });
-    this.postSessionsList();
-  }
-
-  private grokConfig(): { get<T>(key: string, defaultValue: T): T } | undefined {
-    const get = this.host?.getConfiguration;
-    if (typeof get !== "function") return undefined;
-    const cfg = get.call(this.host, "grok") as { get?: unknown } | undefined;
-    if (!cfg || typeof cfg.get !== "function") return undefined;
-    return cfg as { get<T>(key: string, defaultValue: T): T };
-  }
-
-  private usesPanelTabs(): boolean {
-    return this.grokConfig()?.get<"panel" | "sidebar">("preferredLocation", "panel") === "panel";
-  }
-
-  useSessionsSidebar(): boolean {
-    return this.grokConfig()?.get<boolean>("sessionsSidebar", true) ?? true;
-  }
-
-  hideAutoSessions(): boolean {
-    return this.grokConfig()?.get<boolean>("hideAutoSessions", true) ?? false;
-  }
-
-  private webviewFor(session: Session): HostWebview | undefined {
-    if (this.usesPanelTabs()) {
-      return session.panel?.webview
-        ?? (session === this.focused ? this.view?.webview : undefined);
-    }
-    return session === this.focused ? this.view?.webview : undefined;
-  }
-
-  async openPreferred(): Promise<void> {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else await this.host.revealChatView();
-    if (this.useSessionsSidebar()) {
-      try {
-        await this.host.revealChatView();
-      } catch { /* Sessions lives in its own activity-bar view */ }
-    }
-  }
-
-  openPanel(): void {
-    this.ensurePanelForSession(this.focused);
-  }
-
-  async openSidebar(): Promise<void> {
-    await this.host.revealChatView();
-  }
-
-  private postToSessions(message: HostMsg): void {
-    if (message.type !== "sessions" && message.type !== "sessionDot") return;
-    void this.sessionsView?.webview.postMessage(message);
-  }
-
-  private async onSessionsMessage(msg: WebviewMsg): Promise<void> {
-    switch (msg.type) {
-      case "sessionsReady":
-        this.postSessionsList();
-        break;
-      case "listSessions":
-        this.postSessionsList({
-          offset: msg.offset,
-          limit: msg.limit,
-          query: msg.query,
-          providerCursor: msg.providerCursor,
-        });
-        break;
-      case "setHideAutoSessions":
-        void this.host.getConfiguration("grok").update("hideAutoSessions", !!msg.value);
-        this.postSessionsList();
-        break;
-      case "resumeSession":
-        await this.openSession(msg.id);
-        this.revealChat();
-        break;
-      case "renameSession":
-        this.renameSession(msg.id, msg.name, "local");
-        break;
-      case "deleteSession":
-        await this.deleteSession(msg.id, msg.name, "local");
-        break;
-      case "clearAllSessions":
-        await this.clearAllSessions(this.historyCwdFor("local"), "local");
-        break;
-      case "newSession":
-        await this.newFocusedSession("local");
-        this.revealChat();
-        break;
-    }
-  }
-
-  private revealChat(): void {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else void this.host.revealChatView?.();
-  }
-
-  private panelTitleFor(session: Session): string {
-    const name = this.sessionDisplayName(session).trim();
-    return name || "Grok30m";
-  }
-
-  private updatePanelTitle(session: Session): void {
-    session.panel?.setTitle?.(this.panelTitleFor(session));
-  }
-
-  private ensurePanelForSession(session: Session, title?: string): void {
-    if (!this.usesPanelTabs() || typeof this.host.openEditorWebview !== "function") return;
-    if (!this.context?.extensionUri) return;
-    if (session.panel) {
-      session.panel.reveal();
-      this.updatePanelTitle(session);
-      return;
-    }
-    const panel = this.host.openEditorWebview({
-      viewType: GrokSidebar.panelType,
-      title: title ?? this.panelTitleFor(session),
-      localResourceRoots: this.chatLocalResourceRoots(),
-    });
-    if (!panel) return;
-    this.bindChatPanel(panel, session);
-  }
-
-  private claimPanelSession(session: Session): void {
-    if (this.focused === session) return;
-    // The tab the user is in, not a replay. focusSession() clears the webview
-    // and would wipe the composer they are about to paste into.
-    this.focused = session;
-    this.touch(session);
-    this.markRead(session);
-    this.updatePanelTitle(session);
-  }
-
-  private bindChatPanel(panel: HostEditorWebview, session: Session): void {
-    session.panel = panel;
-    // Subscribe before assigning html: a restored or cached editor webview can
-    // run scripts in the same turn, and a lost `ready` leaves Starting forever.
-    panel.onDidChangeViewState?.((active) => {
-      if (active) this.claimPanelSession(session);
-    });
-    panel.webview.onDidReceiveMessage((raw) => {
-      const m = raw as WebviewMsg;
-      // Blur of the tab being left must not steal focus back. Every other
-      // message is from the tab the user is acting in — including paste and send.
-      if (!(m.type === "composerFocus" && m.focused === false)) {
-        this.claimPanelSession(session);
-      }
-      if (m.type === "ready" && session.client) {
-        this.rehydrateWebviewFromFocused();
-        return;
-      }
-      void this.onMessage(m, "local").catch((e) => {
-        const text = (e as Error)?.message ?? String(e);
-        this.host.appendLine(`[webview] ${m.type} failed: ${text}`);
-        void this.host.showErrorMessage(`Grok: ${m.type} failed — ${text}`);
-      });
-    });
-    panel.webview.html = this.getHtml(panel.webview);
-    panel.onDidDispose(() => {
-      if (session.panel === panel) session.panel = undefined;
-    });
-  }
-
-  private getSessionsHtml(webview: HostWebview): string {
-    const nonce = getNonce();
-    const mediaUri = (file: string) =>
-      webview.asWebviewUri(Uri.joinPath(this.context.extensionUri, "media", file));
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
-<style>html, body { background: var(--vscode-sideBar-background); }</style>
-<link rel="stylesheet" href="${mediaUri("sessions.css")}" />
-</head>
-<body>
-  <div class="sessions-root">
-    <div class="sessions-header">
-      <span class="sessions-title">Sessions</span>
-      <button id="sessions-new-btn" class="sessions-new-btn" title="New session"></button>
-    </div>
-    <div class="sessions-search-wrap">
-      <input id="sessions-search" class="sessions-search" type="text" placeholder="Search sessions…" />
-    </div>
-    <label class="sessions-filter-auto" title="Hide automated sessions">
-      <input id="sessions-hide-auto" type="checkbox" checked />
-      <span>Hide automated</span>
-    </label>
-    <div id="sessions-list" class="sessions-list"></div>
-    <div id="sessions-footer" class="sessions-footer" hidden>
-      <button id="sessions-clear-btn" class="sessions-clear-all" title="Delete all sessions in this workspace's history"></button>
-    </div>
-  </div>
-  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
-  <script nonce="${nonce}" src="${mediaUri("sessions.js")}"></script>
-</body>
-</html>`;
   }
 
   private chatLocalResourceRoots(): Uri[] {
@@ -3327,7 +3175,7 @@ export class GrokSidebar {
       }
       const oldProvider = session.provider;
       const discardId = session.activeSessionId;
-      if (isAdapterProvider(oldProvider) && discardId) {
+      if (supportsSessionDeletion(oldProvider) && discardId) {
         try { await client.deleteSession(discardId); }
         catch (error) { this.host.appendLine(`[${oldProvider}] could not discard empty session ${discardId}: ${(error as Error).message}`); }
       }
@@ -3343,7 +3191,7 @@ export class GrokSidebar {
       const discardId = session.activeSessionId;
       await this.rememberProjectProvider(this.sessionCwd(session), provider, undefined);
       if (provider === "grok") await this.rememberGrokConfig("defaultModel", "");
-      else if (isAdapterProvider(provider)) await this.discardAdapterEmptySession(provider, discardId, this.sessionCwd(session), client);
+      else if (usesAdapterHistory(provider)) await this.discardAdapterEmptySession(provider, discardId, this.sessionCwd(session), client);
       await this.startSession(undefined, session);
       if (provider === "grok") this.discardRestartedEmptySession(discardId, session);
       return;
@@ -3412,7 +3260,7 @@ export class GrokSidebar {
       const wasEmpty = !session.hasHistory;
       const discardId = session.activeSessionId;
       await this.rememberProviderEffort(session.provider, newLevel);
-      if (wasEmpty && isAdapterProvider(session.provider)) {
+      if (wasEmpty && usesAdapterHistory(session.provider)) {
         await this.discardAdapterEmptySession(session.provider, discardId, this.sessionCwd(session), session.client);
       }
       await this.startSession(undefined, session);
@@ -3514,10 +3362,7 @@ See design doc for the full state machine diagram.`;
 
   private postMode(session: Session = this.focused): void {
     const message: HostMsg = { type: "modeChanged", modeId: this.displayMode(session) };
-    if (session === this.focused) {
-      const webview = this.webviewFor(session);
-      if (webview) webview.postMessage(message);
-    }
+    if (session === this.focused) this.view?.webview.postMessage(message);
     this.sendRemoteSession(session, message);
   }
 
@@ -3671,6 +3516,7 @@ Only continue if you trust this code.`,
     session: Session = this.focused,
     requester?: RemoteRequester,
   ): Promise<void> {
+    if (!supportsModeSwitching(session.provider)) return;
     // Agent/plan/yolo are mutually exclusive. Plan = client write/exec gate;
     // YOLO = auto-approve. Both ride on top of the CLI's agent mode, except
     // Plan which also tells the CLI to plan instead of act. The mode button only
@@ -4151,7 +3997,7 @@ Only continue if you trust this code.`,
       ...overrides,
       [sid]: { ...(overrides[sid] ?? {}), activeAt },
     });
-    for (const provider of (["codex", "claude"] as const)) {
+    for (const provider of INTERNAL_PROVIDERS.filter(usesAdapterHistory)) {
       const history = this.adapterHistory(provider);
       if (!history) continue;
       for (const [key, entries] of history.cache) {
@@ -4247,19 +4093,25 @@ Only continue if you trust this code.`,
     // Auto accept is not a verdict on a plan-review card. Same rule as
     // autoApprovePendingPermissions, including after a failed mode RPC
     // that already cleared the Plan bit.
-    if (session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
+    if (supportsModeSwitching(session.provider) && session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
       const opt = req.options.find((o) => o.kind === "allow_always") ??
                   req.options.find((o) => o.kind === "allow_once");
       if (opt) { client.respondPermission(req.id, opt.optionId); return; }
     }
-    const execute = String(req.toolCall?.kind ?? "").toLowerCase() === "execute";
+    // This flag engages the HOST's own command grants, which replace the CLI's
+    // persistent choice with ours. Muse answers a session-scoped grant itself
+    // and never reaches `allowedCommandPrograms` below, so there the machinery
+    // would remove a choice that works and offer one that resolves to a single
+    // allow. Plan gating re-reads `toolCall.kind` and still applies.
+    const execute = session.provider !== "muse"
+      && String(req.toolCall?.kind ?? "").toLowerCase() === "execute";
     const command = (req.toolCall?.rawInput as { command?: unknown } | undefined)?.command;
     const programs = execute && typeof command === "string"
       ? commandProgramsForGrant(command, resolvedTerminalShellDialect()) : undefined;
     const allowOnce = req.options.find((o) => o.kind === "allow_once");
     // Every segment must be covered: an npm grant cannot smuggle in `&& rm`.
     // is_background deliberately does not matter; it runs the same program.
-    if (!planActive && allowOnce && programs?.every((program) => session.allowedCommandPrograms.has(program))) {
+    if (session.provider !== "muse" && !planActive && allowOnce && programs?.every((program) => session.allowedCommandPrograms.has(program))) {
       if (client.respondPermission(req.id, allowOnce.optionId)) {
         // The COMMAND, not `toolCall.title` -- grok's title for an execute card
         // is often just "Shell", and what ran is the one thing this line exists
@@ -4342,6 +4194,7 @@ Only continue if you trust this code.`,
    *  unread plan, and the card must stay answerable. A card with no allow
    *  option is left for the user as well. */
   private autoApprovePendingPermissions(session: Session): void {
+    if (!supportsModeSwitching(session.provider)) return;
     const client = session.client;
     if (!client || session.pendingPermissions.size === 0) return;
     let resolved = 0;
@@ -4547,7 +4400,8 @@ Only continue if you trust this code.`,
 
     // A steer should carry only its authored contribution: the editor may have
     // moved since this turn started, and ambient snippets would be repeated.
-    const slashCommand = matchSlashCommand(
+    const slashCommand = matchProviderSlashCommand(
+      session.provider,
       queuedSendsText(contributions) || authored,
       client.availableCommands.map((c) => c.name),
     );
@@ -8234,7 +8088,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const adapterIds = new Set(ids.filter((id) => {
         const provider = overrides[id]?.provider;
-        return (provider && isAdapterProvider(provider)) || cachedAdapterIds.has(id);
+        return (provider && usesAdapterHistory(provider)) || cachedAdapterIds.has(id);
       }));
       if (adapterIds.size) {
         this.scheduleAdapterHistoryRefresh("codex", cwd);
@@ -8356,7 +8210,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const mime = m.mimeType || guessMediaMime(m.path);
       // Trusted session media: stream from disk when the webview can.
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) {
         const src = webview.asWebviewUri(Uri.file(m.path));
         // Copy image needs PIXELS, and a webview cannot read them back out of an
@@ -8503,7 +8357,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (opts.report) opts.report(text);
       else void this.host.showErrorMessage(text);
     };
-    if (isAdapterProvider(provider)) {
+    if (usesAdapterHistory(provider)) {
       const cliPath = this.locateProvider(provider);
       const name = providerDisplayName(provider);
       if (!cliPath) {
@@ -8705,7 +8559,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // another provider's crashed/clientless session remains resumable.
     for (const session of affectedSessions) this.disposeSession(session);
     for (const shell of shells) {
-      if (isAdapterProvider(shell.provider)) {
+      if (usesAdapterHistory(shell.provider)) {
         void this.discardAdapterEmptySession(shell.provider, shell.id, shell.cwd);
       } else {
         this.removeSessionFromDisk(shell.id, shell.cwd);
@@ -8896,7 +8750,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // models only appeared after clicking New session — for a session
         // that already was new. Re-post the catalog so the picker picks it up
         // in place.
-        if (isAdapterProvider(provider)) this.scheduleAdapterHistoryRefresh(provider, this.sessionCwd(session));
+        if (usesAdapterHistory(provider)) this.scheduleAdapterHistoryRefresh(provider, this.sessionCwd(session));
         if (!session.hasHistory) this.postSessionModels(session);
         this.postSessionsList();
       }
@@ -8953,6 +8807,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     void this.host.setContext("grok.composerFocus", false);
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
     if (this.routineTimer) { clearInterval(this.routineTimer); this.routineTimer = undefined; }
+    if (this.workflowTimer) { clearInterval(this.workflowTimer); this.workflowTimer = undefined; }
     for (const timer of this.loginReprobeTimers.values()) clearTimeout(timer);
     this.cancelAllDeviceLogins();
     this.loginReprobeTimers.clear();
@@ -8966,6 +8821,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     try { this.settingsEditor?.dispose(); } catch { /* tab already gone */ }
     this.settingsEditor = undefined;
     void this.disposePool();
+    for (const provider of new Set([...this.adapterHistoryClients.keys(), ...(this.museHistoryStart ? ["muse" as const] : [])])) {
+      void this.disposeAdapterHistoryClient(provider);
+    }
     this.editorWatcher?.dispose();
     this.configWatcher?.dispose();
     this.terminalManager.disposeAll();
@@ -9016,7 +8874,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  The cached version is NOT deleted first. On success the probe
    *  overwrites it; on failure the last known version is better than a blank
    *  row, and unlike the update path nothing here says the binary changed. */
-  private async reprobeProviderVersion(provider: "codex" | "claude"): Promise<void> {
+  private async reprobeProviderVersion(provider: "codex" | "claude" | "muse"): Promise<void> {
     // Same guard reprobeProviderCredentials carries, for the same reason: a
     // `--version` spawn holds the binary the updater is replacing. The updater
     // drains the in-flight probe before it replaces, so a probe started after
@@ -9026,9 +8884,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // pressing Update before the credential probe ahead of this one returns.
     // The updater re-reads the version itself when it finishes.
     if (this.providerCliUpdate?.provider === provider) return;
-    const inFlight = provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe;
+    const inFlight = provider === "muse" ? this.museVersionProbe
+      : provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe;
     await inFlight?.catch(() => "");
-    if (provider === "codex") this.codexVersionProbe = undefined;
+    if (provider === "muse") this.museVersionProbe = undefined;
+    else if (provider === "codex") this.codexVersionProbe = undefined;
     else this.claudeVersionProbe = undefined;
     await this.probeProviderVersion(provider).catch(() => "");
   }
@@ -9036,6 +8896,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private probeProviderVersion(provider: AcpProvider): Promise<string> {
     if (provider === "codex") return this.probeCodexVersion();
     if (provider === "claude") return this.probeClaudeVersion();
+    if (provider === "muse") return this.probeMuseVersion();
     if (this.grokVersionProbe) return this.grokVersionProbe;
     this.grokVersionProbe = (async () => {
       const cliPath = this.locateProvider("grok");
@@ -9153,6 +9014,31 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
     })();
     return this.claudeVersionProbe;
+  }
+
+  /** Probe the installed CLI, not the SDK/adapter package version. */
+  private probeMuseVersion(): Promise<string> {
+    if (this.museVersionProbe) return this.museVersionProbe;
+    this.museVersionProbe = (async () => {
+      const cliPath = this.locateProvider("muse");
+      if (!cliPath) return "";
+      try {
+        const { stdout } = await execGrokCli(cliPath, ["--version"], {
+          timeout: 30_000,
+          windowsHide: true,
+        });
+        const version = parseMuseVersionOutput(stdout ?? "");
+        if (!version) throw new Error("unrecognized version output");
+        this.providerCliVersions.muse = version;
+        this.postProviderState();
+        return version;
+      } catch (error) {
+        this.host.appendLine(`muse --version failed: ${(error as Error).message}`);
+        this.postProviderState();
+        return "";
+      }
+    })();
+    return this.museVersionProbe;
   }
 
   /** Once per extension upgrade, from session start, with a fresh install only
@@ -9582,6 +9468,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await (provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe);
       await Promise.all(this.providerModelProbes?.get(provider) ?? []);
       await Promise.all(this.adapterHistory(provider)?.refresh?.values() ?? []);
+      // The history listener is a LONG-LIVED process now, one per provider
+      // rather than one per listing, so it outlives the drain above and holds
+      // the binary exactly as those throwaways did. Await its real exit.
+      await this.disposeAdapterHistoryClient(provider, true);
       const closing = affected().map((session) => {
         stopped.push(session);
         const client = this.detachClient(session);
@@ -9855,6 +9745,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     clock?: OpenClock,
     opts: { silent?: boolean; canReplace?: () => boolean } = {},
   ): Promise<AcpClient | undefined> {
+    if (target.provider === "muse") await this.museCliChange;
     if (this.providerCliUpdate?.provider === target.provider) await this.providerCliUpdate.done;
     return this.runExclusiveSessionStart(target, () => this.startSessionBody(resumeId, target, intent, clock, opts));
   }
@@ -10058,7 +9949,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // toolbar shows the right one from the first paint — no Agent → Auto accept
     // flash while the session spins up and primes. Resumed sessions stay
     // verdict-driven (plan-restore decides), so they don't pre-apply it.
-    const rememberedYolo = startsInYolo(
+    const rememberedYolo = supportsModeSwitching(session.provider) && startsInYolo(
       this.host.getConfiguration("grok").get<string>("defaultMode", ""),
       !!resumeId,
     );
@@ -10163,7 +10054,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         : undefined;
       this.applyPlanModeCompatibility(session, compatibility);
     } else {
-      session.planModeAvailable = true;
+      session.planModeAvailable = supportsModeSwitching(session.provider);
       session.planModeVersionVerified = true;
       session.planModeUnavailableReason = undefined;
     }
@@ -10201,7 +10092,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       effort,
       log: (msg) => this.host.appendLine(msg),
       timeouts: this.acpClientTimeouts(),
-      mcpServers: (onDispose) => this.hostMcpServersFor(session, onDispose),
+      mcpServers: (onDispose) => supportsClientMcpServers(session.provider) ? this.hostMcpServersFor(session, onDispose) : [],
       ...(session.provider === "grok"
         ? { grokVersion: grokHandshakeVersion, grokVersionVerified }
         : { backend: this.createProviderBackend(session.provider) }),
@@ -10520,7 +10411,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     client.on("promptComplete", (meta) => {
       if (gen !== session.gen) return;
       const gated = gateZeroTokenMeta(meta);
-      if (isAdapterProvider(session.provider) && !session.replaying) {
+      if (usesPerCallContextOccupancy(session.provider) && !session.replaying) {
         // Stale partitions on a zero-inference compact turn are the previous
         // turn replayed — observing them would undo the compact reset.
         // Claude's result usage is a SUM; occupancy is the largest call.
@@ -10554,7 +10445,18 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("contextUsage", (used: number | undefined, window?: number) => {
       if (gen !== session.gen) return;
-      if (isAdapterProvider(session.provider)) {
+      if (session.provider === "muse") {
+        const id = session.activeSessionId;
+        if (id) {
+          const current = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+          void this.state.update(SESSION_META_KEY, { ...current, [id]: { ...current[id],
+            ...(typeof used === "number" ? { contextUsed: used } : {}),
+            ...(typeof window === "number" ? { contextWindow: window } : {}) } });
+        }
+        this.emit(session, { type: "contextUsage", used, window });
+        return;
+      }
+      if (usesPerCallContextOccupancy(session.provider)) {
         // Window only. Occupancy is remembered from prompt size / compact,
         // never from billed usage_update.used.
         this.rememberAdapterContext(session, {
@@ -10582,7 +10484,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("adapterUsageUpdate", (used: number, window?: number) => {
       if (gen !== session.gen) return;
-      if (!isAdapterProvider(session.provider) || session.replaying) {
+      if (!usesPerCallContextOccupancy(session.provider) || session.replaying) {
         if (typeof window === "number" && Number.isFinite(window) && window > 0) {
           this.rememberAdapterContext(session, { window });
         }
@@ -10657,6 +10559,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("subagentLifecycle", (u: unknown, meta?: any) => {
       if (gen !== session.gen) return;
+      // Persisted workflow/goal frames establish cards at their replay position.
+      // Use the live rail's parser and replace the subagent-only forwarding.
+      const runProg = parseRunProgressUpdate(u);
+      if (runProg) {
+        this.emit(session, { type: "runProgress", update: runProg });
+        return;
+      }
       if ((u as { sessionUpdate?: unknown })?.sessionUpdate === "turn_completed") {
         if (session.replaying) {
           this.emit(session, {
@@ -11656,7 +11565,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         break;
       case "setModel": {
-        const provider = isAcpProvider(msg.provider)
+        const provider = isInternalProvider(msg.provider)
           ? msg.provider
           : this.providerForRequestedModel(msg.modelId, session.provider);
         const { effort } = msg;
@@ -12018,7 +11927,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "runGrokLogin": {
-        const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : "grok";
+        const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : "grok";
         const cliPath = this.locateProvider(provider);
         if (!cliPath) {
           this.post({
@@ -12055,7 +11964,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // observed directly. Probe immediately as well: browser/desktop login
         // helpers may already have completed, and the explicit Re-check below
         // remains available for interactive terminals still in progress.
-        this.watchProviderLogin(provider);
+        if (provider !== "muse") this.watchProviderLogin(provider);
         // Connecting an agent is about the NEXT conversation, not the one on
         // screen. Showing its sign-in panel over a session with history covered
         // that transcript, and the confirmation afterwards had nowhere sensible
@@ -12105,7 +12014,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "submitDeviceLoginCode": {
-        const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : "grok";
+        const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : "grok";
         const running = this.deviceLogins.get(provider);
         if (!running) break;
         const code = typeof msg.code === "string" ? msg.code.trim() : "";
@@ -12127,7 +12036,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.cancelGithubDeviceLogin();
           break;
         }
-        const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : "grok";
+        const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : "grok";
         const running = this.deviceLogins.get(provider);
         if (!running) break;
         this.deviceLogins.delete(provider);
@@ -12147,7 +12056,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "recheckConnection": {
-        const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : session.provider;
+        const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : session.provider;
         if (!this.locateProvider(provider)) {
           this.post({
             type: "onboarding",
@@ -12169,13 +12078,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         //
         // A failure never demotes, either: a lapsed account keeps its row and
         // gets the sign-in action, which is what needsLogin is for.
+        if (provider === "muse") {
+          const client = await this.adapterHistoryClient(provider, this.locateProvider(provider)!);
+          if (!client) break;
+          // The user acknowledges CLI sign-in here; MSP has no auth-status RPC.
+          // A turn reports any remaining credential error through the normal path.
+          this.setProviderNeedsLogin(provider, false);
+          await this.setProviderConnected(provider, true);
+          await this.adoptSessionsForConnectedProvider(provider, session);
+          for (const target of this.sessionsForModelRefresh()) this.postSessionModels(target);
+          break;
+        }
         const rechecked = await this.reprobeProviderCredentials(provider);
         if (rechecked) await this.setProviderConnected(provider, true);
         await this.adoptSessionsForConnectedProvider(provider, session);
         break;
       }
       case "retryProviderSession": {
-        const provider: AcpProvider = isAcpProvider(msg.provider) ? msg.provider : session.provider;
+        const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : session.provider;
         if (!this.connectedProviders().includes(provider)) {
           if (requester) this.sendRemoteRequester(requester, {
             type: "error",
@@ -12193,7 +12113,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // that, and it only lets this through on a cloud environment. It says
         // there is NOBODY AT THE MACHINE to answer a modal.
         await this.logout(
-          isAcpProvider(msg.provider) ? msg.provider : "grok",
+          isInternalProvider(msg.provider) ? msg.provider : "grok",
           {
             fromRemote: origin === "remote",
             // `requester`, NOT clientId. Host dialogs are invisible on a cloud
@@ -12236,13 +12156,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         } else {
         this.postSessionsList({ offset: msg.offset, limit: msg.limit, query: msg.query, providerCursor: msg.providerCursor });
         }
-        break;
-      case "sessionsReady":
-        this.postSessionsList();
-        break;
-      case "setHideAutoSessions":
-        void this.host.getConfiguration("grok").update("hideAutoSessions", !!msg.value);
-        this.postSessionsList();
         break;
       case "listRepoSessions":
         // Preview rows for a repo WITHOUT selecting it (the projects rail).
@@ -12404,7 +12317,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (!HOST_CAPABILITIES.editProviderConfigFiles || !HOST_CAPABILITIES.editProjectFiles) break;
         const generation = session.gen;
         const canReplace = () => {
-          if (!isAcpProvider(msg.provider) || !msg.sessionId || msg.provider !== session.provider
+          if (!isInternalProvider(msg.provider) || !msg.sessionId || msg.provider !== session.provider
             || msg.sessionId !== session.activeSessionId || session.gen !== generation) {
             this.reportRequester(requester, "warning", "The current conversation changed. Open the matching provider conversation and restart it there.");
             return false;
@@ -13038,6 +12951,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private reservedMcpIdentityFor(session: Session): ReservedMcpIdentity {
     const cwd = this.sessionCwd(session);
     const parts: ReservedMcpIdentity[] = [];
+    if (session.provider === "muse") return { names: [], urls: [] };
     for (const filePath of mcpConfigPaths({
       cwd,
       provider: session.provider,
@@ -13577,7 +13491,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     cwd = listCwd;
     const providers = this.connectedProviders();
-    const adapterProviders = providers.filter(isAdapterProvider);
+    const adapterProviders = providers.filter(usesAdapterHistory);
     for (const provider of adapterProviders) this.scheduleAdapterHistoryRefresh(provider, cwd);
     // Grok rows are files under GROK_HOME/sessions (plus live-pool synthesis) —
     // listing is disk/buffer-truth and must not wait for a located grok binary.
@@ -13595,9 +13509,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const adapter: SessionListEntry[] = [];
     if (providers.includes("codex")) adapter.push(...(this.codexSessionCache.get(projectProviderKey(cwd)) ?? []));
+    if (providers.includes("muse")) adapter.push(...(this.museSessionCache?.get(projectProviderKey(cwd)) ?? []));
     if (providers.includes("claude")) adapter.push(...(this.claudeSessionCache.get(projectProviderKey(cwd)) ?? []));
     for (const session of this.pool) {
-      if (!isAdapterProvider(session.provider) || !session.activeSessionId || !pathsEqual(this.sessionCwd(session), cwd)) continue;
+      if (!usesAdapterHistory(session.provider) || !session.activeSessionId || !pathsEqual(this.sessionCwd(session), cwd)) continue;
       if (adapter.some((entry) => entry.id === session.activeSessionId)) continue;
       adapter.push(this.liveSessionEntry(session, session.activeSessionId, this.sessionCwd(session), overrides));
     }
@@ -13620,24 +13535,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? offset + entries.length
       : Math.max(offset + entries.length, combinedPage?.providerCursor.grokOffset ?? 0);
     const total = query ? (merged?.length ?? 0) : (grok?.total ?? 0) + adapter.length;
-    const hideAuto = this.hideAutoSessions();
-    const visible = hideAuto
-      ? entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined))
-      : entries;
-    const visibleDots: Record<string, Dot> = {};
-    for (const entry of visible) visibleDots[entry.id] = this.dotForId(entry.id);
     return {
       type: "sessions",
-      entries: visible,
+      entries,
       activeId,
-      dots: visibleDots,
+      dots,
       offset,
-      total: hideAuto ? visible.length : total,
+      total,
       hasMore: query ? nextOffset < total : combinedPage?.hasMore ?? false,
       nextOffset,
       ...(!query && combinedPage ? { providerCursor: combinedPage.providerCursor } : {}),
       query,
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -13647,7 +13555,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private scheduleAdapterHistoryRefresh(provider: AcpProvider, cwd: string): void {
     if (this.providerCliUpdate?.provider === provider) return;
-    if (!isAdapterProvider(provider) || !this.connectedProviders().includes(provider)) return;
+    if (!usesAdapterHistory(provider) || !this.connectedProviders().includes(provider)) return;
     const history = this.adapterHistory(provider);
     if (!history) return;
     const key = projectProviderKey(cwd);
@@ -13658,7 +13566,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       : this.refreshAdapterHistory(provider, cwd, key))
       .catch((error) => {
         this.host.appendLine(`[${provider}] session listing failed: ${(error as Error).message}`);
-        const credential = provider === "claude" ? isClaudeCredentialError(error) : isCodexCredentialError(error);
+        const credential = this.createProviderBackend(provider)?.isCredentialError(error);
         if (!credential) return;
         history.at.set(key, Date.now());
         this.setProviderNeedsLogin(provider, true);
@@ -13671,76 +13579,198 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return this.refreshAdapterHistory("codex", cwd, key);
   }
 
+  /**
+   * The shared history process for a provider, started on first use.
+   *
+   * A listing never needed a process of its own. Measured against both real
+   * adapters, 2026-09-21: **codex sends no cwd on the wire at all** — its
+   * `session/list` returns an unscoped catalog that `codex-backend.ts` filters
+   * locally, and a process spawned in one repo duly returned sessions for
+   * eight others — while **claude takes `cwd` as a per-call parameter and
+   * honours it**: asked from a process spawned in one checkout for a different
+   * one, it returned that second checkout's 69 sessions and nothing else, with no
+   * leakage in either direction. For both, the process's own spawn cwd is
+   * irrelevant to the answer, so one process can serve every repo on the rail.
+   *
+   * What that buys: opening the app with five projects spawned TEN adapters in
+   * 400ms, each living ~25s and re-arming for as long as the rail was on
+   * screen. It is two now, and they are reused.
+   *
+   * What it costs, and the reason for the exit handler: a shared process is a
+   * shared failure domain. When it dies the handle is dropped, so the next
+   * listing starts a fresh one rather than talking to a corpse.
+   *
+   * It is spawned in the HOME directory, never in a project, and that is not
+   * cosmetic. Because the spawn cwd carries no meaning (above), a process born
+   * in whichever project happened to list first would go on holding that
+   * folder open for as long as it lived — and it now outlives the project. On
+   * Windows the user closes the project, tries to delete the folder, and
+   * Explorer refuses; `revokeClosedProjectFolder` hard-kills conversation
+   * processes for exactly that reason, and this one is not one of them. Home
+   * is measured, not assumed: asked from there, codex returned its global
+   * catalog across nine checkouts and claude returned the 69 sessions of a
+   * repo the process had never been in.
+   */
+  private async adapterHistoryClient(provider: AcpProvider, cliPath: string): Promise<AcpClient | undefined> {
+    if (provider === "muse" && this.museCliChange) {
+      await this.museCliChange;
+      const currentPath = this.locateProvider(provider);
+      if (!currentPath) throw new Error("Muse CLI is unavailable after its path changed");
+      cliPath = currentPath;
+    }
+    if (provider === "muse" && this.museHistoryStart) {
+      await this.museHistoryStart;
+      return this.adapterHistoryClient(provider, cliPath);
+    }
+    const generation = this.museHistoryGeneration ?? 0;
+    const start = async () => {
+      const existing = this.adapterHistoryClients.get(provider);
+      if (existing && existing.cliPath === cliPath) return existing.client;
+      // A relocated or upgraded CLI is a different program. Never keep talking to
+      // the old one just because it is still answering.
+      if (existing) {
+        this.adapterHistoryClients.delete(provider);
+        await existing.client.dispose();
+      }
+      const backend = this.createProviderBackend(provider);
+      if (!backend) return undefined;
+      const client = new AcpClient({
+        cliPath,
+        cwd: this.projectHomeDir(),
+        env: { ...process.env },
+        backend,
+        log: (message) => this.host.appendLine(message),
+      });
+      if (provider === "muse") client.on("initialized", (init) => {
+        const catalog = init?._meta?.models;
+        if (!Array.isArray(catalog?.availableModels)) return;
+        const models = catalog.availableModels.map((m: any) => ({ modelId: m.modelId, name: m.name,
+          description: m.description, totalContextTokens: m._meta?.totalContextTokens }));
+        const cache = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
+        void this.state.update(PROVIDER_MODEL_CACHE_KEY, { ...cache, muse: { models, currentModelId: catalog.currentModelId, seenAt: Date.now() } });
+      });
+      let exited = false;
+      client.on("exit", () => {
+        exited = true;
+        if (this.adapterHistoryClients.get(provider)?.client === client) {
+          this.adapterHistoryClients.delete(provider);
+        }
+      });
+      try {
+        await client.start();
+      } catch (error) {
+        await client.dispose();
+        throw error;
+      }
+      if (exited || provider === "muse" && generation !== (this.museHistoryGeneration ?? 0)) {
+        await client.dispose();
+        throw new Error("Provider history connection was closed during startup");
+      }
+      this.adapterHistoryClients.set(provider, { cliPath, client });
+      return client;
+    };
+    if (provider !== "muse") return start();
+    const pending = this.museHistoryStart = start();
+    try { return await pending; }
+    finally { if (this.museHistoryStart === pending) this.museHistoryStart = undefined; }
+  }
+
+  /**
+   * Drop a provider's shared history process — disconnect, CLI change, shutdown.
+   *
+   * `forUpdate` awaits the process actually exiting rather than merely
+   * signalling it. That matters only on the CLI-update path, and it matters
+   * there because this process is no longer a throwaway: the probes drained
+   * alongside it are torn down for the same reason, since a live one keeps the
+   * binary locked on Windows and the replacement fails.
+   */
+  private async disposeAdapterHistoryClient(provider: AcpProvider, forUpdate = false): Promise<void> {
+    if (provider === "muse") {
+      this.museHistoryGeneration = (this.museHistoryGeneration ?? 0) + 1;
+      await this.museHistoryStart?.catch(() => undefined);
+    }
+    const entry = this.adapterHistoryClients.get(provider);
+    if (!entry) return Promise.resolve();
+    this.adapterHistoryClients.delete(provider);
+    return forUpdate ? entry.client.disposeForUpdate() : entry.client.dispose();
+  }
+
   private async refreshAdapterHistory(provider: AcpProvider, cwd: string, key = projectProviderKey(cwd)): Promise<void> {
     if (this.providerCliUpdate?.provider === provider) return;
-    if (!isAdapterProvider(provider)) return;
+    if (!usesAdapterHistory(provider)) return;
+    if (!this.adapterHistory(provider) || !this.locateProvider(provider)) return;
+    if (!this.connectedProviders().includes(provider)) return;
+    // Queued rather than concurrent: the rail asks for every repo at once and
+    // they now share one process, so the opening burst becomes N cheap round
+    // trips instead of N spawns. A previous listing's failure belongs to its
+    // own caller and must not break the chain for the next one.
+    const run = (this.adapterHistoryQueue.get(provider) ?? Promise.resolve())
+      .catch(() => { /* handled by whoever awaited it */ })
+      .then(() => this.listAdapterHistory(provider, cwd, key));
+    this.adapterHistoryQueue.set(provider, run.catch(() => { /* keep the chain alive */ }));
+    return run;
+  }
+
+  private async listAdapterHistory(provider: AcpProvider, cwd: string, key: string): Promise<void> {
     const history = this.adapterHistory(provider);
+    // Re-checked here, not only at queue time: a provider can be disconnected
+    // or its CLI replaced while this call was waiting its turn.
     const cliPath = this.locateProvider(provider);
-    const backend = this.createProviderBackend(provider);
-    if (!history || !cliPath || !backend || !this.connectedProviders().includes(provider)) return;
-    const client = new AcpClient({
-      cliPath,
-      cwd,
-      env: { ...process.env },
-      backend,
-      log: (message) => this.host.appendLine(message),
-    });
-    try {
-      await client.start();
-      const result = await client.listSessions(cwd, process.platform);
-      const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-      const stableOverrides: SessionMetaOverrides = { ...overrides };
-      // First-seen adapter listing time is a baseline only. Claude restamps
-      // `updatedAt` on `session/load` (measured). Codex does not restamp, but
-      // pinning is still what we want: an open must not promote the row.
-      // Trade-off: work done outside this extension stops promoting the row.
-      // Unlike grok, neither adapter has a load-stable on-disk file to rank by.
-      for (const entry of result.sessions) {
-        const previous = stableOverrides[entry.sessionId] ?? {};
-        if (typeof previous.activeAt === "number") continue;
-        stableOverrides[entry.sessionId] = {
-          ...previous,
-          activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt,
-        };
-      }
-      const entries = result.sessions.map((entry) => adapterListEntry(entry, stableOverrides, provider));
-      // Same reasoning as startSession's: listing sessions reads this machine's
-      // own files and succeeds with any token at all. On the owner's host a
-      // phone reconnect swept four project folders at 10:05:40, spawning an
-      // adapter per folder, and each success wiped the needs-login the failing
-      // conversation had just raised. The catch below still LOWERS the verdict
-      // from a listing -- a listing that fails with a credential error is real
-      // evidence -- but a listing that succeeds is evidence of nothing.
-      // (Kept on the grok/probe paths, which make a call the account must
-      // authorize; this one does not.)
-      history.cache.set(key, entries);
-      history.at.set(key, Date.now());
-      await this.updateSessionMeta((current) => {
-        let changed = false;
-        const next = { ...current };
-        for (const entry of result.sessions) {
-          const previous = next[entry.sessionId] ?? {};
-          const title = typeof entry.title === "string" ? entry.title.trim() : "";
-          const autoName = capAutoName(title);
-          const updated = {
-            ...previous,
-            provider,
-            providerCwd: entry.cwd,
-            activeAt: typeof previous.activeAt === "number"
-              ? previous.activeAt
-              : stableOverrides[entry.sessionId]?.activeAt,
-            ...(!previous.customName && autoName ? { autoName } : {}),
-          };
-          if (JSON.stringify(updated) !== JSON.stringify(previous)) {
-            next[entry.sessionId] = updated;
-            changed = true;
-          }
-        }
-        return changed ? next : null;
-      });
-    } finally {
-      await client.dispose();
+    if (!history || !cliPath || !this.connectedProviders().includes(provider)) return;
+    if (this.providerCliUpdate?.provider === provider) return;
+    const client = await this.adapterHistoryClient(provider, cliPath);
+    if (!client) return;
+    const result = await client.listSessions(cwd, process.platform);
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const stableOverrides: SessionMetaOverrides = { ...overrides };
+    // First-seen adapter listing time is a baseline only. Claude restamps
+    // `updatedAt` on `session/load` (measured). Codex does not restamp, but
+    // pinning is still what we want: an open must not promote the row.
+    // Trade-off: work done outside this extension stops promoting the row.
+    // Unlike grok, neither adapter has a load-stable on-disk file to rank by.
+    for (const entry of result.sessions) {
+      const previous = stableOverrides[entry.sessionId] ?? {};
+      if (typeof previous.activeAt === "number") continue;
+      stableOverrides[entry.sessionId] = {
+        ...previous,
+        activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt,
+      };
     }
+    const entries = result.sessions.map((entry) => adapterListEntry(entry, stableOverrides, provider));
+    // Same reasoning as startSession's: listing sessions reads this machine's
+    // own files and succeeds with any token at all. On the owner's host a
+    // phone reconnect swept four project folders at 10:05:40, spawning an
+    // adapter per folder, and each success wiped the needs-login the failing
+    // conversation had just raised. The catch below still LOWERS the verdict
+    // from a listing -- a listing that fails with a credential error is real
+    // evidence -- but a listing that succeeds is evidence of nothing.
+    // (Kept on the grok/probe paths, which make a call the account must
+    // authorize; this one does not.)
+    history.cache.set(key, entries);
+    history.at.set(key, Date.now());
+    await this.updateSessionMeta((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const entry of result.sessions) {
+        const previous = next[entry.sessionId] ?? {};
+        const title = typeof entry.title === "string" ? entry.title.trim() : "";
+        const autoName = capAutoName(title);
+        const updated = {
+          ...previous,
+          provider,
+          providerCwd: entry.cwd,
+          activeAt: typeof previous.activeAt === "number"
+            ? previous.activeAt
+            : stableOverrides[entry.sessionId]?.activeAt,
+          ...(!previous.customName && autoName ? { autoName } : {}),
+        };
+        if (JSON.stringify(updated) !== JSON.stringify(previous)) {
+          next[entry.sessionId] = updated;
+          changed = true;
+        }
+      }
+      return changed ? next : null;
+    });
     this.postSessionsList();
     this.sendLocalRepoSessionsPreview(cwd);
   }
@@ -13753,7 +13783,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
-    const hideAuto = this.hideAutoSessions();
     // Stale per-tab / selected cwds must not scan a closed project's catalog.
     const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
@@ -13802,22 +13831,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     let pageEntries: SessionListEntry[];
     let total: number;
     let nextOffset: number;
-    const filterAuto = (entries: SessionListEntry[]) => {
-      if (!hideAuto) return entries;
-      return entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined));
-    };
-    if (query || hideAuto) {
-      // Search and hide-auto need names, so read (cache-backed) the whole list once, then filter.
+    if (query) {
+      // Search needs names for everything, so read (cache-backed) the whole list once, then filter.
       const all = this.readEntriesCachedMulti(index.map((e) => e.id), mtimeById, cwdById, overrides, grokHome, log)
         .filter((e) => e.kind !== "subagent");
       all.sort((a, b) => b.updatedAt - a.updatedAt);
-      const matched = filterAuto(query
-        ? all.filter(
-            (e) =>
-              e.displayName.toLowerCase().includes(query) ||
-              (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
-          )
-        : all);
+      const matched = all.filter(
+        (e) =>
+          e.displayName.toLowerCase().includes(query) ||
+          (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
+      );
       total = matched.length;
       pageEntries = matched.slice(offset, offset + limit);
       nextOffset = offset + pageEntries.length;
@@ -13905,7 +13928,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       hasMore,
       nextOffset,
       query: opts?.query ?? "",
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -13949,7 +13971,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // a nameless session reads like a row rather than a bare "(Fork)".
     const generated = (override?.autoName || "").trim();
     const opening = (session.firstUserMessageForTitle || "").trim();
-    const first = session.client && isAdapterProvider(session.client.provider) ? generated || opening : opening || generated;
+    const first = session.client && usesAdapterHistory(session.client.provider) ? generated || opening : opening || generated;
     return fallbackName(first, Date.now());
   }
 
@@ -14136,7 +14158,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       (cwd, allowed) => sessionCwdBelongsToRepo(cwd, allowed, pathsEqual),
     );
     const provider = live?.provider ?? overrides[id]?.provider ?? cachedAdapter?.provider ?? "grok";
-    if (provider && isAdapterProvider(provider)) {
+    if (provider && usesAdapterHistory(provider)) {
       return cachedAdapter ? { cwd: cachedAdapter.cwd } : { reason: "gone", repoCwd: selectedCwd };
     }
 
@@ -14212,7 +14234,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // A rename changes displayName but not summary.json's mtime, so the mtime-keyed cache would
     // otherwise keep serving the old name. Drop it so the next read rebuilds the entry.
     this.sessionCache.delete(id);
-    for (const adapter of (["codex", "claude"] as const)) {
+    for (const adapter of INTERNAL_PROVIDERS.filter(usesAdapterHistory)) {
       const history = this.adapterHistory(adapter);
       if (!history) continue;
       for (const [key, entries] of history.cache) {
@@ -14446,6 +14468,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       localNamedCwd ||
       this.historyCwdFor(origin);
     const provider = live?.provider ?? overridesNow[id]?.provider ?? cachedAdapter?.provider ?? "grok";
+    if (!supportsHistoryDeletion(provider)) {
+      this.host.appendLine(`[sessions] deletion is unsupported for ${provider}`);
+      this.reportRequester(
+        origin === "remote" && clientId ? this.captureRemoteRequester(clientId) : undefined,
+        "warning",
+        `${providerDisplayName(provider)} history deletion is not supported, so this conversation was not deleted.`,
+      );
+      return;
+    }
     // Tear the CLI down BEFORE touching the disk, not after. The live process
     // owns this conversation and re-persists it: delete the directory first and
     // it simply comes back, which is why deleting the open conversation used to
@@ -14458,7 +14489,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       { limit: Number.MAX_SAFE_INTEGER },
       undefined,
     ).entries;
-    if (isAdapterProvider(provider)) {
+    if (usesAdapterHistory(provider)) {
       // A FAILED DELETE MUST STILL REMOVE THE ROW.
       //
       // Codex implements delete as one `threadArchive(threadId)` and Claude's
@@ -14648,6 +14679,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const repoCwdKeys = new Set(repoCwds.map(normalizeFsPath));
     const exiting: Promise<void>[] = [];
     for (const s of [...this.pool]) {
+      if (!supportsHistoryDeletion(s.provider)) continue;
       if (this.sessionHasLiveOwner(s)) continue;
       if (!repoCwdKeys.has(normalizeFsPath(this.sessionCwd(s)))) continue;
       exiting.push(this.disposeSession(s));
@@ -14663,7 +14695,32 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // A failed refresh must not fall through to the stale cache — that is how
     // "were not cleared" became a delete. Only providers that checked succeed.
     const adapterHistoryChecked = new Set<AcpProvider>();
-    for (const provider of this.connectedProviders().filter(isAdapterProvider)) {
+    // A notice is a line in the transcript, and a transcript belongs to ONE
+    // project — so a remark about a project you are not talking in lands in the
+    // wrong conversation. Computed here rather than beside its other use below,
+    // because the skipped-provider warning needs the same gate: cleared from the
+    // rail while reading another project, it otherwise told THAT conversation
+    // that Muse history was kept, without naming the project it meant.
+    const clientCwd = origin === "remote" && clientId ? this.remoteClients.cwd(clientId) : undefined;
+    const inThisConversation = origin !== "remote" || (!!clientCwd && pathsEqual(cwd, clientCwd));
+    // Deliberately true when the provider is merely CONNECTED, not only when
+    // this project is known to hold its conversations. Muse's cache is never
+    // refreshed here — the refresh below runs only for providers that support
+    // session deletion — so an empty cache means "nobody looked", not "nothing
+    // there". Over-warning costs a line nobody needed; under-warning is the
+    // original defect, where history was kept and the dialog said otherwise.
+    const skippedProviders = INTERNAL_PROVIDERS.filter((provider) => !supportsHistoryDeletion(provider)
+      && (this.connectedProviders().includes(provider)
+        || [...this.pool].some(s => s.provider === provider && repoCwdKeys.has(normalizeFsPath(this.sessionCwd(s))))
+        || (this.adapterHistory(provider)?.cache.get(projectProviderKey(cwd))?.length ?? 0) > 0));
+    if (inThisConversation) for (const provider of skippedProviders) {
+      this.reportRequester(
+        origin === "remote" && clientId ? this.captureRemoteRequester(clientId) : undefined,
+        "warning",
+        `${providerDisplayName(provider)} history deletion is not supported, so its conversations were not cleared.`,
+      );
+    }
+    for (const provider of this.connectedProviders().filter(supportsSessionDeletion)) {
       try {
         await this.refreshAdapterHistory(provider, cwd);
         adapterHistoryChecked.add(provider);
@@ -14693,10 +14750,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       entries: indexSessions({ fs: defaultFs, grokHome, cwd: sessionCwd }),
     })));
     const adapterEntries = adapterEntriesEligibleForClear(
-      [
-        { provider: "codex", entries: this.codexSessionCache.get(projectProviderKey(cwd)) ?? [] },
-        { provider: "claude", entries: this.claudeSessionCache.get(projectProviderKey(cwd)) ?? [] },
-      ],
+      INTERNAL_PROVIDERS.filter(supportsSessionDeletion).map(provider => ({
+        provider, entries: this.adapterHistory(provider)?.cache.get(projectProviderKey(cwd)) ?? [],
+      })),
       adapterHistoryChecked,
     );
     const allEntries = [...repoEntries, ...adapterEntries];
@@ -14704,15 +14760,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       (entry) => protectedIds.has(entry.id) && entry.id !== requesterId,
     );
     const clearableCount = allEntries.filter((entry) => !protectedIds.has(entry.id)).length;
-    // A notice is a line in the transcript, and a transcript belongs to ONE
-    // project — so a remark about a project you are not talking in lands in the
-    // wrong conversation. Where the rail is the thing that asked, the refreshed
-    // rail is the answer: the project shows itself empty, in its own place.
-    const clientCwd = origin === "remote" && clientId ? this.remoteClients.cwd(clientId) : undefined;
-    const inThisConversation = origin !== "remote" || (!!clientCwd && pathsEqual(cwd, clientCwd));
+    // Where the rail is the thing that asked, the refreshed rail is the answer:
+    // the project shows itself empty, in its own place. (`inThisConversation` is
+    // computed above, where the skipped-provider warning also needs it.)
     if (clearableCount === 0) {
       if (keptForAnotherOwner) this.reportProtectedSession(origin, clientId, "clear");
-      else if (inThisConversation) this.reportRequester(
+      else if (inThisConversation && !skippedProviders.length) this.reportRequester(
         origin === "remote" && clientId ? this.captureRemoteRequester(clientId) : undefined,
         "info",
         "No history to clear.",
@@ -14741,7 +14794,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         );
       }
     }
-    for (const provider of (["codex", "claude"] as const)) {
+    for (const provider of INTERNAL_PROVIDERS.filter(usesAdapterHistory)) {
+      if (!supportsSessionDeletion(provider)) continue;
       if (!adapterHistoryChecked.has(provider)) continue;
       const history = this.adapterHistory(provider);
       const entries = (history?.cache.get(projectProviderKey(cwd)) ?? [])
@@ -14785,7 +14839,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
     if (removed.length) {
       const gone = new Set(removed);
-      for (const adapter of (["codex", "claude"] as const)) {
+      for (const adapter of INTERNAL_PROVIDERS.filter(usesAdapterHistory)) {
         const history = this.adapterHistory(adapter);
         if (!history) continue;
         for (const [key, entries] of history.cache) {
@@ -14951,6 +15005,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       grok: pickSttBackend({ ...state, provider: "grok" }) ?? null,
       codex: pickSttBackend({ ...state, provider: "codex" }) ?? null,
       claude: pickSttBackend({ ...state, provider: "claude" }) ?? null,
+      muse: pickSttBackend({ ...state, provider: "muse" }) ?? null,
     } };
   }
 
@@ -16786,7 +16841,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // it (a /compact that *grew* the context 6x in testing — see
     // research/compact.md). Confirmed commands flip the prompt order so the
     // command keeps position 0 and the context trails it.
-    const slashCommand = matchSlashCommand(
+    const slashCommand = matchProviderSlashCommand(
+      session.provider,
       text,
       client.availableCommands.map((c) => c.name),
     );
@@ -16889,7 +16945,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (slashCommand === "compact") {
         session.sawCompactFailed = false;
         session.sawCompactNotification = false;
-        if (isAdapterProvider(session.provider)) {
+        if (usesAdapterHistory(session.provider)) {
           session.adapterCompactThisTurn = true;
           this.rememberAdapterContext(session, { compacted: true });
         }
@@ -17377,10 +17433,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    */
   private rehydrateWebviewFromFocused(): void {
     const session = this.focused;
-    const wv = this.webviewFor(session);
+    const wv = this.view?.webview;
     if (!wv) return;
     this.touch(session);
     this.markRead(session);
+    this.refreshWorkflowCompletions(session);
     void wv.postMessage({ type: "clearMessages" });
     void wv.postMessage({ type: "historyReplay", active: true });
     for (const m of session.buffer) {
@@ -17432,8 +17489,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postChips(session: Session = this.focused): void {
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
-    const webview = session === this.focused ? this.webviewFor(session) : undefined;
-    if (webview) {
+    if (session === this.focused && this.view) {
+      const webview = this.view.webview;
       const localMessage: HostMsg = { type: "chips", chips: this.localPreviewChips(session, webview) };
       void webview.postMessage(localMessage);
     }
@@ -17558,9 +17615,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
@@ -17578,11 +17633,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Post to the VS Code webview only (plus catalog mirror to the projects rail). */
   private postLocal(message: HostMsg): void {
     this.postTap?.("local", message);
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /**
@@ -17704,6 +17756,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const clientIds = this.remoteClients.clientsForActiveValue(session);
     if (clientIds.length === 0) return;
+    this.refreshWorkflowCompletions(session);
     const snapshot = [
       ...bracketRemoteSnapshot(session.buffer),
       { type: "subscriptionUsage" as const, windows: session.subscriptionUsage?.snapshot() ?? [] },
@@ -18132,6 +18185,43 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     };
   }
 
+  private startWorkflowCompletionPolling(): void {
+    this.workflowTimer = setInterval(() => {
+      for (const session of new Set([this.focused, ...this.pool])) this.refreshWorkflowCompletions(session);
+    }, 2000);
+    this.workflowTimer.unref?.();
+  }
+
+  private workflowCompletion(session: Session, update: RunProgressUpdate) {
+    if (session.provider !== "grok" || update.kind !== "workflow" || update.done) return;
+    const sid = session.activeSessionId || session.client?.sessionId;
+    if (!sid) return;
+    const dir = sessionDirFor(resolveGrokHome(process.env), this.sessionCwd(session), sid, { fs: defaultFs });
+    return readWorkflowCompletion(dir, update);
+  }
+
+  private refreshWorkflowCompletions(session: Session): void {
+    if (session.provider !== "grok") return;
+    const runs = new Map<string, Extract<HostMsg, { type: "runProgress" }>[]>();
+    for (const message of session.buffer) {
+      if (message.type !== "runProgress" || message.update.kind !== "workflow") continue;
+      const frames = runs.get(message.update.id);
+      if (frames) frames.push(message);
+      else runs.set(message.update.id, [message]);
+    }
+    for (const frames of runs.values()) {
+      const completed = this.workflowCompletion(session, frames[frames.length - 1].update);
+      if (!completed) continue;
+      // Hydration may keep the first frame it sees. Repair every replay position
+      // from the newest observation, with independent nested data for each frame.
+      for (const message of frames) message.update = structuredClone(completed);
+      if (session.suppressContent) continue;
+      const frame: HostMsg = { type: "runProgress", update: completed, replaceOnly: true };
+      if (session === this.focused) this.postLocal(frame);
+      if (!session.replaying) this.sendRemoteSession(session, frame);
+    }
+  }
+
   /**
    * Session-scoped post. Records the message in that session's view buffer (so a
    * focus switch can rebuild its chat losslessly — clearMessages + replay) and,
@@ -18144,6 +18234,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * focused one, so this is behaviorally identical to `post`.)
    */
   private emit(session: Session, message: HostMsg): void {
+    if (message.type === "runProgress") {
+      const completed = this.workflowCompletion(session, message.update);
+      if (completed) message = { type: "runProgress", update: completed };
+    }
     // A capture still running when tools start may already contain their writes.
     // Prefer the tool-row fallback to presenting that as the pre-turn file.
     if (session.turnToken && (message.type === "toolCall" || message.type === "toolCallUpdate"
@@ -18157,11 +18251,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session === this.focused) {
       this.postTap?.("local", message);
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
       // Active-session identity for the projects rail (highlight + pin home).
       this.mirrorToProjectsRail(message);
-      this.postToSessions(message);
     }
     if (!session.replaying) this.sendRemoteSession(session, message);
   }
@@ -18186,10 +18279,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /** Desk-targeted, non-replayable delivery for one-shot notices. */
@@ -18197,10 +18289,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   private async replayLoadedHistory(session: Session, load: () => Promise<void>): Promise<void> {
@@ -18212,6 +18303,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // A saved id may still be an untouched shell. Only a successful replay
       // can prove that; failed loads retain the provider lock.
       session.hasHistory = session.historyEventCount > 0 || session.userMessageCount > 0;
+      this.refreshWorkflowCompletions(session);
     }, {
       onStart: () => this.emit(session, { type: "historyReplay", active: true }),
       onFinish: () => {
@@ -18417,7 +18509,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.focused = session;
     this.touch(session);
     this.markRead(session); // opening it clears any unread (green/red) badge
-    const wv = this.webviewFor(session);
+    this.refreshWorkflowCompletions(session);
+    const wv = this.view?.webview;
     // Both surfaces need it, and the desk has the same gap the browser does —
     // re-focusing a live conversation never said which agent it belongs to.
     const identity = this.sessionIdentityFrame(session);
@@ -18522,9 +18615,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const provider = cur.provider;
     // Retain the pipe for session/delete. disposeSession still owns all pool
     // and remote bookkeeping; its second detach finds no client to terminate.
-    const client = isAdapterProvider(provider) ? this.detachClient(cur) : undefined;
+    const client = usesAdapterHistory(provider) ? this.detachClient(cur) : undefined;
     this.disposeSession(cur);
-    if (isAdapterProvider(provider)) {
+    if (usesAdapterHistory(provider)) {
       void this.discardAdapterEmptySession(provider, id, cwd, client).finally(() => client?.dispose()).then((removed) => {
         if (removed) this.postSessionRemoved(id, cwd);
       }).catch((error) => {
@@ -18560,9 +18653,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = current.activeSessionId;
     const cwd = this.sessionCwd(current);
     const provider = current.provider;
-    const client = isAdapterProvider(provider) ? this.detachClient(current) : undefined;
+    const client = usesAdapterHistory(provider) ? this.detachClient(current) : undefined;
     this.disposeSession(current);
-    if (isAdapterProvider(provider)) {
+    if (usesAdapterHistory(provider)) {
       void this.discardAdapterEmptySession(provider, id, cwd, client).finally(() => client?.dispose()).then((removed) => {
         if (removed) this.postSessionRemoved(id, cwd);
       }).catch((error) => {
@@ -19114,9 +19207,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = session.activeSessionId;
     if (!id) return;
     const message: HostMsg = { type: "sessionDot", id, dot: this.dotForId(id) };
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
@@ -19165,7 +19256,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     cwd: string,
     liveClient?: AcpClient,
   ): Promise<boolean> {
-    if (!id || !isAdapterProvider(provider)) return false;
+    if (!id || !supportsSessionDeletion(provider)) return false;
     let temporary: AcpClient | undefined;
     try {
       let client = liveClient;
@@ -19225,7 +19316,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const cur = overrides[id] ?? {};
     const occupancy = this.adapterTurnOccupancy(session, meta);
-    const compacted = isAdapterProvider(session.provider) && session.adapterCompactThisTurn;
+    const compacted = usesPerCallContextOccupancy(session.provider) && session.adapterCompactThisTurn;
     const usageLog = capUsageLog([
       ...(cur.usageLog ?? []),
       {
@@ -19281,7 +19372,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private noteAdapterCompactSignal(session: Session, update: unknown): void {
-    if (session.replaying || !isAdapterProvider(session.provider)) return;
+    if (session.replaying || !usesPerCallContextOccupancy(session.provider)) return;
     const signal = adapterCompactSignal(update);
     if (!signal) return;
     if (signal === "failed") {
@@ -19313,7 +19404,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session: Session,
     event: Parameters<typeof persistSessionContext>[1],
   ): { used?: number; window?: number } | undefined {
-    if (!isAdapterProvider(session.provider)) return undefined;
+    if (!usesAdapterHistory(session.provider)) return undefined;
     const id = session.activeSessionId;
     if (!id) return undefined;
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
@@ -19338,7 +19429,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private emitContextUsage(session: Session): void {
     const id = session.activeSessionId;
     if (!id) return;
-    if (isAdapterProvider(session.provider)) {
+    if (usesAdapterHistory(session.provider)) {
       const usage = persistedContextUsage(this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]);
       if (usage) {
         this.emit(session, {
@@ -19594,7 +19685,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // After the sweep, not before: the sweep can retire the empty session this
     // one replaced, and a list built ahead of it would show a row that is gone.
     this.postSessionsList();
-    this.revealChat();
   }
 
   private focusRemoteSession(clientId: string, session: Session, notifyCatalog = true): void {
@@ -19607,6 +19697,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // than being relabelled after the fact. See sessionIdentityFrame.
     const identity = this.sessionIdentityFrame(session);
     if (identity) this.sendRemoteClient(clientId, identity);
+    this.refreshWorkflowCompletions(session);
     for (const msg of bracketRemoteSnapshot(session.buffer)) this.sendRemoteClient(clientId, msg);
     for (const msg of sessionUiSnapshot(session, this.displayMode(session))) this.sendRemoteClient(clientId, msg);
     if (notifyCatalog) this.postRepoCatalog();
@@ -19804,7 +19895,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       sameCwd: pathsEqual,
     });
     const provider = overrides[id]?.provider ?? "grok";
-    const actualCwd = provider && isAdapterProvider(provider)
+    const actualCwd = provider && usesAdapterHistory(provider)
       ? resumeCandidates.find((candidate) => allowedCwds.some((allowed) => pathsEqual(candidate, allowed)))
       : findSessionCatalogCwd({
           fs: defaultFs,
@@ -20073,7 +20164,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // a conversation is not a request to change which project you are in.
     // Desktop's own selectRepo does the whole switch; this is the half VS Code
     // needs because it has no folder to switch.
-    this.revealChat();
     if (this.host.canSwitchWorkspaceFolder) return;
     const openedIn = this.resolveLocalRepoTarget(this.sessionCwd(this.focused));
     if (openedIn && !pathsEqual(openedIn.cwd, this.selectedRepoCwd || "")) {
@@ -20224,7 +20314,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       cachedCwd: o?.providerCwd ?? this.sessionCache.get(id)?.entry.cwd,
       sameCwd: pathsEqual,
     });
-    const cwd = isAdapterProvider(this.focused.provider)
+    const cwd = usesAdapterHistory(this.focused.provider)
       ? candidates.find((candidate) => trustedCwds.some((trusted) => pathsEqual(candidate, trusted)))
       : findSessionCatalogCwd({
           fs: defaultFs,
@@ -21115,6 +21205,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Conversation buffer only when the bound session still lives under an
     // authorized cwd (revoke disposes doomed sessions; this is the belt).
     if (session && sessionCwdOk && !session.replaying) {
+      this.refreshWorkflowCompletions(session);
       snap.push(...bracketRemoteSnapshot(session.buffer));
     }
     if (session && sessionCwdOk) {
@@ -21238,12 +21329,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (category) {
         void this.settingsEditor.webview.postMessage({ type: "settingsCategory", category });
       }
-      void this.refreshCommunityLagOnSettings();
       return;
     }
     const panel = this.host.openEditorWebview({
       viewType: "grok.settings",
-      title: "Grok30m Settings",
+      title: "Grok Settings",
       localResourceRoots: [
         Uri.joinPath(this.context.extensionUri, "media"),
         Uri.joinPath(this.context.extensionUri, "resources"),
@@ -21266,21 +21356,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const text = (e as Error)?.message ?? String(e);
         this.host.appendLine(`[settings] ${msg.type} failed: ${text}`);
       });
-    });
-    void this.refreshCommunityLagOnSettings();
-  }
-
-  private async refreshCommunityLagOnSettings(): Promise<void> {
-    const panel = this.settingsEditor;
-    if (!panel) return;
-    const lag = await peekCommunityLag(this.context.extensionVersion);
-    if (this.settingsEditor !== panel) return;
-    void panel.webview.postMessage({
-      type: "communityLagStatus",
-      base: lag.base,
-      latest: lag.latest || "",
-      behind: lag.behind,
-      error: lag.error || "",
     });
   }
 
@@ -21333,11 +21408,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         providersChecking: this.providerRefreshInFlight,
         githubState: this.githubStatePayload(),
         extVersion: this.context.extensionVersion,
-        communityBase: COMMUNITY_BASE_VERSION,
-        communityLatest: "",
-        communityBehind: false,
-        communityError: "",
-        communityReleasesUrl: COMMUNITY_RELEASES_PAGE,
         cliVersion: this.providerCliVersions.grok || "",
         hostKind: "extension" as const,
         hostName: deviceDisplayName(os.hostname(), process.platform, os.release()),
@@ -21383,7 +21453,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   html, body { background: var(--vscode-editor-background, var(--vscode-sideBar-background)); }
 </style>
 <link rel="stylesheet" href="${mediaUri("settings.css")}" />
-<title>Grok30m Settings</title>
+<title>Grok Settings</title>
 </head>
 <body class="settings-page">
   <div id="settings-root"></div>
@@ -21419,14 +21489,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           } };
           if (msg.current) next.cliVersion = msg.current;
           surface.update(next);
-        }
-        if (msg.type === "communityLagStatus") {
-          surface.update({
-            communityBase: msg.base || "",
-            communityLatest: msg.latest || "",
-            communityBehind: !!msg.behind,
-            communityError: msg.error || "",
-          });
         }
         if (msg.type === "providerState" && Array.isArray(msg.providers)) {
           surface.update({ providers: msg.providers, providersChecking: msg.checking === true });
@@ -21491,9 +21553,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? `
   <aside id="projects-rail" class="projects-rail" aria-label="Projects">
     <div class="rail-top">
-      <span class="rail-brand" title="Grok30m">
+      <span class="rail-brand" title="Grok Build Desktop">
         <span class="mark" style="--rail-mark:url('${railMark}')" aria-hidden="true"></span>
-        <span class="wordmark"><b>Grok</b><span class="dim">30m</span></span>
+        <span class="wordmark"><b>Grok</b> <span class="dim">Build</span></span>
       </span>
       <button id="desk-rail-toggle" class="rail-icon-btn" type="button" title="Hide projects" aria-label="Hide projects" aria-expanded="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>
@@ -21587,7 +21649,7 @@ ${openMain}
     </div>
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>
     <button id="remote-btn" class="icon-btn remote-btn" title="Continue remotely" hidden></button>
-    ${this.useSessionsSidebar() ? "" : `<button id="history-btn" class="icon-btn" title="Session history"></button>`}
+    <button id="history-btn" class="icon-btn" title="Session history"></button>
     <button id="new-btn" class="icon-btn" title="New session"></button>
     ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}
     ${this.host.canSwitchWorkspaceFolder ? "" : `<div id="vscode-session-actions"></div>`}
@@ -21598,8 +21660,8 @@ ${fileShellOpen}
   <main id="messages" class="messages">
     <div class="welcome" id="welcome">
       <span class="welcome-mark" role="img" aria-label="Grok" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
-      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok30m"}</h2>
-      <p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>
+      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok Build (Community)"}</h2>
+      <p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>
       <p id="welcome-version" class="muted welcome-status-busy"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Starting</span></p>
       <div id="welcome-onboarding"></div>
     </div>

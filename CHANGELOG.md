@@ -1,5 +1,31 @@
 # Changelog
 
+## 4.11.0 — 2026-09-23
+
+**A fourth agent to talk to, and a workflow that knows when it is finished.** Muse Code joins Grok, Codex and Claude Code. A running workflow stays within reach; a finished one leaves a report where it happened, including when nobody was watching it finish.
+
+### Added
+
+- **Muse Code is a fourth provider.** Connect Meta's coding agent in **Settings → Providers**, then pick its model and reasoning effort, follow streaming replies, approve tools and resume conversations from history. Sign-in works from the editor, a browser or your phone: the computer running Muse starts its own login, and your screen shows Meta's link and short code. macOS and Linux install it with Meta's own script; on Windows that script does not run, so the CLI has to be put on PATH by hand — the extension no longer treats Windows as impossible, and starts Muse normally once it is there. About shows the installed CLI version once it has been read. Approval choices belong to Muse. Mode switching, steering, compaction, history deletion and the connectors managed here are not offered for it.
+
+  Some of the models Muse offers are marked as contributing your data, including one of its own defaults. Meta's description is passed to the picker exactly as Meta writes it — “Your content, including inter-session messages, may be used for product improvement.” Worth reading before you pick one.
+
+### Changed
+
+- **A workflow stays in reach while it runs, and gets out of the way when it finishes (#163).** The live card pins above the composer, collapsed by default: its name, reported phase dots, current phase, elapsed time and when an update last arrived. Pause, Resume and Stop stay reachable. Open it for the phase strip and one row per agent; while it is closed, agents that have failed or are waiting on a permission prompt are COUNTED by state — “1 agent failed” — which is the smallest thing that distinguishes a stuck run from a quiet one without putting the roster back on the card. An arriving update is not proof that an agent is making progress, so the card keeps those two facts separate.
+
+  When the run ends, the pin goes and its transcript marker becomes a **collapsed report**. The header shows the outcome, reported duration and phase dots without asking you to open it. Open it for the result and agent detail. A finish missed while nobody was watching is recovered from the saved workflow state; reopening an older conversation puts the report where the run happened, without reviving the pin or appending a second copy at the bottom.
+
+- **The conversation list no longer starts a process for every project.** Codex, Claude and Muse each reuse one history connection across repositories. Opening several projects no longer multiplies the same background work, and the shared process starts outside the project folders so closing one releases it on Windows.
+
+- **Counts read as counts.** Large counts use separators in the workflow card, file panel, settings routines and turn summary.
+
+### Fixed
+
+- **A Windows install path with spaces can start an agent again.** A command shim installed under a name such as `C:\Users\Jane Smith\…` was split at the space before the CLI could start. Signing in now preserves that path across all four providers, and Muse’s Windows launcher can start the agent from it too.
+
+- **Clear all history says what it can clear.** The confirmation names the providers it can actually clear and says open conversations are kept; Muse is reported separately afterwards, as history that was not cleared. Muse rows no longer offer a Delete that cannot work.
+
 ## 4.10.0 — 2026-09-21
 
 **This release is mostly about things the app was doing without being asked.** Closing the desktop window killed the agent you had left running. Opening Settings opened a real session with every agent you had connected, to learn something the page already knew. And in two places the app had the information you wanted and showed you something else — a document in a code fence you had to scroll sideways to read, and a context meter that threw away the number first.

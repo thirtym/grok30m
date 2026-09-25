@@ -1,5 +1,18 @@
 (function () {
-  const vscode = acquireVsCodeApi();
+  const hostApi = acquireVsCodeApi();
+  let museAdvertised = false;
+  let museAvailable = false;
+  function namesMuse(value) {
+    if (!value || typeof value !== "object") return false;
+    return Object.entries(value).some(([key, child]) =>
+      key === "provider" && child === "muse" || child && typeof child === "object" && namesMuse(child));
+  }
+  const vscode = { getState: () => hostApi.getState(), setState: value => hostApi.setState(value),
+    postMessage: message => {
+      if (namesMuse(message) && !museAvailable) return false;
+      return hostApi.postMessage(message);
+    } };
+  function offeredProviders() { return Object.keys(globalThis.GrokWebviewHelpers.PROVIDER_ACTIONS).filter(id => id !== "muse" || museAvailable); }
   const hostWait = window.GrokHostWait.get();
   const pendingPreferences = new Map();
   let sendWait = null;
@@ -502,6 +515,7 @@
     grok: "Ask Grok\u2026",
     codex: "Ask GPT\u2026",
     claude: "Ask Claude\u2026",
+    muse: "Ask Muse…",
   };
   // What each level MEANS. The name is prepended from `effortLabel` rather than
   // spelled here, so one level cannot be called two things in one popover — the
@@ -1332,6 +1346,10 @@
     return (value < 0 ? "-" : "") + text + suffix;
   }
 
+  function formatCount(value) {
+    return value.toLocaleString("en-US");
+  }
+
   function truncate(s, max) {
     return s.length > max ? s.slice(0, max) + "…" : s;
   }
@@ -1363,6 +1381,7 @@
   }
 
   function updateModeBtn(modeId) {
+    modeBtn.hidden = state.activeProvider === "muse";
     const meta = MODE_META[modeId] || MODE_META.agent;
     modeBtn.innerHTML = `${meta.icon}<span class="btn-label">${escapeHtml(meta.label)}</span>`;
     modeBtn.classList.toggle("plan-active", modeId === "plan");
@@ -1931,6 +1950,7 @@
         })
         .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
         .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+        .replace(/(^|[^\p{L}\p{N}_])_([^_\n]+)_(?=$|[^\p{L}\p{N}_])/gu, "$1<em>$2</em>")
         .replace(/\x00C(\d+)\x00/g, (_, i) => held[+i]);
     }
 
@@ -2282,7 +2302,7 @@
         closePopovers();
       };
     }
-    contextPopover.appendChild(act);
+    if (globalThis.GrokWebviewHelpers.providerSupports(state.activeProvider, "compact")) contextPopover.appendChild(act);
 
     const subscription = document.createElement("section");
     subscription.className = "subscription-usage";
@@ -3967,10 +3987,10 @@
     // A signed-out agent has no knowable model list, and the placeholder shown
     // in its place ("Codex default") reads as something you can select — so its
     // rows are replaced by the one action that can actually help.
-    const signInProviders = ["grok", "codex", "claude"].filter(providerNeedsLogin);
-    models = models.filter((model) => !signInProviders.includes(model.provider || state.activeProvider));
+    const signInProviders = offeredProviders().filter(providerNeedsLogin);
+    models = models.filter((model) => ((model.provider || state.activeProvider) !== "muse" || museAvailable) && !signInProviders.includes(model.provider || state.activeProvider));
     if (grouped) {
-      models = ["grok", "codex", "claude"].flatMap((provider) => models.filter((model) =>
+      models = offeredProviders().flatMap((provider) => models.filter((model) =>
         (model.provider || state.activeProvider) === provider));
     }
     let group = "";
@@ -4004,7 +4024,13 @@
           `<span class="model-picker-name">${escapeHtml(truncate(label, 28))}</span>` +
         `</span>` +
         (active ? '<span class="popover-check">✓</span>' : "");
-      el.title = m.modelId;
+      el.title = m.description || m.modelId;
+      if (modelProvider === "muse" && m.description && m.modelId) {
+        const description = document.createElement("span");
+        description.className = "model-picker-description";
+        description.textContent = m.description;
+        el.appendChild(description);
+      }
       el.disabled = modelSelectionLocked();
       el.setAttribute("role", "radio");
       el.setAttribute("aria-checked", String(active));
@@ -4041,7 +4067,7 @@
       }
     };
     if (grouped) {
-      for (const provider of ["grok", "codex", "claude"]) {
+      for (const provider of offeredProviders()) {
         for (const m of models) {
           if ((m.provider || state.activeProvider) === provider) renderModelRow(m);
         }
@@ -4636,6 +4662,8 @@
   }
 
   function renderEffortStrip() {
+    const model = currentModel();
+    if (model?.supportsReasoningEffort === false && !model.reasoningEfforts?.length) return;
     const box = document.createElement("div");
     box.className = "model-effort-strip";
     const levels = currentModel() ? effortLevelsForModel() : [];
@@ -4758,6 +4786,7 @@
   }
 
   function openModePopover() {
+    if (state.activeProvider === "muse") return;
     if (!modePopover.hidden) { closePopovers(); return; }
     closePopovers();
     modePopover.innerHTML = "";
@@ -4859,6 +4888,12 @@
     codex: "M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z",
     // Four-point sparkle — distinct from the Grok/Codex marks, currentColor.
     claude: "M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z",
+    // Meta's mark, from the same Lobe set as the three above -- Muse Code is
+    // Meta's agent, and a bare letter beside three real marks read as a
+    // placeholder because it was one. Its two loops are drawn with holes, so
+    // this is the mark that actually needs the evenodd rule; Lobe ships all
+    // four with it and the other three render the same either way.
+    muse: "M6.897 4c1.915 0 3.516.932 5.43 3.376l.282-.373c.19-.246.383-.484.58-.71l.313-.35C14.588 4.788 15.792 4 17.225 4c1.273 0 2.469.557 3.491 1.516l.218.213c1.73 1.765 2.917 4.71 3.053 8.026l.011.392.002.25c0 1.501-.28 2.759-.818 3.7l-.14.23-.108.153c-.301.42-.664.758-1.086 1.009l-.265.142-.087.04a3.493 3.493 0 01-.302.118 4.117 4.117 0 01-1.33.208c-.524 0-.996-.067-1.438-.215-.614-.204-1.163-.56-1.726-1.116l-.227-.235c-.753-.812-1.534-1.976-2.493-3.586l-1.43-2.41-.544-.895-1.766 3.13-.343.592C7.597 19.156 6.227 20 4.356 20c-1.21 0-2.205-.42-2.936-1.182l-.168-.184c-.484-.573-.837-1.311-1.043-2.189l-.067-.32a8.69 8.69 0 01-.136-1.288L0 14.468c.002-.745.06-1.49.174-2.23l.1-.573c.298-1.53.828-2.958 1.536-4.157l.209-.34c1.177-1.83 2.789-3.053 4.615-3.16L6.897 4zm-.033 2.615l-.201.01c-.83.083-1.606.673-2.252 1.577l-.138.199-.01.018c-.67 1.017-1.185 2.378-1.456 3.845l-.004.022a12.591 12.591 0 00-.207 2.254l.002.188c.004.18.017.36.04.54l.043.291c.092.503.257.908.486 1.208l.117.137c.303.323.698.492 1.17.492 1.1 0 1.796-.676 3.696-3.641l2.175-3.4.454-.701-.139-.198C9.11 7.3 8.084 6.616 6.864 6.616zm10.196-.552l-.176.007c-.635.048-1.223.359-1.82.933l-.196.198c-.439.462-.887 1.064-1.367 1.807l.266.398c.18.274.362.56.55.858l.293.475 1.396 2.335.695 1.114c.583.926 1.03 1.6 1.408 2.082l.213.262c.282.326.529.54.777.673l.102.05c.227.1.457.138.718.138.176.002.35-.023.518-.073.338-.104.61-.32.813-.637l.095-.163.077-.162c.194-.459.29-1.06.29-1.785l-.006-.449c-.08-2.871-.938-5.372-2.2-6.798l-.176-.189c-.67-.683-1.444-1.074-2.27-1.074z",
   };
 
   /**
@@ -4881,7 +4916,7 @@
    * nobody is at the screen to read it. Same shape as steerableProvider().
    */
   function rewindCapableProvider() {
-    if (state.activeProvider === "claude" || state.activeProvider === "codex") return false;
+    if (state.activeProvider !== "grok") return false;
     // A host older than 4.1.0 classifies rewindSession / editLastMessage as
     // host-local and drops them without a reply, so the buttons would be dead
     // for every remote user who has not updated — and the relay always ships
@@ -4893,17 +4928,18 @@
   function providerDisplayName(provider) {
     if (provider === "codex") return "Codex";
     if (provider === "claude") return "Claude";
+    if (provider === "muse") return "Muse Code";
     return "Grok";
   }
 
   function providerLogoId(provider) {
-    if (provider === "codex" || provider === "claude") return provider;
+    if (provider === "codex" || provider === "claude" || provider === "muse") return provider;
     return "grok";
   }
 
   function providerLogoMarkup(provider) {
     const id = providerLogoId(provider);
-    return `<svg class="provider-logo" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="${PROVIDER_LOGO_PATHS[id]}"></path></svg>`;
+    return `<svg class="provider-logo" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><path d="${PROVIDER_LOGO_PATHS[id]}"></path></svg>`;
   }
 
   function makeProviderGlyph(provider, dotValue, sessionId) {
@@ -5360,7 +5396,7 @@
     const clearBtn = document.createElement("button");
     clearBtn.className = "history-clear-all";
     clearBtn.innerHTML = ICON.trash + "<span>Clear all history</span>";
-    clearBtn.title = "Delete all sessions in this repository's history";
+    clearBtn.title = "Delete supported providers' conversations in this repository";
     clearBtn.onclick = (e) => {
       e.stopPropagation();
       closePopovers();
@@ -5369,7 +5405,7 @@
       const repoPath = repo?.cwd || state.selectedRepoCwd;
       uiConfirm({
         title: `Clear history for “${repoLabel}”?`,
-        body: `Deletes every session for:\n${repoPath}\n\nThe current session is kept. This cannot be undone.`,
+        body: globalThis.GrokWebviewHelpers.clearHistoryConfirmation(repoPath),
         confirmLabel: "Delete All",
         danger: true,
       }).then((ok) => {
@@ -5549,7 +5585,7 @@
       // make the delete "not stick" — and then starts a fresh conversation in
       // the same project. Against a host that cannot, the button stays away
       // rather than posting a message that comes back refused.
-      if (!active || canDeleteActiveSession()) {
+      if (globalThis.GrokWebviewHelpers.providerSupports(s.provider, "deleteHistory") && (!active || canDeleteActiveSession())) {
       const delBtn = document.createElement("button");
       delBtn.className = "history-action-btn history-action-danger";
       delBtn.innerHTML = ICON.trash;
@@ -7201,7 +7237,7 @@
     let html = "";
     if (opts.icon) html += `<span class="rail-head-icon">${opts.icon}</span>`;
     html += `<span class="rail-head-title"></span>`;
-    html += `<span class="rail-head-twisty">${opts.open ? ICON.chevronDown : ICON.chevronRight}</span>`;
+    html += `<span class="rail-head-twisty" aria-hidden="true">${opts.open ? ICON.chevronDown : ICON.chevronRight}</span>`;
     btn.innerHTML = html;
     btn.querySelector(".rail-head-title").textContent = opts.title;
     btn.disabled = !!opts.forcedOpenBySearch;
@@ -8312,12 +8348,12 @@
           ? "Update Grok Build on your computer to clear another project's history from here"
           : knownEmpty
             ? "This project has no history"
-            : "Delete all sessions in this repository's history",
+            : "Delete supported providers' conversations in this repository",
         onSelect: () => {
           const repoLabel = repo.label || cwdLeaf(repo.cwd);
           uiConfirm({
             title: `Clear history for “${repoLabel}”?`,
-            body: `Deletes every session for:\n${repo.cwd}\n\nThe current session is kept. This cannot be undone.`,
+            body: globalThis.GrokWebviewHelpers.clearHistoryConfirmation(repo.cwd),
             confirmLabel: "Delete All",
             danger: true,
           }).then((ok) => {
@@ -8657,7 +8693,7 @@
     // stays visibly disabled and says why — the menu keeps its shape, and the
     // reason is the truth rather than "the open session can't be deleted".
     const activeUndeletable = !!active && !canDeleteActiveSession();
-    items.push(null, {
+    if (globalThis.GrokWebviewHelpers.providerSupports(s.provider, "deleteHistory")) items.push(null, {
       label: "Delete",
       icon: ICON.trash,
       danger: true,
@@ -8961,7 +8997,7 @@
     const host = state.welcomeTips || {};
     const providers = state.providers || [];
     const altConnected = providers.some(
-      (p) => p && (p.id === "codex" || p.id === "claude") && p.connected,
+      (p) => p && (p.id === "codex" || p.id === "claude" || p.id === "muse" && museAdvertised) && p.connected,
     );
     return {
       appPurpose: state.appPurpose === "coding" ? "coding" : "knowledge",
@@ -9874,6 +9910,7 @@
     state.mediaGenCallIds.clear();
     state.subagentCards.clear();
     state.runProgressCards.clear();
+    clearWorkflowPin();
     // Question/restored-card maps too, or a new session's tool updates could
     // attach to the previous session's (now-detached) cards by toolCallId.
     state.questionToolCalls.clear();
@@ -10062,11 +10099,11 @@
   function remoteConnectPanel(mode, info, ver) {
     const device = info.device;
     const provider = info.provider
-      || (mode === "codex-login" ? "codex" : mode === "claude-login" ? "claude" : mode === "auth-required" ? "grok" : "");
+      || (mode === "codex-login" ? "codex" : mode === "claude-login" ? "claude" : mode === "muse-login" ? "muse" : mode === "auth-required" ? "grok" : "");
     // The products' own names, everywhere this panel speaks. Not "Grok": that
     // is the model, the extension is Grok Build, and a heading that disagrees
     // with the button beneath it reads as two different things to connect.
-    const NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code" };
+    const NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code", muse: "Muse Code" };
     const name = NAMES[provider] || "an agent";
     const status = (text) => { if (ver) setWelcomeStatus(text, false); };
 
@@ -10223,7 +10260,7 @@
     // frame's provider is the specific thing being asked for again.
     const nothingConnected = !((state.providers || []).some((p) => p && p.connected));
     const cloudFresh = !!(state.hostCaps && state.hostCaps.remoteAgentSignOut) && nothingConnected;
-    const offer = provider && !cloudFresh ? [provider] : ["grok", "codex", "claude"];
+    const offer = (provider && !cloudFresh ? [provider] : offeredProviders()).filter(id => id !== "muse" || museAvailable);
     // A cloud machine's three agents are not equal offers: Grok is the native
     // one. Ranking is the cloud-only part; every agent that has a headless
     // flow is offered, including Claude Code's paste-code sign-in.
@@ -10396,6 +10433,7 @@
     "connect-agent": true,
     "codex-login": true,
     "claude-login": true,
+    "muse-login": true,
     "auth-required": true,
   };
 
@@ -10423,6 +10461,7 @@
 
   function showOnboarding(mode, info, beforeRender) {
     info = info || {};
+    if ((info.provider === "muse" || mode === "muse-login" || mode === "missing-muse") && !museAdvertised) return;
     state.onboardingMode = mode;
     state.onboardingInfo = info;
     if (beforeRender) beforeRender();
@@ -10439,7 +10478,7 @@
     const onb = $("welcome-onboarding");
     const ver = $("welcome-version");
     if (!onb) return;
-    if (IS_REMOTE && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required")) {
+    if (IS_REMOTE && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required" || mode === "muse-login" && museAvailable)) {
       // The card is an ENTRY POINT, not a second renderer: a live flow belongs
       // to the wizard, so the card keeps showing the offer underneath it.
       // The card NEVER renders a live flow. Stripping it only while the wizard
@@ -10459,6 +10498,17 @@
         ? Object.assign({}, info, { device: undefined })
         : info;
       onb.innerHTML = remoteConnectPanel(mode, forCard, ver);
+      return;
+    }
+    if ((mode === "muse-login" || mode === "missing-muse") && museAdvertised) {
+      const provider = (state.providers || []).find(p => p.id === "muse");
+      const reason = provider && provider.unavailableReason;
+      onb.innerHTML = `<div class="onb"><p class="onb-heading">Muse Code</p>`
+        + `<p class="onb-desc">${escapeHtml(reason || (mode === "missing-muse"
+          ? "Install Meta's Muse Code CLI on the execution host, then re-check."
+          : "Run muse login on the execution host, then re-check."))}</p>`
+        + (reason ? "" : `${!IS_REMOTE && mode !== "missing-muse" ? '<button class="onb-action" data-act="connectProvider" data-provider="muse">Open Muse sign-in</button>' : ''}<button class="onb-action" data-act="recheckProvider" data-provider="muse">Re-check</button>`)
+        + `</div>`;
       return;
     }
     if (mode === "no-project") {
@@ -10493,7 +10543,7 @@
       const id = info.provider || "grok";
       const done = id === "codex"
         ? "You can start working with OpenAI!"
-        : id === "claude" ? "You can start clauding!" : "You can start grokking!";
+        : id === "claude" ? "You can start clauding!" : id === "muse" ? "Muse Code is connected." : "You can start grokking!";
       if (ver) setWelcomeStatus("Connected", false);
       onb.innerHTML =
         `<div class="onb onb-connected">` +
@@ -10525,6 +10575,9 @@
             `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="claude">` +
               `<span class="onb-agent-mark">${providerLogoMarkup("claude")}</span><span><strong>Claude Code</strong><small>Claude Code CLI</small></span>` +
             `</button>` +
+            (museAvailable ? `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="muse">` +
+              `<span class="onb-agent-mark">${providerLogoMarkup("muse")}</span><span><strong>Muse Code</strong><small>Meta Muse CLI</small></span>` +
+            `</button>` : "") +
           `</div>` +
         `</div>`;
     } else if (mode === "missing-cli") {
@@ -11293,7 +11346,7 @@
   }
 
   function feedbackOffered() {
-    return state.feedbackAvailable === true && state.activeProvider !== "codex" && state.activeProvider !== "claude";
+    return state.feedbackAvailable === true && state.activeProvider === "grok";
   }
 
   function stripTurnThumbs(actions) {
@@ -11583,12 +11636,12 @@
     }
     n.edit = editFiles.size;
     const parts = [];
-    if (n.explore) parts.push(`explored ${n.explore} item${n.explore === 1 ? "" : "s"}`);
-    if (n.edit) parts.push(`edited ${n.edit} file${n.edit === 1 ? "" : "s"}`);
-    if (n.delete) parts.push(`deleted ${n.delete} file${n.delete === 1 ? "" : "s"}`);
-    if (n.generate) parts.push(`generated ${n.generate} item${n.generate === 1 ? "" : "s"}`);
+    if (n.explore) parts.push(`explored ${formatCount(n.explore)} item${n.explore === 1 ? "" : "s"}`);
+    if (n.edit) parts.push(`edited ${formatCount(n.edit)} file${n.edit === 1 ? "" : "s"}`);
+    if (n.delete) parts.push(`deleted ${formatCount(n.delete)} file${n.delete === 1 ? "" : "s"}`);
+    if (n.generate) parts.push(`generated ${formatCount(n.generate)} item${n.generate === 1 ? "" : "s"}`);
     if (n.web) parts.push("searched web");
-    if (n.command) parts.push(`ran ${n.command} command${n.command === 1 ? "" : "s"}`);
+    if (n.command) parts.push(`ran ${formatCount(n.command)} command${n.command === 1 ? "" : "s"}`);
     return parts.length ? parts.join(", ").replace(/^./, (c) => c.toUpperCase()) : "Tool calls";
   }
 
@@ -11775,6 +11828,7 @@
     search: `<svg class="tool-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v3.5"/><circle cx="16.5" cy="16.5" r="2.5"/><path d="M21 21l-1.6-1.6"/></svg>`,
     pencil: `<svg class="tool-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.17 6.81a1 1 0 0 0-3.98-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z"/><path d="M15 5l4 4"/></svg>`,
     terminal: `<svg class="tool-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m7 11 2-2-2-2"/><path d="M11 13h4"/></svg>`,
+    workflow: `<svg class="tool-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg>`,
   };
   function toolIconRank(call) {
     const k = toolKind(call);
@@ -11850,6 +11904,7 @@
     clearWelcome();
     hideGrokking(); // a tool card is the first content of this turn
     hideThinkingIndicator(); // a running tool now conveys the activity
+    if (addWorkflowToolMarker(call)) return;
     // Deletes never carry a type:"diff" block — catch kind:delete + shell
     // Remove-Item/rm here (and on restore's completed tool_call).
     maybeRecordTurnDelete(call);
@@ -12096,7 +12151,7 @@
     let viewAll = null;
     let expanded = false;
     let previewLabel = logicalPreview.truncated
-      ? `View all (${logicalPreview.lineCount} lines) →`
+      ? `View all (${formatCount(logicalPreview.lineCount)} lines) →`
       : "View all →";
     const ensureViewAll = () => {
       if (viewAll) {
@@ -12154,7 +12209,7 @@
       if (!expanded) pre.classList.add("command-preview-capped");
       const renderedTruncated = hasLayout && pre.scrollHeight > pre.clientHeight;
       const truncated = logicalTruncated || renderedTruncated;
-      previewLabel = truncated ? `View all (${logicalPreview.lineCount} lines) →` : "View all →";
+      previewLabel = truncated ? `View all (${formatCount(logicalPreview.lineCount)} lines) →` : "View all →";
       if (!expanded) {
         if (hasLayout && !truncated) pre.classList.remove("command-preview-capped");
         pre.classList.remove("command-full");
@@ -12284,6 +12339,7 @@
       merged.detailInput = update.detailInput;
     }
     item._call = merged;
+    if (item.classList.contains("workflow-tool-marker")) syncWorkflowToolMarkers();
     // Flatten / summarize read `_calls`, not `item._call`. Grok's first
     // use_tool row is titled "use_tool" until this update; leave the
     // group's copy stale and the flat label stays the wrapper name.
@@ -12701,10 +12757,10 @@
     sub.className = "tool-item-subtitle diff-stat";
     const a = document.createElement("span");
     a.className = "diff-stat-add";
-    a.textContent = `+${added}`;
+    a.textContent = `+${formatCount(added)}`;
     const d = document.createElement("span");
     d.className = "diff-stat-del";
-    d.textContent = `−${removed}`;
+    d.textContent = `−${formatCount(removed)}`;
     sub.appendChild(a);
     sub.appendChild(document.createTextNode(" "));
     sub.appendChild(d);
@@ -13672,13 +13728,571 @@
   }
 
   // ---------- Workflow / Goal / Deep-research progress cards (P2-10) ----------
-  // Host normalizes `_x.ai/session_notification` workflow_updated / goal_updated
-  // into a stable shape; we upsert one card per id and stop the dots on done.
+  // Host normalizes workflow_updated / goal_updated. Workflow clocks and
+  // activity claims below use reported data; goals retain their completion UI.
+
+  let workflowPin = null;
+  let workflowAgeTimer = null;
+
+  function addWorkflowToolMarker(call) {
+    if (!/^Workflow: [\w.:-]+$/.test(call?.title || "")) return false;
+    closeToolGroup();
+    flushAgent();
+    state.activeAgentEl = null;
+    state.activeAgentRaw = "";
+    const item = document.createElement("div");
+    item.className = "tool-flat workflow-tool-marker";
+    item.innerHTML = toolIconFor([call]);
+    applyToolLabel(workflowText(item, "tool-item-label", "", "span"), call);
+    item._call = call;
+    if (call.toolCallId) state.toolItemsByToolCallId.set(call.toolCallId, item);
+    appendTranscriptChild(item);
+    syncWorkflowToolMarkers();
+    return true;
+  }
+
+  function syncWorkflowToolMarkers() {
+    const records = [...state.runProgressCards.values()].map((el) => el._workflow).filter(Boolean);
+    for (const item of messagesEl.querySelectorAll(".workflow-tool-marker")) {
+      const call = item._call;
+      const name = /^Workflow: ([\w.:-]+)$/.exec(call.title || "")?.[1];
+      // The tool remains the fallback until a matching named run arrives.
+      item.hidden = !!name && !toolFailureText(call) && records.filter((r) => r.update.displayName === name).length === 1;
+    }
+  }
+
+  function clearWorkflowPin() {
+    if (workflowPin) workflowPin.remove();
+    workflowPin = null;
+    clearInterval(workflowAgeTimer);
+    workflowAgeTimer = null;
+  }
+
+  function workflowText(parent, className, text, tag = "div") {
+    const el = document.createElement(tag);
+    el.className = className;
+    el.textContent = text;
+    parent.appendChild(el);
+    return el;
+  }
+
+  function workflowPhaseLabel(update) {
+    const phases = Array.isArray(update.phases) ? update.phases : [];
+    const indexed = phases.map((p, i) => ({ p, i }));
+    const reference = update.currentPhaseId || update.currentPhase;
+    const byId = reference ? indexed.filter(({ p }) => p.id === reference) : [];
+    const useId = update.currentPhaseId || byId.length;
+    const matches = useId ? byId : indexed.filter(({ p }) => update.currentPhase && p.title === update.currentPhase);
+    const name = useId && matches.length === 1 ? matches[0].p.title : update.currentPhase;
+    return name || "";
+  }
+
+  // The roster printed the label and the phase side by side, and the label
+  // almost always already contained the phase: an agent labelled `pick` in
+  // phase `Pick` read "pick Pick", `read:readme` in `Read` read
+  // "read:readme Read". Compose ONE name -- the phase, then only what the
+  // label actually adds.
+  const AGENT_NAME_SEPARATORS = " :_-/";
+
+  function workflowAgentName(agent) {
+    const phase = String(agent.phase || "").trim();
+    const label = String(agent.label || "").trim();
+    if (!phase || !label) return label || phase;
+    // Compared and stripped with an explicit character list rather than a
+    // regex class: an earlier spelling lost its backslash and silently ate
+    // the letter s, turning `report-synthesizer` into `Report / ynthesizer`.
+    const sep = (c) => AGENT_NAME_SEPARATORS.includes(c);
+    const bare = (s) => s.toLowerCase().split("").filter((c) => !sep(c)).join("");
+    if (bare(label) === bare(phase)) return phase;
+    if (label.toLowerCase().startsWith(phase.toLowerCase())) {
+      const tail = label.slice(phase.length);
+      let i = 0;
+      while (i < tail.length && sep(tail[i])) i++;
+      const rest = tail.slice(i);
+      if (!rest) return phase;
+      // `read:readme` adds "readme" after a separator, so the phase leads and
+      // the label contributes the rest. `researcher-0` has no separator: it
+      // already reads as its own phase and stands alone, because
+      // "Research / researcher-0" is the repetition again.
+      return i > 0 ? `${phase} / ${rest}` : label;
+    }
+    return `${phase} / ${label}`;
+  }
+
+  // The live lifecycle word, humanized. An empty phase means ordinarily
+  // running: the CLI only fills it once something has happened to the run.
+  function workflowLiveStatus(update) {
+    return /paus|interrupt|budget|block|permission/i.test(update.phase || "")
+      ? String(update.phase).replace(/[_-]+/g, " ").trim() || "running" : "running";
+  }
+
+  function workflowElapsed(ms) {
+    const seconds = Math.floor(Math.max(0, ms) / 1000);
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  }
+
+  function workflowAgentKey(agent, agents) {
+    if (agent.id) return agents.filter((a) => a.id === agent.id).length === 1 ? `id:${agent.id}` : null;
+    // A label is usable only when unique. Never carry evidence by array index.
+    return agents.filter((a) => a.label === agent.label).length === 1 ? `label:${agent.label}` : null;
+  }
+
+  function workflowAgentActivity(record, agent) {
+    const key = workflowAgentKey(agent, record.update.agents || []);
+    const event = key && record.activity.get(key);
+    // A snapshot can include a total before this view observes an increase.
+    const noTokens = Number.isFinite(agent.tokensUsed) && agent.tokensUsed > 0 ? "" : "no token activity observed";
+    if (!event) return noTokens;
+    const label = record.update.done ? event.kind : workflowAge(event.at, event.kind,
+      event.kind === "tokens moved" ? "no recent token movement (30s+)" : "no recent state change (30s+)");
+    return `${label}${!event.tokensObserved && noTokens ? ` · ${noTokens}` : ""}`;
+  }
+
+  // Receipt silence is not proof a run stopped. Keep the two clocks distinct,
+  // but replace unbounded seconds with a quiet, stable observation after 30s.
+  function workflowAge(at, label, quiet) {
+    const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
+    return seconds >= 30 ? quiet : `${label} ${formatCount(seconds)}s ago`;
+  }
+
+  function workflowBlockages(update) {
+    return (update.agents || []).filter((a) => /fail|error|permission|block|await.*approval|waiting.*approval/i.test(a.state || ""));
+  }
+
+  /**
+   * One line naming agents that are NOT simply running, for the collapsed card.
+   *
+   * The roster lives behind the disclosure on purpose — a quiet card was the
+   * point, and a healthy run has nothing to say. A stuck one does. An agent
+   * sitting on a permission prompt still arrives inside frames, so the receipt
+   * above goes on reading "updated 3s ago" while nothing moves, and collapsed
+   * that is indistinguishable from work in progress. This is the one exception
+   * to keeping the roster hidden, and it is the smallest one available: a count
+   * and the state's own word, never the roster itself.
+   */
+  function workflowBlockageSummary(agents) {
+    const groups = new Map();
+    for (const agent of agents) {
+      const label = String(agent.state || "blocked").replace(/[_-]+/g, " ").trim() || "blocked";
+      groups.set(label, (groups.get(label) || 0) + 1);
+    }
+    return [...groups].map(([label, n]) => `${formatCount(n)} ${n === 1 ? "agent" : "agents"} ${label}`).join(" · ");
+  }
+
+  function refreshWorkflowAges() {
+    for (const el of state.runProgressCards.values()) {
+      const record = el._workflow;
+      if (!record) continue;
+      for (const surface of [el, record.pin].filter((surface) => surface?.isConnected)) {
+        const receipt = surface.querySelector(".workflow-receipt");
+        // Three distinct facts, never one standing in for another: a frame
+        // arrived just now, a frame arrived before this view existed (replay),
+        // and this is a finished run being read back.
+        if (receipt) receipt.textContent = record.update.done
+          ? record.receivedAt != null ? "final workflow update" : "historical workflow update"
+          : record.receivedAt != null ? workflowAge(record.receivedAt, "updated", "no recent updates (30s+)")
+          : "no update since this view opened";
+        for (const row of surface.querySelectorAll(".workflow-agent")) {
+          const agent = record.update.agents[Number(row.dataset.agentIndex)];
+          row.querySelector(".workflow-agent-activity").textContent = workflowAgentActivity(record, agent);
+        }
+      }
+    }
+  }
+
+  function workflowOutputText(raw) {
+    if (typeof raw !== "string") return "";
+    const text = raw.trim();
+    // The CLI renders a null completion value as "done".
+    if (!text || text === "done") return "";
+    try {
+      const value = JSON.parse(text);
+      if (typeof value === "string") return workflowOutputText(value);
+      if (value && !Array.isArray(value) && typeof value === "object") {
+        // Known human-facing fields, not arbitrary strings such as status,
+        // paths or ids. Workflow completion values have no universal schema.
+        for (const field of ["report", "summary", "sentence"]) {
+          const content = workflowOutputText(value[field]);
+          if (content) return content;
+        }
+      }
+      return "";
+    } catch {
+      // summarize_result caps at 16KiB: a truncated JSON object must not
+      // fall back to a raw blob. Nor should a JSON code fence bypass this.
+      if (/^(?:\{|\[\s*(?:["{[\d-]|true\b|false\b|null\b|\]))/.test(text) || /^```(?:json)?\s*[\r\n]/i.test(text)) return "";
+      return text;
+    }
+  }
+
+  function renderWorkflowSurface(el, record) {
+    const u = record.update;
+    if (!el.firstChild) {
+      const headingTag = u.done ? "div" : "button";
+      el.innerHTML = `<div class="workflow-heading"><${headingTag} class="workflow-pin-toggle run-progress-row"><span class="run-progress-title"></span><span class="workflow-dots" hidden></span><span class="run-progress-phase"></span><span class="run-progress-elapsed" hidden></span><span class="workflow-chevron" aria-hidden="true"></span></${headingTag}></div>` +
+        `<div class="run-progress-sub" hidden></div><div class="workflow-progress"><ol class="workflow-phases" hidden></ol><div class="workflow-timing"></div><div class="workflow-receipt"></div><div class="workflow-blocked" hidden></div><div class="run-progress-detail" hidden></div><div class="workflow-spend" hidden></div></div><div class="workflow-expanded" hidden><ul class="workflow-roster" hidden></ul></div><div class="run-progress-actions"></div>`;
+      if (!u.done) el.querySelector(".workflow-pin-toggle").onclick = () => {
+        record.expanded = !record.expanded;
+        syncWorkflowPin();
+      };
+    }
+    const expanded = u.done || !!record.expanded;
+    el.classList.toggle("is-expanded", expanded);
+    const toggle = el.querySelector(".workflow-pin-toggle");
+    if (!u.done) {
+      toggle.type = "button";
+      toggle.setAttribute("aria-expanded", String(!!record.expanded));
+    }
+    el.querySelector(".workflow-expanded").hidden = !expanded;
+    el.querySelector(".workflow-chevron").innerHTML = record.expanded ? ICON.chevronDown : ICON.chevronRight;
+    const title = el.querySelector(".run-progress-title");
+    title.textContent = u.title && u.title !== u.id ? u.title : u.displayName || "Workflow";
+    title.title = title.textContent;
+    if (!u.done) toggle.setAttribute("aria-label", `${record.expanded ? "Collapse" : "Expand"} ${title.textContent}`);
+    const position = workflowPhaseLabel(u);
+    // Expanded, the heading carries the status and the strip carries the step.
+    // Collapsed, neither is on screen, so a run that has STOPPED must say so
+    // here or it is indistinguishable from one still working.
+    const live = workflowLiveStatus(u);
+    el.querySelector(".run-progress-phase").textContent = expanded ? ""
+      : live === "running" ? position
+      : position ? `${position} · ${live}` : live;
+    const elapsed = el.querySelector(".run-progress-elapsed");
+    const timing = el.querySelector(".workflow-timing");
+    if (expanded) timing.appendChild(elapsed);
+    else toggle.insertBefore(elapsed, el.querySelector(".workflow-chevron"));
+    timing.hidden = !expanded || !Number.isFinite(u.elapsedMs);
+    elapsed.hidden = !Number.isFinite(u.elapsedMs);
+    elapsed.textContent = elapsed.hidden ? "" : workflowElapsed(u.elapsedMs);
+    elapsed.title = "Reported workflow elapsed time; advances only when reported";
+
+    // Sits beside the receipt rather than inside the disclosure: "updated 3s
+    // ago" is true of a run whose agents are all stuck, so the two lines have
+    // to be readable together or the fresh one reassures on its own.
+    const blocked = workflowBlockages(u);
+    const blockedEl = el.querySelector(".workflow-blocked");
+    blockedEl.hidden = !blocked.length;
+    blockedEl.textContent = blocked.length ? workflowBlockageSummary(blocked) : "";
+
+    const strip = el.querySelector(".workflow-phases");
+    const dots = el.querySelector(".workflow-dots");
+    strip.replaceChildren();
+    dots.replaceChildren();
+    const hasPhases = Array.isArray(u.phases) && u.phases.length;
+    strip.hidden = !hasPhases || !expanded;
+    dots.hidden = !hasPhases || expanded;
+    strip.setAttribute("aria-label", "Reported workflow phases");
+    dots.setAttribute("aria-label", "Reported workflow steps");
+    // Position and state are both reported fields. Never guess completion from
+    // an index, or select an ambiguous name as the current step.
+    const phases = u.phases || [];
+    const reference = u.currentPhaseId || u.currentPhase;
+    const ids = reference ? phases.filter((p) => p.id === reference) : [];
+    const matches = u.currentPhaseId || ids.length ? ids : phases.filter((p) => reference && p.title === reference);
+    for (const phase of phases) {
+      const atPosition = matches.length === 1 ? phase === matches[0] : !reference && phase.state === "active";
+      const reportedTerminal = /^(done|complete|completed|failed|cancelled|stopped)$/.test(phase.state || "");
+      const current = !u.done && !reportedTerminal && atPosition;
+      // current_phase survives completion. It locates the final step; it must
+      // not revive it, nor leave an active step in a terminal transcript card.
+      const phaseState = u.done && !reportedTerminal && (atPosition || phase.state === "active" || (!phase.state && !u.failed && !u.cancelled))
+        ? u.failed ? "failed" : u.cancelled ? "cancelled" : "done"
+        : current ? "active" : phase.state || "unknown";
+      for (const [parent, className, label, tag] of [[strip, "workflow-phase", phase.title, "li"], [dots, "workflow-dot", "", "span"]]) {
+        const item = workflowText(parent, className, label, tag);
+        item.dataset.state = phaseState;
+        if (phase.id) item.dataset.phaseId = phase.id;
+        item.title = `${phase.title}: ${current ? "current" : phaseState === "unknown" ? "state unavailable" : phaseState}`;
+        item.setAttribute("aria-label", item.title);
+        if (current) item.setAttribute("aria-current", "step");
+      }
+    }
+    // Legacy detail mixes results, pause reasons and arbitrary CLI events.
+    // Its provenance cannot be recovered by splitting on a separator. Only
+    // source-preserving hosts can provide output; do not guess on old hosts.
+    const detailText = u.workflowContent?.pauseMessage;
+    for (const [selector, value] of [[".run-progress-sub", u.subtitle], [".run-progress-detail", detailText]]) {
+      const target = el.querySelector(selector);
+      target.hidden = !expanded || !value;
+      target.textContent = value || "";
+    }
+    const spend = el.querySelector(".workflow-spend");
+    const spendText = Number.isFinite(u.agentsUsed)
+      ? (Number.isFinite(u.agentBudget) ? `${formatCount(u.agentsUsed)} of ${formatCount(u.agentBudget)} agents used` : `${formatCount(u.agentsUsed)} agents used`)
+      : Number.isFinite(u.agentBudget) ? `${formatCount(u.agentBudget)} agent budget` : "";
+    spend.hidden = !expanded || !spendText;
+    spend.textContent = spendText;
+    const outputText = workflowOutputText(u.workflowContent?.resultSummary);
+    let output = el.querySelector(".workflow-output");
+    if (!outputText) {
+      if (output) output.remove();
+    } else {
+      if (!output) {
+        output = document.createElement("section");
+        output.className = "workflow-output";
+        output.setAttribute("aria-label", "Output");
+        workflowText(output, "workflow-output-label", "Output", "strong");
+        workflowText(output, "workflow-output-body", "");
+        el.querySelector(".workflow-expanded").prepend(output);
+      }
+      const body = output.querySelector(".workflow-output-body");
+      body.innerHTML = renderMarkdown(outputText);
+      applyAutoDir(body);
+      renderMermaidIn(body);
+    }
+    const roster = el.querySelector(".workflow-roster");
+    roster.hidden = !Array.isArray(u.agents);
+    const existing = new Map([...roster.children].filter((row) => row._agentKey).map((row) => [row._agentKey, row]));
+    const rows = (u.agents || []).map((agent, i, agents) => {
+      const key = workflowAgentKey(agent, agents);
+      const row = existing.get(key) || document.createElement("li");
+      row.className = "workflow-agent";
+      row._agentKey = key;
+      row.dataset.agentIndex = String(i);
+      row.dataset.state = agent.state || "unknown";
+      const activity = workflowAgentActivity(record, agent);
+      // A finished run has nothing behind the row worth opening -- the detail
+      // is the live activity line, which reads "tokens moved" and no more.
+      // It also only EXISTS when this view watched the run finish: activity is
+      // recorded off the live rail only, so the same report drew chevrons or
+      // not depending on whether you happened to be looking. Now neither does.
+      const hasDetails = !!activity && !record.update.done;
+      if (row._hasDetails !== hasDetails) row.replaceChildren();
+      row._hasDetails = hasDetails;
+      if (!row.firstChild) {
+        const button = workflowText(row, "workflow-agent-toggle", "", hasDetails ? "button" : "div");
+        if (hasDetails) {
+          button.type = "button";
+          button.setAttribute("aria-expanded", "false");
+        }
+        workflowText(button, "workflow-agent-name", "", "strong");
+        workflowText(button, "workflow-agent-state", "", "span");
+        const chevron = hasDetails ? workflowText(button, "workflow-agent-chevron", "", "span") : null;
+        if (chevron) {
+          chevron.setAttribute("aria-hidden", "true");
+          chevron.innerHTML = ICON.chevronRight;
+        }
+        const detail = workflowText(row, "workflow-agent-detail", "");
+        detail.hidden = true;
+        workflowText(detail, "workflow-agent-activity", "");
+        if (hasDetails) button.onclick = () => {
+          detail.hidden = !detail.hidden;
+          button.setAttribute("aria-expanded", String(!detail.hidden));
+          chevron.innerHTML = detail.hidden ? ICON.chevronRight : ICON.chevronDown;
+        };
+      }
+      row.querySelector(".workflow-agent-name").textContent = workflowAgentName(agent);
+      row.querySelector(".workflow-agent-state").textContent = [agent.state ? agent.state.replace(/[_-]+/g, " ") : "",
+        Number.isFinite(agent.tokensUsed) ? `${compactTokens(agent.tokensUsed)} tokens` : ""].filter(Boolean).join(" · ");
+      row.querySelector(".workflow-agent-activity").textContent = activity;
+      return row;
+    });
+    for (const child of [...roster.children]) if (!rows.includes(child)) child.remove();
+    rows.forEach((row, i) => { if (roster.children[i] !== row) roster.insertBefore(row, roster.children[i] || null); });
+    if (Array.isArray(u.agents) && !u.agents.length) workflowText(roster, "workflow-agent-empty", "No agents reported", "li");
+
+    const actions = el.querySelector(".run-progress-actions");
+    const paused = /paus/i.test(u.phase || "");
+    // Deliberately NOT gated on `receivedAt`. The handle is what a control
+    // needs, and the host owns the run either way -- a Stop for a run that has
+    // since ended is ignored there, while greying the controls out on a live
+    // run a phone joined is the out-of-reach complaint this card was built for.
+    const reason = !u.displayName ? "Controls unavailable: no workflow handle reported"
+      : !/^[\w.:-]+$/.test(u.displayName) ? "Controls unavailable: invalid workflow handle" : "";
+    // Preserve focused controls and pending pointer clicks across rollup frames.
+    const controlsKey = JSON.stringify([u.done, paused, u.displayName, reason]);
+    if (actions.dataset.controlsKey !== controlsKey) {
+      actions.dataset.controlsKey = controlsKey;
+      actions.replaceChildren();
+      actions.hidden = !!u.done;
+      if (!u.done) {
+        for (const action of [paused ? "resume" : "pause", "stop"]) {
+          const button = workflowText(actions, "run-progress-btn", action[0].toUpperCase() + action.slice(1), "button");
+          button.type = "button";
+          button.disabled = !!reason;
+          button.title = reason || `${button.textContent} ${u.displayName}`;
+          button.onclick = () => {
+            if (!button.disabled) vscode.postMessage({ type: "workflowControl", action, displayName: u.displayName });
+          };
+        }
+        if (reason) workflowText(actions, "workflow-control-reason", reason);
+      }
+    }
+  }
+
+  function syncWorkflowReportChevron(report) {
+    const chevron = report.querySelector(".workflow-report-chevron");
+    if (chevron) chevron.innerHTML = report.open ? ICON.chevronDown : ICON.chevronRight;
+  }
+
+  function renderWorkflowTranscript(el, record) {
+    const u = record.update;
+    const name = u.title && u.title !== u.id ? u.title : u.displayName || "Workflow";
+    el.classList.toggle("run-progress-failed", !!u.failed);
+    el.classList.toggle("run-progress-cancelled", !!u.cancelled && !u.failed);
+    el.classList.toggle("run-progress-done", !!u.done);
+    if (!u.done) {
+      el.replaceChildren();
+      const status = workflowLiveStatus(u);
+      const marker = workflowText(el, "workflow-marker", "");
+      // Every other line in the transcript that reports work carries an icon;
+      // a bare string beside them reads as something half-drawn.
+      marker.innerHTML = TOOL_ICON.workflow + `<span>${escapeHtml(`${name} · ${status}`)}</span>`;
+      return;
+    }
+    let report = el.querySelector(".workflow-report");
+    if (!report) {
+      el.replaceChildren();
+      report = workflowText(el, "workflow-report", "", "details");
+      const summary = workflowText(report, "workflow-report-toggle", "", "summary");
+      // The same parts the live card uses, in the same order. A finished run
+      // used to be a bare string beside the browser's OWN <details> marker --
+      // a different glyph, on the opposite side, from every card still running.
+      // Nobody chose two affordances; one of them was the UA default showing
+      // through, which is also why the elapsed time and the steps vanished.
+      // Deliberately NOT the live card's class names. `.workflow-card
+      // .run-progress-phase` would otherwise match the body's copy and this
+      // one, with different meanings, and every existing assertion about the
+      // body would quietly start reading the summary instead.
+      summary.innerHTML = `<span class="workflow-report-name"></span><span class="workflow-report-dots"></span><span class="workflow-report-state"></span><span class="workflow-report-elapsed" hidden></span><span class="workflow-report-chevron" aria-hidden="true"></span>`;
+      report.addEventListener("toggle", () => syncWorkflowReportChevron(report));
+      workflowText(report, "workflow-report-body", "");
+    }
+    const summary = report.querySelector(".workflow-report-toggle");
+    summary.querySelector(".workflow-report-name").textContent = name;
+    summary.querySelector(".workflow-report-state").textContent = u.failed ? "failed" : u.cancelled ? "cancelled" : "done";
+    const body = report.querySelector(".workflow-report-body");
+    renderWorkflowSurface(body, record);
+    // The body already resolves each step's TERMINAL state for a finished run
+    // (a surviving current_phase must not leave one step looking active), so
+    // clone that rail instead of deriving the same thing a second time.
+    const rail = summary.querySelector(".workflow-report-dots");
+    const resolved = body.querySelector(".workflow-dots");
+    rail.replaceChildren(...[...resolved.children].map((dot) => dot.cloneNode(true)));
+    rail.hidden = !rail.children.length;
+    const reportElapsed = summary.querySelector(".workflow-report-elapsed");
+    reportElapsed.hidden = !Number.isFinite(u.elapsedMs);
+    reportElapsed.textContent = reportElapsed.hidden ? "" : workflowElapsed(u.elapsedMs);
+    syncWorkflowReportChevron(report);
+    // Finished reports have one disclosure, with all fixed content inside it.
+    body.querySelector(".run-progress-title").hidden = true;
+    body.querySelector(".workflow-dots").hidden = true;
+    body.querySelector(".workflow-chevron").hidden = true;
+    body.querySelector(".workflow-expanded").hidden = false;
+  }
+
+  function syncWorkflowPin() {
+    // Every live run, including one this view only learned about from a replay.
+    // A phone joining a conversation replays the transcript, so `receivedAt` is
+    // null until the NEXT frame lands -- and a deep-research run emits about a
+    // dozen frames across its whole length. Gating the pin on freshness meant
+    // the owner watched "deep-research - running" sit in the transcript with
+    // nothing above the composer, which is the complaint the pin exists to fix.
+    // How fresh the information is belongs in the receipt, not in whether the
+    // run is shown at all.
+    const records = [...state.runProgressCards.values()].map((el) => el._workflow)
+      .filter((r) => r && !r.update.done)
+      .sort((a, b) => Number(workflowBlockages(b.update).length > 0) - Number(workflowBlockages(a.update).length > 0));
+    if (!records.length) {
+      if (workflowPin) workflowPin.remove();
+      workflowPin = null;
+      return;
+    }
+    if (!workflowPin) {
+      workflowPin = document.createElement("section");
+      workflowPin.className = "workflow-pin";
+      workflowPin.setAttribute("aria-label", "Live workflows");
+      workflowText(workflowPin, "workflow-pin-runs", "");
+      // INSIDE the composer, not between it and the transcript. The
+      // scroll-to-bottom pill and the previous-prompt circle are absolutely
+      // positioned against the composer's padding box, so a pin that is a
+      // SIBLING lands underneath both: the pill sat across the receipt line and
+      // the circle on top of Stop. As a child it lifts them by its own height,
+      // whatever that height is, collapsed or expanded, on every surface.
+      const composer = document.querySelector(".composer");
+      if (composer) composer.insertBefore(workflowPin, composer.firstChild);
+      else messagesEl.parentNode.insertBefore(workflowPin, messagesEl.nextSibling);
+    }
+    workflowPin.classList.toggle("is-expanded", records.some((r) => r.expanded));
+    const stack = workflowPin.querySelector(".workflow-pin-runs");
+    for (const child of [...stack.children]) {
+      if (!records.some((r) => r.pin === child)) child.remove();
+    }
+    const focused = document.activeElement;
+    for (const [index, record] of records.entries()) {
+      if (!record.pin) {
+        record.pin = document.createElement("article");
+        record.pin.className = "workflow-pin-run run-progress-card";
+        record.pin.dataset.runId = record.update.id;
+      }
+      if (stack.children[index] !== record.pin) stack.insertBefore(record.pin, stack.children[index] || null);
+      renderWorkflowSurface(record.pin, record);
+    }
+    if (focused && focused.isConnected && stack.contains(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
+    refreshWorkflowAges();
+  }
+
+  function applyWorkflowProgress(update) {
+    // Older hosts recognized the lifecycle word but sent done:false for
+    // `complete`. Repair only explicit terminal evidence, never quiet receipts
+    // or a roster whose agents could be between workflow stages.
+    const terminal = /^(complete|completed|failed|cancelled|cleared|stopped|budget_exceeded|error|success)$/.test(update.phase || "");
+    if (terminal && !update.done) update = { ...update, done: true,
+      failed: update.failed || /^(failed|budget_exceeded|error)$/.test(update.phase),
+      cancelled: update.cancelled || /^(cancelled|cleared|stopped)$/.test(update.phase) };
+    const id = String(update.id);
+    let el = state.runProgressCards.get(id);
+    // Loading older transcript pages must not rewind a live run or its pin.
+    if (state.historyHydrating && el) return;
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "run-progress-card workflow-card";
+      el.dataset.runId = id;
+      state.runProgressCards.set(id, el);
+      appendTranscriptChild(el);
+    }
+    let record = el._workflow;
+    if (!record) record = el._workflow = { update, activity: new Map(), receivedAt: null, pin: null, expanded: false };
+    const historical = state.replaying;
+    if (!historical) record.receivedAt = Date.now();
+    const stale = Number.isFinite(update.revision) && Number.isFinite(record.update.revision) && update.revision < record.update.revision;
+    if (!stale) {
+      const before = record.update.agents || [];
+      const agents = update.agents || [];
+      const nextActivity = new Map();
+      for (const agent of agents) {
+        const key = workflowAgentKey(agent, agents);
+        if (!key) continue;
+        const previous = before.find((a) => workflowAgentKey(a, before) === key);
+        let event = record.activity.get(key);
+        if (!historical && previous) {
+          if (Number.isFinite(previous.tokensUsed) && Number.isFinite(agent.tokensUsed) && agent.tokensUsed > previous.tokensUsed) {
+            event = { kind: "tokens moved", at: Date.now(), tokensObserved: true };
+          } else if (previous.state && agent.state && previous.state !== agent.state) {
+            event = { kind: "state changed", at: Date.now(), tokensObserved: !!event?.tokensObserved };
+          }
+        }
+        if (event && !historical) nextActivity.set(key, event);
+      }
+      record.activity = nextActivity;
+      record.update = update;
+    }
+    renderWorkflowTranscript(el, record);
+    syncWorkflowToolMarkers();
+    syncWorkflowPin();
+    refreshWorkflowAges();
+    if (!historical && !workflowAgeTimer) workflowAgeTimer = setInterval(refreshWorkflowAges, 1000);
+    scrollToBottom();
+  }
 
   function applyRunProgress(update) {
     if (!update || !update.id) return;
     clearWelcome();
     hideGrokking();
+    if (update.kind === "workflow") {
+      applyWorkflowProgress(update);
+      return;
+    }
     const id = String(update.id);
     let el = state.runProgressCards.get(id);
     if (!el) {
@@ -13773,18 +14387,7 @@
     el.classList.toggle("run-progress-cancelled", !!update.cancelled && !update.failed);
     el.classList.toggle("run-progress-done", !!update.done);
 
-    // How long this run has been going, in the row beside the phase.
-    //
-    // A workflow reports no completion fraction at all now (see
-    // src/run-progress.ts), so without this the row holds nothing that moves
-    // while one agent works for twenty minutes — and "still going" reads
-    // exactly like "wedged", which is half of #163. It is the same counter the
-    // waiting indicator uses, and it stops itself when the node is detached.
-    //
-    // Not armed while a loaded session is replaying: the only clock available
-    // there starts now, so a restored run would claim to have begun at the
-    // moment the conversation was opened. On `done` the interval stops and the
-    // last value stays as the run's duration.
+    // Goal elapsed display retains its existing local clock.
     const row = el.querySelector(".run-progress-row");
     if (update.done) clearWaitElapsed(row);
     else if (row && !row._waitTimer && !state.replaying) armWaitElapsed(row, "run-progress-elapsed");
@@ -13807,33 +14410,6 @@
       if (phaseAnchor) phaseAnchor.insertAdjacentHTML("afterend", BLINK_DOTS);
     }
 
-    // Workflow control buttons (pause/resume/stop) while running or paused.
-    const actions = el.querySelector(".run-progress-actions");
-    if (update.kind === "workflow" && update.displayName && !update.done) {
-      actions.hidden = false;
-      actions.innerHTML = "";
-      const mk = (label, action) => {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "run-progress-btn";
-        b.textContent = label;
-        b.onclick = (e) => {
-          e.stopPropagation();
-          vscode.postMessage({
-            type: "workflowControl",
-            action,
-            displayName: update.displayName,
-          });
-        };
-        return b;
-      };
-      if (paused) actions.appendChild(mk("Resume", "resume"));
-      else actions.appendChild(mk("Pause", "pause"));
-      actions.appendChild(mk("Stop", "stop"));
-    } else {
-      actions.hidden = true;
-      actions.innerHTML = "";
-    }
 
     scrollToBottom();
   }
@@ -14476,12 +15052,14 @@
   function activityVerb() {
     if (state.activeProvider === "codex") return CODEX_ACTIVITY_VERB;
     if (state.activeProvider === "claude") return CLAUDE_ACTIVITY_VERB;
+    if (state.activeProvider === "muse") return "Working";
     return GROK_ACTIVITY_VERB;
   }
 
   function activityAriaLabel() {
     if (state.activeProvider === "codex") return "OpenAI is working";
     if (state.activeProvider === "claude") return "Claude is working";
+    if (state.activeProvider === "muse") return "Muse Code is working";
     return "Grok is working";
   }
 
@@ -14994,7 +15572,7 @@
       subtitle.className = "card-subtitle";
       const oldLines = (diff.oldText || "").split("\n").length;
       const newLines = (diff.newText || "").split("\n").length;
-      subtitle.textContent = `${diff.path} — ${oldLines} → ${newLines} lines`;
+      subtitle.textContent = `${diff.path} — ${formatCount(oldLines)} → ${formatCount(newLines)} lines`;
       el.appendChild(subtitle);
 
       const openDiff = () => {
@@ -17338,10 +17916,10 @@
     if (find.countEl) {
       if (!q) find.countEl.textContent = "";
       else if (find.invalid) find.countEl.textContent = "—";
-      else if (!n) find.countEl.textContent = find.lastCapped ? "0/" + FIND_MAX_MATCHES + "+" : "0/0";
+      else if (!n) find.countEl.textContent = find.lastCapped ? "0/" + formatCount(FIND_MAX_MATCHES) + "+" : "0/0";
       else {
         const cap = find.lastCapped ? "+" : "";
-        find.countEl.textContent = (find.index + 1) + "/" + n + cap;
+        find.countEl.textContent = formatCount(find.index + 1) + "/" + formatCount(n) + cap;
       }
     }
     if (find.hiddenBtn) {
@@ -17556,7 +18134,7 @@
           find.matches = acc;
           find.invalid = false;
           rebuildFindNav();
-          if (find.countEl) find.countEl.textContent = find.nav.length + "…";
+          if (find.countEl) find.countEl.textContent = formatCount(find.nav.length) + "…";
           find.sliceTimer = setTimeout(step, 0);
           return;
         }
@@ -17581,7 +18159,7 @@
         find.matches = acc;
         find.invalid = false;
         rebuildFindNav();
-        if (find.countEl) find.countEl.textContent = find.nav.length + "…";
+        if (find.countEl) find.countEl.textContent = formatCount(find.nav.length) + "…";
         find.sliceTimer = setTimeout(step, 0);
         return;
       }
@@ -18067,9 +18645,11 @@
         renderWelcomeTip();
         break;
       case "providerState":
+        museAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "muse");
+        museAvailable = museAdvertised && msg.providers.some(p => p && p.id === "muse" && !p.unavailableReason);
         state.providersKnown = true;
         state.providers = Array.isArray(msg.providers) ? msg.providers.filter((provider) =>
-          provider && (provider.id === "grok" || provider.id === "codex" || provider.id === "claude")) : [];
+          provider && Object.hasOwn(globalThis.GrokWebviewHelpers.PROVIDER_ACTIONS, provider.id)) : [];
         // A confirmed account retires its device-flow mirror. Without this the
         // "Connected" flow row would resurface in Settings after a later
         // sign-out, describing a connection that no longer exists.
@@ -18162,7 +18742,7 @@
         state.routineSavePending = false;
         state.routines = Array.isArray(msg.entries) ? msg.entries : [];
         state.routineProjects = Array.isArray(msg.projects) ? msg.projects : [];
-        state.routineModels = Array.isArray(msg.models) ? msg.models : [];
+        state.routineModels = (Array.isArray(msg.models) ? msg.models : []).filter(m => m.provider !== "muse" || museAvailable);
         state.routineError = msg.error || "";
         state.routineErrorId = msg.errorId || "";
         refreshSettingsOverlay();
@@ -18496,7 +19076,7 @@
       case "session": {
         state.subscriptionWindows = [];
         state.currentModelId = msg.currentModelId;
-        state.activeProvider = msg.provider === "codex" || msg.provider === "claude" ? msg.provider : "grok";
+        state.activeProvider = msg.provider === "codex" || msg.provider === "claude" || msg.provider === "muse" && museAvailable ? msg.provider : "grok";
         renderQueuedBlocks();
         syncFeedbackButtons();
         syncProviderVoice();
@@ -18507,7 +19087,7 @@
         renderCodexUpdateNudge();
         if (state.railTransition?.kind === "new") renderRail();
         state.isWorktree = !!msg.worktree; // gates the gear Apply/Remove worktree items
-        state.availableModels = msg.models || [];
+        state.availableModels = (msg.models || []).filter(m => (m.provider || msg.provider) !== "muse" || museAvailable);
         if (currentModel()?.reasoningEffort) state.effort = currentModel().reasoningEffort;
         refreshModelControls();
         renderProviderSignInCard();
@@ -19116,6 +19696,15 @@
         applyChildStream(msg);
         break;
       case "runProgress":
+        if (msg.replaceOnly) {
+          // A repair must not append a report outside this surface's window.
+          // Keep parked desk history current for a later prepend as well.
+          for (const entry of state.historyPrefix) {
+            if (entry.type === "runProgress" && entry.update.id === msg.update.id
+              && entry.update.kind === msg.update.kind) entry.update = msg.update;
+          }
+          if (!state.runProgressCards.has(String(msg.update.id))) break;
+        }
         applyRunProgress(msg.update);
         break;
       case "permissionRequest":
