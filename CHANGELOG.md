@@ -1,5 +1,31 @@
 # Changelog
 
+## 4.10.0 — 2026-09-21
+
+**This release is mostly about things the app was doing without being asked.** Closing the desktop window killed the agent you had left running. Opening Settings opened a real session with every agent you had connected, to learn something the page already knew. And in two places the app had the information you wanted and showed you something else — a document in a code fence you had to scroll sideways to read, and a context meter that threw away the number first.
+
+### Added
+
+- **Close the desktop window without quitting (#174).** On Windows and Linux the window now hides to a tray icon instead of ending the process. Closing used to mean "get this off my screen" and "stop being reachable from my phone" at the same time, with only the destructive reading available; now your agent keeps working and a linked phone keeps reaching it. The first time it happens you are told once, so the app does not simply vanish. **Quit** in the tray menu ends it, and **Settings → General** turns the behaviour off. **macOS is not covered.** Closing the window still quits the app there. The answer on macOS is its own convention — the app outliving its last window, with the dock icon bringing it back — rather than a menu-bar item, and that is a separate change from this one.
+
+  If the tray icon cannot be created — a Linux session with no status-notifier host, for instance — closing quits exactly as it used to. Hiding a window that nothing can bring back would be worse than the problem being solved.
+
+### Changed
+
+- **Opening Settings no longer signs in to your agents (#171).** The Providers page proved every connected account the moment you opened it, which meant opening a settings page made around twenty network connections, started your MCP connectors, and built a throwaway session for each provider. Nothing was billed and no account was at risk — but nothing was learned either, because the page already knew what it was showing you. Detection is now local: it re-runs the CLI locators, and re-reads the Codex and Claude Code versions, so a CLI you installed or upgraded since launch still shows up and an available update is still offered. None of that contacts anybody. Proving an account now happens only where you ask for it: **Refresh**, or the **Re-check connection** a row offers once you have signed that provider in from a terminal.
+
+- **Long lines wrap in a prose code fence (#181).** A fenced block with no language, or one marked `md`, `markdown`, `text` or `txt`, now wraps instead of scrolling sideways. Those fences are how an agent shows you a document rather than a program — an `AGENTS.md` it is proposing, a commit message it has drafted — and a document you have to scroll horizontally to read is not really being shown to you. Real code still scrolls, because wrapping breaks the indentation you read it by. Every block keeps a toggle, so where the guess is wrong you can overrule it per block.
+
+- **The context number is the last thing a narrow composer gives up (#172).** As the composer narrowed it dropped the token count first — at the widest breakpoint of all — so the one number two people independently asked to be able to see was the first thing to go, while the model name and the effort level survived it. That order is now inverted: the effort chip goes first, then the mode label, then the model name is trimmed, and the count is last to be given up. Hovering it now shows the exact figures and the percentage, which previously meant opening the popover.
+
+### Fixed
+
+- **The "always-approve is set in your grok config.toml" dialog no longer appears every time you open the app (#177).** It was meant to explain, once, why the mode button says Auto accept when that setting lives in `~/.grok/config.toml` rather than in this session. The flag lived only in memory, so a desktop launch (and a new VS Code window) showed the same dialog again. It is now remembered, and a project that ships its own always-approve config does not get this notice on top of the consent dialog it already has. Thanks to [@mateolafalce](https://github.com/mateolafalce) ([#173](https://github.com/phuryn/grok-build-vscode/pull/173)).
+
+- **Closing to the tray no longer holds up a Windows shutdown or sign-out.** Windows does not tell an app to quit the way the tray's own **Quit** does, so the window hid instead of closing and the machine waited on an app you thought you had already closed. It now recognises the session ending and gets out of the way.
+
+- **The desktop log no longer fills with worktree capability lines.** Every time the conversation list was rebuilt, the app re-asked a CLI that had already said no whether it supported listing worktrees — a round trip and a log line each time, several per millisecond in bursts. It asks once per run now. A CLI cannot grow the feature while it is running.
+
 ## 4.9.0 — 2026-09-18
 
 **This release is about being asked less and being told more.** A turn that edited five files made you open five tool rows to see what happened to one of them; a permission card asked the same question forty times a session because answering "don't ask again" granted almost nothing; and a workflow reported its progress as a percentage that was really a count of agents spent. Each of those is a place where the app had the information and handed you something else.
@@ -32,7 +58,7 @@
 
 - **The run card says words, not the machine's vocabulary.** Labels like `phase_entered` and `user_paused` reached the card exactly as the CLI spells them internally. Anything it sends is now shown as ordinary English, including names we have never seen, and an event that only repeats what the card already says is dropped instead of printed twice. The liveness dots also moved off the end of the run's name, where they were indistinguishable from the "…" of a name too long to fit.
 
-- **Controls that could not work are no longer offered on a phone (#160).** An "open diff" on a tool row posted a request only a desk machine can answer, so on a phone or in a browser it did nothing at all — while the diff it would have opened was already on screen directly above it.
+- **Controls that could not work are no longer offered on a phone.** An "open diff" on a tool row posted a request only a desk machine can answer, so on a phone or in a browser it did nothing at all — while the diff it would have opened was already on screen directly above it.
 
 - **A turn from a reloaded conversation explains itself instead of opening the wrong edit.** The per-turn diff baseline lives in memory and does not survive reloading the window, and those rows were quietly falling back to whichever single edit touched the file last — so a file the turn changed three times offered you the third change while the row's own `+/−` counts described all three. Those rows are now plain text, with a line at the bottom of the card saying the diffs are kept only while the session stays open. Hosts without per-turn baselines keep the behaviour they have always had, and say nothing.
 
