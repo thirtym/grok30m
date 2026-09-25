@@ -15,7 +15,7 @@ import {
 
 describe("community lag", () => {
   it("records the community tag this tree merged", () => {
-    expect(COMMUNITY_BASE_VERSION).toBe("4.7.0");
+    expect(COMMUNITY_BASE_VERSION).toBe("4.8.0");
     expect(COMMUNITY_GITHUB_REPO).toBe("phuryn/grok-build-vscode");
   });
 
