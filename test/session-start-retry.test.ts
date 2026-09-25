@@ -82,6 +82,7 @@ import { GrokSidebar } from "../src/sidebar";
 
 function makeSidebar(cwd: string): any {
   const sidebar = Object.create(GrokSidebar.prototype) as any;
+  sidebar.pendingTurnDiffCaptures = new WeakSet();
   const memento: Record<string, unknown> = {};
   sidebar.providerConnectionState = { grok: true, codex: false };
   sidebar.providerConnections = vi.fn(() => sidebar.providerConnectionState);
@@ -273,6 +274,15 @@ describe("startSession bounded spawn retry", () => {
     startControl.failWith = "Internal error";
     startControl.starts = 0;
     startControl.disposes = 0;
+  });
+
+  it.each([undefined, "saved-session"])("a new/load start (%s) clears grants even when reusing a Session object", async (resumeId) => {
+    const sidebar = makeSidebar("/repo");
+    const session = sidebar.focused;
+    session.allowedCommandPrograms.add("npm");
+    const client = await sidebar.startSession(resumeId, session);
+    expect(client).toBeDefined();
+    expect(session.allowedCommandPrograms.size).toBe(0);
   });
 
   it("retries two transient spawn failures then comes up with no error", async () => {

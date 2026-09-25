@@ -855,6 +855,7 @@
     // agentStart / next user message; the card itself stays in the transcript.
     turnEditsByToolCallId: new Map(),
     turnDiffSummaryEl: null,
+    turnDiffBaseline: null,
     // Restored question cards on resume (toolCallId → card element). On replay grok
     // sends a tool_call per question (with rawInput.questions); we render the card
     // immediately and fill the answer in whenever it arrives — on the tool_call
@@ -9555,7 +9556,7 @@
   }
 
   const REPLAY_HOLD_TYPES = new Set([
-    "userMessage", "agentStart", "thoughtChunk", "messageChunk", "media",
+    "userMessage", "agentStart", "turnDiffBaseline", "thoughtChunk", "messageChunk", "media",
     "userMessageChunk", "historyBatch", "toolCall", "toolCallUpdate",
     "permissionRequest", "permissionOptions", "permissionResolved",
     "exitPlanRequest", "planResolved", "questionRequest", "questionResolved", "planNotice",
@@ -9680,6 +9681,7 @@
       // its card would be pinned into the history nodes.
       turnEdits: [...state.turnEditsByToolCallId],
       turnDiffSummaryEl: state.turnDiffSummaryEl,
+      turnDiffBaseline: state.turnDiffBaseline,
       turnRating: state.turnRating,
       suppressReplayTurn: state.suppressReplayTurn,
       skipUserBubble: state.skipUserBubble,
@@ -9701,6 +9703,7 @@
     state.activeToolGroupEl = null;
     state.turnAgentActionsEl = null;
     state.turnEditsByToolCallId.clear();
+    state.turnDiffBaseline = null;
     state.turnDiffSummaryEl = null;
     state.suppressReplayTurn = false;
     state.skipUserBubble = false;
@@ -9746,6 +9749,7 @@
     state.turnEditsByToolCallId.clear();
     for (const [id, entry] of saved.turnEdits) state.turnEditsByToolCallId.set(id, entry);
     state.turnDiffSummaryEl = saved.turnDiffSummaryEl;
+    state.turnDiffBaseline = saved.turnDiffBaseline;
     state.turnRating = saved.turnRating;
     state.suppressReplayTurn = saved.suppressReplayTurn;
     state.skipUserBubble = saved.skipUserBubble;
@@ -9851,6 +9855,7 @@
     state.toolExpandOverride = null; // the Expand/Collapse All latch is per-session; a swap/restore starts clean (the replay buffer re-applies it for a warm re-focus)
     state.turnAgentActionsEl = null;
     state.turnEditsByToolCallId.clear();
+    state.turnDiffBaseline = null;
     state.turnDiffSummaryEl = null;
     state.activeAgentEl = null;
     state.activeAgentRaw = "";
@@ -10880,7 +10885,104 @@
     // Leave any previous turn's card in the transcript; only drop the live
     // pointer + per-call map so this turn starts empty.
     state.turnEditsByToolCallId.clear();
+    state.turnDiffBaseline = null;
     state.turnDiffSummaryEl = null;
+  }
+
+  const turnFileDiffPending = new Map();
+  let turnFileDiffRequestSeq = 0;
+
+  function showTurnFileDiff(card, row, path, revealId) {
+    const fallback = () => { if (revealId) revealToolDiff(revealId); };
+    const baseline = card._turnDiffBaseline;
+    const parser = window.GrokFilePanel;
+    if (!baseline || !parser || !parser.patchRowsToDiffHunks) { fallback(); return; }
+    if (row._turnDiffRegion) {
+      row._turnDiffRegion.remove();
+      row._turnDiffRegion = null;
+      row.setAttribute("aria-expanded", "false");
+      return;
+    }
+    const region = document.createElement("div");
+    region.className = "turn-file-diff";
+    region.textContent = "Loading diff…";
+    row.after(region);
+    row._turnDiffRegion = region;
+    row.setAttribute("aria-expanded", "true");
+    const requestId = "turn-diff-" + (++turnFileDiffRequestSeq);
+    const request = { type: "turnFileDiff", requestId, turnId: baseline.turnId, cwd: baseline.cwd, path };
+    const finish = (msg) => {
+      clearTimeout(timer);
+      turnFileDiffPending.delete(requestId);
+      // A repaint, collapse or session switch invalidates only this request's DOM.
+      if (!row.isConnected || row._turnDiffRegion !== region || !region.isConnected) return;
+      if (!msg.ok) {
+        // With a tool row to reveal, revealing it IS the answer and the region
+        // gets out of the way. Without one there is nothing to reveal — a
+        // deleted file has no edit call, so `lastCallByPath` never named it —
+        // and removing the region silently would leave a button that does
+        // nothing when pressed. Say why instead; a dead control is the whole
+        // complaint in #160 and it is not worth re-earning here.
+        if (revealId) {
+          region.remove();
+          row._turnDiffRegion = null;
+          row.setAttribute("aria-expanded", "false");
+          fallback();
+          return;
+        }
+        region.textContent = "";
+        const note = document.createElement("div");
+        note.className = "tool-diff-more";
+        note.textContent = msg.reason || "Could not read this file's diff for the turn.";
+        region.appendChild(note);
+        return;
+      }
+      region.textContent = "";
+      const hunks = parser.patchRowsToDiffHunks(parser.parseUnifiedDiff(msg.patch));
+      if (hunks.length) region.appendChild(buildInlineDiffRegion(hunks, { inlineOnly: true }));
+      else {
+        const note = document.createElement("div");
+        note.className = "tool-diff-more";
+        note.textContent = msg.patch ? "No text diff available for this file." : "No changes since this turn started.";
+        region.appendChild(note);
+      }
+      if (msg.truncated) {
+        const note = document.createElement("div");
+        note.className = "tool-diff-more";
+        note.textContent = "Diff truncated — this preview is incomplete.";
+        region.appendChild(note);
+      }
+      // Only where there is a text diff to escape into. "No changes since this
+      // turn started" would open two identical sides, and a patch we could not
+      // parse (a binary file) would open two screens of mojibake — our sides
+      // are grok-diff: text documents, so VS Code's native image diff never
+      // applies. A truncated diff still has hunks, so the case this exists for
+      // keeps its button.
+      if (!IS_REMOTE && hunks.length) {
+        const preview = document.createElement("button");
+        preview.className = "preview-link";
+        preview.textContent = "open diff →";
+        preview.onclick = (e) => {
+          e.stopPropagation();
+          // Only the host has the whole sides. previewInApp's renderer-owned
+          // texts would reconstruct a lie from this capped patch; Electron's
+          // host.openDiff can open the full texts in its native viewer instead.
+          vscode.postMessage({ type: "turnFileOpenDiff", turnId: baseline.turnId, cwd: baseline.cwd, path });
+        };
+        region.appendChild(preview);
+      }
+    };
+    const timer = setTimeout(() => finish({ ok: false }), 60000);
+    turnFileDiffPending.set(requestId, { request, finish });
+    vscode.postMessage(request);
+  }
+
+  function handleTurnFileDiffResult(msg) {
+    const pending = turnFileDiffPending.get(msg.requestId);
+    if (!pending) return;
+    const request = pending.request;
+    if (msg.turnId !== request.turnId || msg.cwd !== request.cwd || msg.path !== request.path) return;
+    pending.finish(msg);
   }
 
   function pinTurnDiffSummary() {
@@ -10889,10 +10991,10 @@
   }
 
   /** Workspace-relative path for the summary list (falls back to the raw path). */
-  function turnEditDisplayPath(p) {
+  function turnEditDisplayPath(p, root) {
     if (!p) return "Unknown file";
     let s = String(p).replace(/\\/g, "/");
-    const cwd = (state.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const cwd = (root || state.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "");
     if (cwd) {
       const sl = s.toLowerCase();
       const cl = cwd.toLowerCase();
@@ -11002,6 +11104,14 @@
     }
   }
 
+  // Does this host capture per-turn baselines at all? A desk always agrees
+  // with its own renderer; a remote is served the current client against
+  // whatever extension its desk has installed, and every released extension
+  // (the card shipped in v4.4.0, baselines did not) answers no here.
+  function hostKeepsTurnBaselines() {
+    return !!(state.hostCaps && state.hostCaps.turnDiffBaselines);
+  }
+
   function refreshTurnDiffSummaryUi() {
     const agg = aggregateTurnEdits(state.turnEditsByToolCallId.values());
     if (!agg.files.length) {
@@ -11017,6 +11127,8 @@
       el.className = "turn-diff-summary" + (state.expandDiffCard ? " expanded" : "");
       el.setAttribute("role", "region");
       el.setAttribute("aria-label", "Files changed this turn");
+      // Past cards remain live: never read the current turn at click time.
+      el._turnDiffBaseline = state.turnDiffBaseline;
       state.turnDiffSummaryEl = el;
     }
     while (el.firstChild) el.removeChild(el.firstChild);
@@ -11054,14 +11166,24 @@
     list.className = "turn-diff-summary-list";
     for (const f of agg.files) {
       const isDel = f.action === "deleted";
-      // The row opens that file's own tool row, on every surface. There is no
-      // whole-turn diff to open instead: a wire diff carries the REPLACED
-      // REGION, not a snapshot, so a file edited twice has no honest before/
-      // after without host-side baselines — and the tool row it reveals holds
-      // the real diff, with its own "open diff →" to the native editor beside
-      // it. A remote could not have posted openDiff anyway (host-local).
       const revealId = lastCallByPath.get(normalizeTurnEditPathKey(f.path || ""));
-      const clickable = !isDel && !!revealId;
+      // Clickable while this turn's baseline is still on the host — or on a
+      // host too old to have baselines at all.
+      //
+      // With a baseline the row opens the turn's merged diff. Without one it
+      // used to fall back to revealing the LAST tool call that touched the file
+      // — which on a file edited three times in a turn is edit #3 of 3, while
+      // the row's own `+/−` counts describe all three merged. The row and the
+      // thing it opened actively disagreed, and the counts were the honest
+      // half, so on a host that keeps baselines that fallback is gone and the
+      // foot explains the absence.
+      //
+      // On an OLDER host it stays, because there the absence means something
+      // else entirely and the reveal is the only thing the card ever had.
+      // `revealId` is wired below in both cases for a third one: a baseline
+      // exists and the host's git capture failed.
+      const clickable = !!el._turnDiffBaseline || (!hostKeepsTurnBaselines() && !isDel && !!revealId);
+      const diffPath = turnEditDisplayPath(f.path, el._turnDiffBaseline && el._turnDiffBaseline.cwd);
       const row = document.createElement(clickable ? "button" : "div");
       row.className = "turn-diff-file"
         + (clickable ? " has-diff" : "")
@@ -11069,11 +11191,10 @@
       if (clickable) {
         row.type = "button";
         row.title = "Show the diff";
+        if (el._turnDiffBaseline) row.setAttribute("aria-expanded", "false");
         row.onclick = (e) => {
           e.stopPropagation();
-          // Expands the row and its group, and scrolls it into view — the same
-          // answer the permission card gives a remote.
-          revealToolDiff(revealId);
+          showTurnFileDiff(el, row, diffPath, revealId);
         };
       }
       // M / A / D in front of the path — git's own letters, the ones the
@@ -11092,17 +11213,41 @@
     }
     el.appendChild(list);
 
+    // The foot: what the card cannot do, then the way out of it.
+    const foot = document.createElement("div");
+    foot.className = "turn-diff-summary-foot";
+
+    // Why the rows above are not clickable, said out loud.
+    //
+    // `turnDiffBaselines` is a Map on the host, filled at turn START and never
+    // persisted, so reloading the window leaves every turn already in the
+    // transcript without one. Making those rows inert was the fix; making them
+    // inert SILENTLY was not, and the owner said so: "explain not available
+    // after session reload instead of silently disabling. Maybe at the bottom
+    // of the card?" A row that opened a diff yesterday and does nothing today
+    // with nothing said is the #160 complaint over again — the note is what
+    // makes the absence a fact about the session rather than a fault in the
+    // card. The counts stay either way: those come from the tool calls in the
+    // transcript, which history does restore.
+    if (!el._turnDiffBaseline && hostKeepsTurnBaselines() && agg.files.length) {
+      const note = document.createElement("div");
+      note.className = "turn-diff-summary-note";
+      note.textContent =
+        "File diffs aren't available for this turn — they're kept only while the session stays open.";
+      foot.appendChild(note);
+    }
+
     // The way OUT of the card, and into the whole picture.
     //
     // The card answers "what did this turn touch"; the next question is almost
     // always "what is uncommitted now", and until this link the only route was
     // to find the panel and press a glyph. Offered only where the panel exists
     // AND has a repository to talk about — a dead link on a knowledge-work
-    // session would be worse than no link, and both are ordinary states.
+    // session would be worse than no link, and both are ordinary states. It is
+    // also the one thing a reloaded turn can still offer, which is why the note
+    // above sits beside it rather than instead of it.
     const panel = filePanelController();
     if (panel && typeof panel.canShowChanges === "function" && panel.canShowChanges()) {
-      const foot = document.createElement("div");
-      foot.className = "turn-diff-summary-foot";
       const open = document.createElement("button");
       open.type = "button";
       open.className = "turn-diff-open-changes";
@@ -11112,8 +11257,8 @@
         panel.showChanges();
       };
       foot.appendChild(open);
-      el.appendChild(foot);
     }
+    if (foot.childElementCount) el.appendChild(foot);
 
     setTurnDiffSummaryExpanded(el, el.classList.contains("expanded"));
     appendTranscriptChild(el); // live: always ride at the end of the turn
@@ -12376,7 +12521,8 @@
     if (remaining > 0) {
       const more = document.createElement("div");
       more.className = "tool-diff-more";
-      more.textContent = "... " + remaining + " more line(s) - open diff for the full change";
+      more.textContent = "... " + remaining + " more line(s)"
+        + (opts && opts.inlineOnly ? " — preview limit reached" : " - open diff for the full change");
       more.hidden = true;
       previewOverflow.push(more);
       wrap.appendChild(more);
@@ -12497,6 +12643,14 @@
     // reconstruction in the native editor.
     for (const { diff, hunks } of blocks) {
       details.appendChild(buildInlineDiffRegion(hunks));
+      // Desk only, and this was the inconsistency the owner asked about from
+      // the other side: a remote's click posts `openDiff`, which is host-local,
+      // so policy refuses it and NOTHING happens. Unlike the permission card
+      // there is no `revealToolDiff` fallback worth reaching for either — this
+      // button sits INSIDE the inline region it would reveal, so the diff a
+      // phone would "open" is already on screen directly above it. #160 is
+      // exactly this complaint about a control that does nothing.
+      if (IS_REMOTE) continue;
       const preview = document.createElement("button");
       preview.className = "preview-link";
       preview.textContent = "open diff →";
@@ -13510,8 +13664,17 @@
           `<span class="run-progress-kind"></span>` +
           `<span class="run-progress-sep">·</span>` +
           `<span class="run-progress-title"></span>` +
-          BLINK_DOTS +
+          // After the PHASE, not after the title. `.run-progress-title` is
+          // `text-overflow: ellipsis`, so a long run name really does end in
+          // "…" — and three dots glued to its right edge (the dots carry
+          // `margin-left: 1px`) are indistinguishable from that truncation.
+          // The owner read the card exactly that way the first time he saw a
+          // real one: "those dots in the middle" don't look like liveness,
+          // they look like a name cut short. Past the phase they pulse on the
+          // thing that is actually in progress, which is also the idiom
+          // everywhere else in this file — `Thinking⋯`, never `Think⋯ing`.
           `<span class="run-progress-phase"></span>` +
+          BLINK_DOTS +
         `</div>` +
         `<div class="run-progress-sub" hidden></div>` +
         `<div class="run-progress-detail" hidden></div>` +
@@ -13522,11 +13685,24 @@
 
     const kindLabel = update.kind === "goal" ? "Goal" : "Workflow";
     el.querySelector(".run-progress-kind").textContent = kindLabel;
+    // A goal_updated with no display handle sets `title` to the kind label
+    // itself (src/run-progress.ts), which drew the row as "Goal - Goal". Drop
+    // the redundant half AND its separator -- an emptied span still costs the
+    // row a 6px flex gap.
     const title = update.title || id;
-    el.querySelector(".run-progress-title").textContent = title;
-    el.querySelector(".run-progress-title").title = title;
+    const redundant = title === kindLabel;
+    const titleEl = el.querySelector(".run-progress-title");
+    titleEl.textContent = redundant ? "" : title;
+    titleEl.title = redundant ? "" : title;
+    titleEl.hidden = redundant;
+    el.querySelector(".run-progress-sep").hidden = redundant;
 
     const phase = String(update.phase || "running");
+    // Paused is neither working nor finished, and three places need to agree
+    // on it: the dots (removed), the controls (Resume rather than Pause), and
+    // the phase label. Derived from the machine value, never from the label —
+    // `user_paused` is what a real pause puts here.
+    const paused = /paus/.test(phase);
     const pct =
       typeof update.progress === "number" && Number.isFinite(update.progress)
         ? ` ${Math.round(update.progress * 100)}%`
@@ -13539,7 +13715,15 @@
         : update.done
           ? (phase === "completed" || phase === "success" ? "done" : phase)
           : phase;
-    phaseEl.textContent = `· ${statusWord}${pct}`;
+    // Underscores are wire syntax. Most phases are single words, but the ones
+    // that arrive when a run ends badly are not — `budget_exceeded`,
+    // `budget_limited`, `accounting_incomplete` — and neither is the
+    // discriminator the parser falls back to when no phase field arrives at
+    // all. The machine value stays on `update.phase`, which the pause/resume
+    // test below still reads; this is only what the row shows.
+    // (src/run-progress.ts documents why this lives here and not there: the
+    // machine value has to survive the trip intact.)
+    phaseEl.textContent = `· ${String(statusWord).replace(/[_-]+/g, " ").trim()}${pct}`;
 
     const sub = el.querySelector(".run-progress-sub");
     if (update.subtitle) {
@@ -13562,20 +13746,44 @@
     el.classList.toggle("run-progress-cancelled", !!update.cancelled && !update.failed);
     el.classList.toggle("run-progress-done", !!update.done);
 
+    // How long this run has been going, in the row beside the phase.
+    //
+    // A workflow reports no completion fraction at all now (see
+    // src/run-progress.ts), so without this the row holds nothing that moves
+    // while one agent works for twenty minutes — and "still going" reads
+    // exactly like "wedged", which is half of #163. It is the same counter the
+    // waiting indicator uses, and it stops itself when the node is detached.
+    //
+    // Not armed while a loaded session is replaying: the only clock available
+    // there starts now, so a restored run would claim to have begun at the
+    // moment the conversation was opened. On `done` the interval stops and the
+    // last value stays as the run's duration.
+    const row = el.querySelector(".run-progress-row");
+    if (update.done) clearWaitElapsed(row);
+    else if (row && !row._waitTimer && !state.replaying) armWaitElapsed(row, "run-progress-elapsed");
+
     const dots = el.querySelector(".blink-dots");
-    if (update.done) {
+    // Not while paused, and this was the owner's sharpest observation on the
+    // real card: "the timer continued, then stopped. But the three blinking
+    // dots didn't." Three dots pulsing beside the word "paused" says the card
+    // does not believe its own label — the dots mean "working", and a paused
+    // run is the one state that is neither working nor finished. The clock
+    // above keeps running on purpose: wall-clock time really is still passing,
+    // and freezing it would need a second timebase we do not have.
+    if (update.done || paused) {
       if (dots) dots.remove();
     } else if (!dots) {
-      // Restarted (e.g. resume) — put dots back after the title.
-      const titleEl = el.querySelector(".run-progress-title");
-      if (titleEl) titleEl.insertAdjacentHTML("afterend", BLINK_DOTS);
+      // Restarted (e.g. resume) — put dots back where the template puts them,
+      // after the phase. Anchoring this on the title instead is what would
+      // quietly reintroduce the ellipsis ambiguity on resumed runs only.
+      const phaseAnchor = el.querySelector(".run-progress-phase");
+      if (phaseAnchor) phaseAnchor.insertAdjacentHTML("afterend", BLINK_DOTS);
     }
 
     // Workflow control buttons (pause/resume/stop) while running or paused.
     const actions = el.querySelector(".run-progress-actions");
     if (update.kind === "workflow" && update.displayName && !update.done) {
       actions.hidden = false;
-      const paused = /paus/.test(phase);
       actions.innerHTML = "";
       const mk = (label, action) => {
         const b = document.createElement("button");
@@ -14181,8 +14389,19 @@
   // state-keyed timer would stop counting a wait the user is still looking at.
   // It also stops itself once the node is detached, so any path that removes
   // the indicator — not just hideGrokking — cleans up.
-  function armWaitElapsed(el) {
-    el._waitStart = Date.now();
+  //
+  // `cls` names the span so a second caller can use the same timer without a
+  // second implementation: the run-progress card has the identical problem one
+  // level up (#163 — a workflow that sits on one number for an hour is
+  // indistinguishable from a dead one), and it wants the readout inside its own
+  // row rather than at the end of a label. An existing `_waitStart` is kept, so
+  // re-arming a node that is already counting continues its clock instead of
+  // restarting it — a resumed run has not been running for zero seconds.
+  function armWaitElapsed(el, cls) {
+    if (!el) return;
+    clearWaitElapsed(el);
+    const klass = cls || "grokking-elapsed";
+    if (!el._waitStart) el._waitStart = Date.now();
     // Painted at once and then every second, with NO threshold to cross.
     //
     // A delay was the first design and it was wrong twice over. It guaranteed
@@ -14197,10 +14416,10 @@
         clearWaitElapsed(el);
         return;
       }
-      let out = el.querySelector(".grokking-elapsed");
+      let out = el.querySelector("." + klass);
       if (!out) {
         out = document.createElement("span");
-        out.className = "grokking-elapsed";
+        out.className = klass;
         // The verb is already announced. A value that changes every second
         // would otherwise be read out every second.
         out.setAttribute("aria-hidden", "true");
@@ -14544,10 +14763,17 @@
     el.className = "card permission resolved perm-resolved";
     el.innerHTML = "";
     const line = document.createElement("div");
-    line.className = "perm-resolved-line perm-" + (kind === "reject_once" ? "rejected" : "allowed");
+    // ONE test drives both the colour and the word. They used to disagree: a
+    // host-answered card (#61) carries no options, so the kind is unknown here
+    // and the verb fell through to "Answered" while the class ternary landed on
+    // perm-allowed anyway -- a green line that would not say Allowed. The same
+    // split mislabelled a reject_always as allowed. `/reject|deny/i` is the
+    // test resolvePermissionCardEl already uses a few lines below.
+    const rejected = /reject|deny/i.test(String(kind || ""));
+    line.className = "perm-resolved-line perm-" + (rejected ? "rejected" : "allowed");
     const verb = document.createElement("span");
     verb.className = "perm-resolved-verb";
-    verb.textContent = PERM_VERB[kind] || "Answered";
+    verb.textContent = PERM_VERB[kind] || (rejected ? "Rejected" : "Allowed");
     line.appendChild(verb);
     const what = document.createElement("span");
     what.className = "perm-resolved-what";
@@ -18142,6 +18368,7 @@
         state.activeToolGroupEl = null;
         state.turnAgentActionsEl = null;
         state.turnEditsByToolCallId.clear();
+        state.turnDiffBaseline = null;
         state.turnDiffSummaryEl = null;
         // The host has just rebuilt the aggregate from the surviving ledger.
         // No completed-turn figure survives a rewind; when the whole transcript
@@ -18494,6 +18721,12 @@
         }
         addMessage("user", msg.text, msg.chips || [], { steer: msg.steer });
         forceScrollToBottom(); // jump back to the bottom on the user's own send (#16)
+        break;
+      case "turnDiffBaseline":
+        state.turnDiffBaseline = { turnId: msg.turnId, cwd: msg.cwd };
+        break;
+      case "turnFileDiffResult":
+        handleTurnFileDiffResult(msg);
         break;
       case "agentStart":
         // A user-initiated turn began. Show Grokking until content replaces it.
@@ -18854,7 +19087,11 @@
         break;
       case "permissionRequest":
         addPermissionCard(msg.req);
-        if (!state.replaying) {
+        // A card with no options cannot be answered, so nothing is waiting on
+        // anyone. A session-granted command (#61) arrives already resolved in
+        // one batch, and announcing a wait for it would be false on exactly the
+        // commands the grant exists to keep quiet.
+        if (!state.replaying && (msg.req.options || []).length > 0) {
           // Tool titles can expose commands or file operations. The accessibility
           // cue says what the user must do without reading tool details aloud.
           speakWaitingPrompt("Grok is waiting for your permission. Review the request and choose an option.");

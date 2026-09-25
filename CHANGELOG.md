@@ -1,5 +1,43 @@
 # Changelog
 
+## 4.9.0 — 2026-09-18
+
+**This release is about being asked less and being told more.** A turn that edited five files made you open five tool rows to see what happened to one of them; a permission card asked the same question forty times a session because answering "don't ask again" granted almost nothing; and a workflow reported its progress as a percentage that was really a count of agents spent. Each of those is a place where the app had the information and handed you something else.
+
+### Added
+
+- **See a whole turn's changes to one file, in one diff (#168).** The Changes summary on a finished turn now expands each file into a single diff covering everything the turn did to it, instead of one diff per edit spread across the tool rows. The baseline is taken the moment the turn starts, so it is what the file looked like before the agent touched it — not before its last edit. It works wherever the card does: the VS Code side bar, the desktop app, a browser and your phone.
+
+  Where a diff cannot be taken honestly, it is not taken at all. A folder that is not a git repository, a turn from a conversation you have reloaded, a project you switched away from between sending and clicking, a repository busy with another command — each of those falls back to the per-edit tool rows exactly as before, rather than showing you a diff of the wrong state.
+
+- **Stop being asked about a command you have already approved (#61, #123).** A terminal permission card now offers **"Yes, and allow this program this session"**, naming the program it would allow. Grant `npm` once and `npm test`, `npm run build` and `npm ci` stop asking for the rest of the conversation.
+
+  This is the part that was actually broken. The agent's own "don't ask again" remembers the **exact command string**, so approving `npm test -- users` does nothing for `npm test -- orders`; in a session where nearly every command differs by a path or a flag, nearly every one is a fresh question. That is why the setting felt like it was not working — it was working, on one string at a time.
+
+  The grant is deliberately narrow. It lasts for the conversation and is gone when it ends; nothing is granted until you grant it; a chained command is judged one segment at a time, so `npm test && rm -rf build` does not ride in on an `npm` grant; a command we cannot take apart with confidence still asks; and while you are in Plan mode nothing is auto-approved at all. Every command allowed this way still appears in the transcript as an answered card, because "it stopped asking" must never mean "I could not see what it did".
+
+  For a grant that outlives the conversation, the agent's own `[permission]` rules in `.grok/config.toml` take glob patterns and are enforced before the request ever reaches us.
+
+### Fixed
+
+- **The permission card asks one question with three answers, not four (#154).** It offered four rows of equal weight, two of which remembered your answer in ways that mostly did not help. Now: yes, yes-and-allow-this-program, no. The row that was removed is the one the two reports above are about — it promised to remember and remembered one exact string.
+
+- **Agent edits stop closing your open editor tabs (#167).** Opening the diff for a proposed change took VS Code's preview slot — the italic tab a single click in the Explorer produces — and whatever was sitting there was gone at that instant. It read as the agent closing your files; it never closed anything, it took the seat. The diff now opens as its own tab and never asks for that slot. (3.19.2 fixed the same report's other half, which is why it came back.)
+
+  One consequence worth knowing: a turn with many edits now leaves a diff tab each rather than reusing one. They close as you answer each card, so they only accumulate where cards go unanswered — which is the case where you wanted the tabs anyway.
+
+- **A workflow no longer reports how much of its budget it has spent as though it were progress (#163).** A deep-research or workflow run drew `agents used / agent budget` as a percentage, in the same place a Goal card draws real completion — so "2%" meant "one agent of fifty gone", and a run doing an hour of useful work inside a single agent sat at the same number the whole time. It now reads `3/50 agents`: the same fact, in a form that cannot be mistaken for a finish line. The card also shows elapsed time while a run is working, so a long quiet stretch is visibly *working* rather than possibly wedged.
+
+- **Pausing or stopping a workflow now changes the card that reports it.** Pause printed its confirmation and the card carried on as though nothing had happened: the button still said Pause, the phase still named the step it had stopped in, and the three dots kept pulsing beside a run that was no longer running. A run reports its lifecycle (`active`, paused, cancelled) separately from its position within that lifecycle, and the card was reading only the position — which a pause never changes. It now says **paused**, offers **Resume**, stops the dots, and keeps the step name on the line below, because where a paused run will resume from is worth knowing. A stopped run is marked ended and its controls are taken away.
+
+- **The run card says words, not the machine's vocabulary.** Labels like `phase_entered` and `user_paused` reached the card exactly as the CLI spells them internally. Anything it sends is now shown as ordinary English, including names we have never seen, and an event that only repeats what the card already says is dropped instead of printed twice. The liveness dots also moved off the end of the run's name, where they were indistinguishable from the "…" of a name too long to fit.
+
+- **Controls that could not work are no longer offered on a phone (#160).** An "open diff" on a tool row posted a request only a desk machine can answer, so on a phone or in a browser it did nothing at all — while the diff it would have opened was already on screen directly above it.
+
+- **A turn from a reloaded conversation explains itself instead of opening the wrong edit.** The per-turn diff baseline lives in memory and does not survive reloading the window, and those rows were quietly falling back to whichever single edit touched the file last — so a file the turn changed three times offered you the third change while the row's own `+/−` counts described all three. Those rows are now plain text, with a line at the bottom of the card saying the diffs are kept only while the session stays open. Hosts without per-turn baselines keep the behaviour they have always had, and say nothing.
+
+- **Waking your machine no longer strands the Changes view on a phone.** A reconnect snapshot that arrives before the machine has rebound its project reached the panel as "no project", which it read as a project *switch*: it left Changes for Folders, and the file diff you were reading was left saying "Reading the diff…" for a request that had died with the old connection and would never be asked again. The panel now keeps the project it had until a real one replaces it, and entering Changes re-reads the open diff the same way it already re-reads the file list.
+
 ## 4.8.0 — 2026-09-17
 
 **A project can now wear an icon, so you can find it without reading.** Colour told two projects apart; it could not say which was which, and a rail of six tinted folders is still six folders. Each project now carries a mark you choose, drawn everywhere the project is named.

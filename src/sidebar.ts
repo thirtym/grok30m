@@ -269,7 +269,7 @@ import {
   unreferencedUploadsForRemovedSessions,
 } from "./file-upload";
 import { MAX_DIFF_EXPAND_BYTES, expandDiffToWholeFile } from "./diff-view";
-import { applyAgentModeToHostPlan, effectivePlanActive, isPlanReviewPermission, permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, planReviewVerdictForOption, planTextFromPermissionToolCall, shouldRejectPermission } from "./plan-gate";
+import { applyAgentModeToHostPlan, commandProgramsForGrant, effectivePlanActive, isPlanReviewPermission, permissionAnswerAllowed, permissionOptionsForPlan, pickRejectOption, planReviewVerdictForOption, planTextFromPermissionToolCall, shouldRejectPermission } from "./plan-gate";
 import { appendPlanEntry, planRestoreSource, truncateResolvedAfter, countsAsUserBubble, decideRestoreState, isInterjectionText } from "./plan-restore";
 import {
   planReviewFileName,
@@ -291,7 +291,7 @@ import {
   resolveRemoteFileRoot,
   writeRemoteProjectFile,
 } from "./remote-files";
-import { GitRunGate, readGitFileDiff, readGitStatus, runGitPlan } from "./git-run";
+import { GitRunGate, captureGitTurnBaseline, readGitFileDiff, readGitTurnFileBefore, readGitStatus, runGitPlan, type GitTurnBaseline } from "./git-run";
 import { describeGitFailure, isKnownChangedPath, planGitOp } from "./git-status";
 import {
   isCloudEnvironment,
@@ -884,6 +884,8 @@ export class GrokSidebar {
    * describe a tree that no longer exists.
    */
   private readonly gitRunGate = new GitRunGate();
+  private readonly turnDiffBaselines = new Map<string, { root: string } & Partial<GitTurnBaseline>>();
+  private readonly pendingTurnDiffCaptures = new WeakSet<object>();
   /** Cold session/load claims the persisted id before ACP has emitted `session`. */
   private readonly sessionLoadReservations = new Map<string, SessionLoadReservation>();
   /** Sessions being spawned on a remote tab's behalf — a reconnect burst must
@@ -4208,9 +4210,51 @@ Only continue if you trust this code.`,
                   req.options.find((o) => o.kind === "allow_once");
       if (opt) { client.respondPermission(req.id, opt.optionId); return; }
     }
+    const execute = String(req.toolCall?.kind ?? "").toLowerCase() === "execute";
+    const command = (req.toolCall?.rawInput as { command?: unknown } | undefined)?.command;
+    const programs = execute && typeof command === "string"
+      ? commandProgramsForGrant(command, resolvedTerminalShellDialect()) : undefined;
+    const allowOnce = req.options.find((o) => o.kind === "allow_once");
+    // Every segment must be covered: an npm grant cannot smuggle in `&& rm`.
+    // is_background deliberately does not matter; it runs the same program.
+    if (!planActive && allowOnce && programs?.every((program) => session.allowedCommandPrograms.has(program))) {
+      if (client.respondPermission(req.id, allowOnce.optionId)) {
+        // The COMMAND, not `toolCall.title` -- grok's title for an execute card
+        // is often just "Shell", and what ran is the one thing this line exists
+        // to show. Reads after the collapsed card's verb, which is "Answered"
+        // because the card carries no option the renderer can name; nobody
+        // answered it, so the title is where the reason has to live too.
+        const title = `${command} — auto-approved for this session`;
+        session.pendingPermissions.set(req.id, createPendingPermission({
+          title, toolCallId: req.toolCall?.toolCallId, toolKind: req.toolCall?.kind,
+          options: [allowOnce],
+        }));
+        // Existing frames, delivered atomically. No actionable buttons or keyboard
+        // default, and no needs-you/human-wait transition, even for a remote.
+        this.emit(session, { type: "historyBatch", messages: [
+          { type: "permissionRequest", req: { ...req, toolCall: { ...req.toolCall, title }, options: [] } },
+          { type: "permissionResolved", requestId: req.id, optionId: allowOnce.optionId },
+        ] });
+        this.persistPermissionAnswer(session, req.id, allowOnce.optionId);
+        return;
+      }
+    }
+    // The card no longer offers "no, and never ask again"; execute cards also
+    // stop writing the CLI's exact-string grants (#123). The CLI and
+    // .grok/config.toml remain the route for either persistent policy.
+    const options = req.options.filter((o) => o.kind !== "reject_always" && (!execute || o.kind !== "allow_always"));
+    const ungranted = [...new Set(programs?.filter((program) => !session.allowedCommandPrograms.has(program)))];
+    let commandGrant;
+    if (allowOnce && ungranted.length > 0 && ungranted.length <= 3) {
+      // Namespacing plus a collision check keeps even an unfamiliar CLI id opaque.
+      let optionId = "grok-build:allow-command-session";
+      while (req.options.some((o) => o.optionId === optionId)) optionId += ":host";
+      commandGrant = { optionId, allowOnceId: allowOnce.optionId, programs: ungranted };
+      options.push({ optionId, kind: "allow_always", name: `Yes, and allow ${ungranted.map((p) => JSON.stringify(p)).join(", ")} this session` });
+    }
     // Remember it so the answer can be persisted for replay on resume.
     const visibleOptions = permissionOptionsForPlan(
-      req.options ?? [],
+      options,
       planActive,
       req.toolCall?.kind,
     );
@@ -4234,11 +4278,8 @@ Only continue if you trust this code.`,
       toolCallId: req.toolCall?.toolCallId,
       toolKind: req.toolCall?.kind,
       plan,
-      options: (req.options ?? []).map((o) => ({
-        optionId: o.optionId,
-        kind: o.kind,
-        name: o.name,
-      })),
+      options,
+      commandGrant,
     }));
     this.syncHumanWait(session);
     this.emit(session, {
@@ -9924,6 +9965,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.queueInFlightPlanCommentsOnExit(session, replacedClient, session.gen);
     }
     const gen = ++session.gen;
+    // Session objects can be reused for load/restart. Their grants cannot.
+    session.allowedCommandPrograms.clear();
     const testDelay = this.testSessionStartDelay;
     if (testDelay && testDelay.resumeId === resumeId) {
       this.testSessionStartDelay = undefined;
@@ -11501,7 +11544,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             session.planActive,
             pending.toolKind,
           )) break;
-          if (!session.client?.respondPermission(msg.requestId, msg.optionId)) break;
+          const grant = pending.commandGrant?.optionId === msg.optionId ? pending.commandGrant : undefined;
+          if (!session.client?.respondPermission(msg.requestId, grant?.allowOnceId ?? msg.optionId)) break;
+          if (grant) for (const program of grant.programs) session.allowedCommandPrograms.add(program);
           // Record the resolution in the session buffer so re-focusing this session
           // replays the card collapsed instead of active (the live collapse is a
           // webview-only DOM mutation that the buffer never captured).
@@ -12599,6 +12644,79 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         });
         break;
       }
+      case "turnFileDiff": {
+        const correlation = { requestId: msg.requestId, turnId: msg.turnId, cwd: msg.cwd, path: msg.path };
+        const reply = (body: Extract<HostMsg, { type: "turnFileDiffResult" }>) => {
+          if (requester) this.sendRemoteRequester(requester, body);
+          else this.post(body);
+        };
+        const fail = (reason: string) => reply({ type: "turnFileDiffResult", ...correlation, ok: false, reason });
+        const rootResult = this.resolveGitRoot(msg.cwd, origin, clientId);
+        if (!rootResult.ok) { fail(rootResult.reason); break; }
+        const baseline = this.turnDiffBaselines.get(msg.turnId);
+        if (!baseline?.sha || !pathsEqual(baseline.root, rootResult.root)) {
+          fail("This turn's diff is no longer available.");
+          break;
+        }
+        const baselineBlob = baseline.untracked?.get(msg.path);
+        let untracked = false;
+        if (!baselineBlob) {
+          // Paths absent from the host's blob map still need the live fence.
+          // A mapped path is already known: staging cannot change its base,
+          // and deletion must reach hash-object's ordinary failure response.
+          const status = await readGitStatus(rootResult.root);
+          if (!status.ok) { fail(status.reason); break; }
+          if (!isKnownChangedPath(status.snapshot, msg.path)) {
+            fail("That file is no longer changed. Refresh and try again.");
+            break;
+          }
+          untracked = status.snapshot.files.find((file) => file.path === msg.path)?.status === "?";
+        }
+        const diff = await readGitFileDiff(rootResult.root, msg.path, baselineBlob
+          ? { baselineBlob } : { baseline: baseline.sha, untracked });
+        if (!diff.ok) { fail(diff.reason); break; }
+        reply({ type: "turnFileDiffResult", ...correlation, ok: true, patch: diff.patch, truncated: diff.truncated });
+        break;
+      }
+      case "turnFileOpenDiff": {
+        const fail = (text: string) => this.post({ type: "error", text });
+        const rootResult = this.resolveGitRoot(msg.cwd, origin, clientId);
+        if (!rootResult.ok) { fail(rootResult.reason); break; }
+        const baseline = this.turnDiffBaselines.get(msg.turnId);
+        if (!baseline?.sha || !pathsEqual(baseline.root, rootResult.root)) {
+          fail("This turn's diff is no longer available.");
+          break;
+        }
+        const baselineBlob = baseline.untracked?.get(msg.path);
+        if (!baselineBlob) {
+          // Keep turnFileDiff's mapped-blob-or-live fence: staging a mapped
+          // file cannot revoke its baseline; other paths need fresh status.
+          const status = await readGitStatus(rootResult.root);
+          if (!status.ok) { fail(status.reason); break; }
+          if (!isKnownChangedPath(status.snapshot, msg.path)) {
+            fail("That file is no longer changed. Refresh and try again.");
+            break;
+          }
+        }
+        const before = await readGitTurnFileBefore(rootResult.root, msg.path, { sha: baseline.sha, untracked: baseline.untracked });
+        if (!before.ok) { fail(before.reason); break; }
+        const after = this.readTurnAfterSide(path.join(rootResult.root, msg.path));
+        if (after === undefined) {
+          // There is no region fallback here. A file we may not read, or one
+          // too big to hold twice, must not masquerade as a whole-file
+          // deletion in a review tab -- a real deletion is answered above.
+          fail("The current file could not be read for a diff. It may be too large.");
+          break;
+        }
+        // The turnId is a randomUUID, so naming it here would spend 36
+        // characters of tab label on something no human can read, and push the
+        // filename out of the visible width -- losing the one word that says
+        // which tab this is. The price is that two tabs from different turns on
+        // one file look alike in the tab bar; their contents do not.
+        await this.openDiffTexts(session, msg.path, before.text, after,
+          `Turn diff: ${path.basename(msg.path)}`);
+        break;
+      }
       case "gitRun": {
         const correlation = typeof msg.requestId === "string" ? { requestId: msg.requestId } : {};
         const op = msg.op;
@@ -12682,6 +12800,34 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
     }
 
+  }
+
+  private startTurnDiffBaseline(session: Session, turn: object): void {
+    const root = this.sessionCwd(session);
+    const turnId = randomUUID();
+    const baseline: { root: string } & Partial<GitTurnBaseline> = { root };
+    this.turnDiffBaselines.set(turnId, baseline);
+    // Bound both completed and pending turns. Eviction must never resurrect on completion.
+    if (this.turnDiffBaselines.size > 100) {
+      this.turnDiffBaselines.delete(this.turnDiffBaselines.keys().next().value!);
+    }
+    this.emit(session, { type: "turnDiffBaseline", turnId, cwd: root });
+    // Skip a busy repo rather than queue a snapshot of a later working tree.
+    if (!this.gitRunGate.tryAcquire(root)) return;
+    const gen = session.gen;
+    this.pendingTurnDiffCaptures.add(turn);
+    void captureGitTurnBaseline(root).then((captured) => {
+      if (session.gen === gen && session.turnToken === turn
+        && this.pendingTurnDiffCaptures.has(turn) && this.turnDiffBaselines.get(turnId) === baseline) {
+        baseline.sha = captured?.sha;
+        baseline.untracked = captured?.untracked;
+      }
+    }).catch(() => {
+      // Capture is best effort; an unavailable baseline keeps the tool-row path.
+    }).finally(() => {
+      this.pendingTurnDiffCaptures.delete(turn);
+      this.gitRunGate.release(root);
+    });
   }
 
   /**
@@ -15713,7 +15859,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     replaceAll?: boolean,
     sites?: { oldText: string; newText: string; oldLine?: number; newLine?: number }[],
   ): Promise<void> {
-    const base = path.basename(filePath);
     // grok's diff block carries only the replaced region, which opens as a
     // context-free two-line tab. Expand it against the file on disk so the tab
     // shows the whole file and lands on the change (#66); a pending permission
@@ -15726,26 +15871,64 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       replaceAll,
       sites,
     });
+    await this.openDiffTexts(session, filePath, sides.oldText, sides.newText,
+      `Grok proposed: ${path.basename(filePath)}`, sides.firstChangedLine, requestId);
+  }
+
+  // Both callers own complete sides at this point. Turn diffs must bypass
+  // region expansion (and its second disk read), and carry no permission id:
+  // their tabs belong to the user, not a card's automatic cleanup lifecycle.
+  private async openDiffTexts(
+    session: Session,
+    filePath: string,
+    oldText: string,
+    newText: string,
+    title: string,
+    at = 0,
+    requestId?: number | string,
+  ): Promise<void> {
+    const base = path.basename(filePath);
     // Unique key per diff so sequential edits to the same file don't collide on
     // the content map. The trailing real filename gives VS Code the language.
     const key = String(this.diffSeq++);
     const left = Uri.from({ scheme: GROK_DIFF_SCHEME, path: `/${key}/before/${base}` });
     const right = Uri.from({ scheme: GROK_DIFF_SCHEME, path: `/${key}/after/${base}` });
-    this.diffProvider.set(left, sides.oldText);
-    this.diffProvider.set(right, sides.newText);
+    this.diffProvider.set(left, oldText);
+    this.diffProvider.set(right, newText);
     if (requestId !== undefined) {
       // Auto-open is per pending permission; remember the URIs so the matching
       // tab can be closed (and its content dropped) once the user decides (#21).
       const stale = this.openDiffsByRequest.set(session, requestId, { left, right });
       if (stale) this.closeDiffUris(stale);
     }
-    // preview:true reuses a single preview tab across grok's many small sequential
-    // edits; preserveFocus:true keeps focus on the chat so the permission card is
+    // preview:false, and the `false` is the fix for #167 — *"agent edits
+    // unexpectedly close open editor tabs"*.
+    //
+    // It used to be true, to reuse one preview tab across grok's many small
+    // sequential edits. But VS Code keeps exactly ONE preview slot per editor
+    // group — the italic tab a single click in the Explorer produces — so this
+    // diff took that slot and its occupant was gone at that instant.
+    // `closeDiffTabs` then destroyed our diff when the card was answered, and
+    // that part is correctly guarded (both sides must be `grok-diff:` URIs), so
+    // we never closed the user's file. We took its seat and then burned the
+    // chair, which is indistinguishable from the outside.
+    //
+    // It is also why the report read as intermittent: it needs a single-clicked
+    // tab (a double-clicked, edited or pinned one is never in the preview slot)
+    // AND a turn that emits a permission card — under auto-accept we return
+    // before a card exists and never open this at all. Same family as #132,
+    // fixed in 3.19.2, which stopped the diff RE-OPENING and left this untouched.
+    //
+    // The price, so it is not rediscovered: a turn with many edits now leaves a
+    // tab each instead of reusing one. `closeDiffTabs` removes each as its card
+    // is answered, so they only accumulate where cards go unanswered — which is
+    // the case where you wanted the tabs anyway.
+    //
+    // preserveFocus:true keeps focus on the chat so the permission card is
     // immediately clickable. `selection` opens a whole-file diff on the edit
     // instead of at line 1 (#66) — harmless at 0 when expansion fell back.
-    const at = sides.firstChangedLine;
-    await this.host.openDiff(left, right, `Grok proposed: ${base}`, {
-      preview: true,
+    await this.host.openDiff(left, right, title, {
+      preview: false,
       preserveFocus: true,
       selection: {
         start: { line: at, character: 0 },
@@ -15755,10 +15938,30 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /**
-   * The file's current content, for whole-file diff expansion (#66). Undefined
-   * when it can't be read — a create whose file doesn't exist yet, a file
-   * deleted since, or one too big to hold twice — which leaves the diff at the
-   * region-only fallback rather than failing the open.
+   * The after side of a turn diff. A path the turn DELETED has no current
+   * content, and that is the diff rather than a failure: the before side comes
+   * from the baseline, so the tab can honestly show every line removed. Without
+   * this the native tab failed on every Deleted row -- the one shape where a
+   * 400-line inline cap makes the escape hatch necessary rather than optional.
+   *
+   * The split matters because {@link readFileForDiff} collapses three outcomes
+   * into one `undefined`: gone, too big to hold twice, and refused by desktop
+   * containment. Only the first may read as empty. A file nobody is allowed to
+   * read must still refuse, which is why the existence test comes first and the
+   * policy check stays inside the read.
+   */
+  private readTurnAfterSide(filePath: string): string | undefined {
+    if (!fs.existsSync(filePath)) return "";
+    return this.readFileForDiff(filePath);
+  }
+
+  /**
+   * The file's current content, for native diff readers. Undefined
+   * when it can't be read — a create whose file doesn't exist yet, or one too
+   * big to hold twice — which leaves the diff at the region-only fallback for a
+   * per-edit preview (#66). A turn diff has no trustworthy region to fall back
+   * to: it answers a deletion through {@link readTurnAfterSide} and reports
+   * only a genuinely failed read.
    */
   private readFileForDiff(filePath: string): string | undefined {
     try {
@@ -16621,6 +16824,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // The token, not the status, is what says a turn is running from here on —
     // and only whoever holds it may end this one.
     const turn = beginTurn(session);
+    this.startTurnDiffBaseline(session, turn);
     this.setStatus(session, "working");
     // The send IS the activity — the rail should not wait ~2s for the CLI to
     // write a transcript before admitting you are working in this conversation.
@@ -16824,6 +17028,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // The resend is a turn in its own right — it gets its own token, and the
     // outer turn's `finally` can no longer end it (the tokens differ).
     const turn = beginTurn(session);
+    this.startTurnDiffBaseline(session, turn);
     this.setStatus(session, "working");
     session.adapterTurnCallUsed = [];
     try {
@@ -17021,6 +17226,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // metadata preload; every other host keeps the lazy default.
         servesMediaRanges: this.host.canServeMediaRanges,
         showInFolder: this.host.canShowInFolder,
+        // Not a host-kind capability: every host running THIS code captures
+        // turn baselines. It is a host-VERSION fact, and the only client that
+        // can disagree with its host about it is a remote (see protocol.ts).
+        turnDiffBaselines: true,
         // OPT-IN: desktop only. View all / proposed diffs open the in-app
         // overlay instead of a host editor or bare window. Remotes never
         // receive this (DESK_ONLY_CAPABILITIES).
@@ -17881,6 +18090,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * focused one, so this is behaviorally identical to `post`.)
    */
   private emit(session: Session, message: HostMsg): void {
+    // A capture still running when tools start may already contain their writes.
+    // Prefer the tool-row fallback to presenting that as the pre-turn file.
+    if (session.turnToken && (message.type === "toolCall" || message.type === "toolCallUpdate"
+      || message.type === "permissionRequest")) this.pendingTurnDiffCaptures.delete(session.turnToken);
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (message.type === "clearMessages") session.buffer = [];
     else if (!GrokSidebar.TRANSIENT_TYPES.has(message.type)) session.buffer.push(message);

@@ -2675,6 +2675,20 @@ body.thinking-hidden .msg.thinking { display: none; }
   white-space: nowrap;
 }
 .run-progress-card .run-progress-phase { flex: none; opacity: 0.85; }
+/* The liveness dots sit after the phase (see the template in chat.js) and must
+   not shrink: a squashed set of three reads as a rendering fault, and the row
+   has the title's ellipsis to give away instead. */
+.run-progress-card .run-progress-row .blink-dots { flex: none; }
+/* The run's elapsed time. Tabular figures so the row does not twitch once a
+   second, and last in the row so it never pushes the phase off a narrow
+   phone. Same treatment as .grokking-elapsed — it is the same readout. */
+.run-progress-card .run-progress-elapsed {
+  flex: none;
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.92em;
+  opacity: 0.75;
+}
 .run-progress-card .run-progress-sub,
 .run-progress-card .run-progress-detail {
   margin-top: 3px;
@@ -2998,6 +3012,10 @@ body.vscode-light {
   flex-direction: column;
   gap: 2px;
 }
+.turn-file-diff {
+  min-width: 0;
+  margin: 4px 0 8px;
+}
 .turn-diff-file {
   /* letter · path · stat. A grid rather than the old space-between flex, so
      the status letters make a column of their own and the paths start on one
@@ -3088,8 +3106,24 @@ button.turn-diff-file.has-diff:focus-visible {
    is right — it is the card's one action that leaves the card, and the rows
    are quiet enough that a small secondary button does not shout over them. */
 .turn-diff-summary-foot {
+  /* A column since the reload note joined the button here: the note is a
+     sentence and the button is 26px tall, so side by side the sentence would
+     wrap around a control it is not about. `flex-start` keeps the button its
+     own width rather than stretching it the width of the card. */
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
   margin-top: 8px;
+}
+/* Padded to the file rows' own 6px rather than to the paths inside them: the
+   note is about the rows collectively, not about any one path. No font-size of
+   its own either — `.turn-diff-summary` is already 0.92em, so borrowing
+   `.tool-diff-more`'s 0.92em (written for a full-size tool row) would compound
+   to 0.85 and make the explanation the smallest text on screen. */
+.turn-diff-summary-note {
+  padding: 0 6px;
+  color: var(--vscode-descriptionForeground);
 }
 .turn-diff-open-changes {
   min-height: 26px;
@@ -4561,8 +4595,11 @@ body.dragging { outline: 2px dashed var(--vscode-focusBorder); outline-offset: -
 .card-actions button.primary { font-weight: 600; }
 .card-actions button.danger {
   color: var(--vscode-errorForeground);
+  /* The gap sets No apart from the Yeses. There is no border-top here because
+     the button above already draws its own border-bottom, and the two together
+     rendered as TWO rules 10px apart -- one closing the allow group and one
+     opening this button. Visible with four options, obvious at three. */
   margin-top: 10px;
-  border-top: 1px solid var(--vscode-editorWidget-border);
 }
 .card-actions button.danger.arming { pointer-events: none; }
 .card-actions button:disabled { opacity: 0.4; cursor: default; }
