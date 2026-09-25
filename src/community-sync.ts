@@ -14,7 +14,7 @@ export const COMMUNITY_RELEASES_PAGE =
  * Community tag last merged into Grok30m. The auto-sync Action rewrites this
  * in the same commit that merges the tag.
  */
-export const COMMUNITY_BASE_VERSION = "4.8.0";
+export const COMMUNITY_BASE_VERSION = "4.9.0";
 
 export const COMMUNITY_NOTICE_STATE_KEY = "grok30m.communityBehindNoticed";
 
