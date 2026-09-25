@@ -512,7 +512,8 @@ import { authorizeMcpConnectorOAuth, ownedMcpOAuthClient, writeOAuthClientInfoFi
 // imported above. See that file for why.
 
 const SESSION_META_KEY = "grok.sessionMeta";
-const PROVIDER_CONNECTIONS_KEY = "grok.providerConnections";
+// Older booleans included silent credential-probe promotions. Never import them.
+const PROVIDER_CONNECTIONS_KEY = "grok.providerConnections.v2";
 const PROVIDER_MODEL_CACHE_KEY = "grok.providerModelCache";
 const PROJECT_PROVIDER_DEFAULTS_KEY = "grok.projectProviderDefaults";
 const REPO_PINS_KEY = "grok.repoPins";
@@ -802,6 +803,8 @@ export class GrokSidebar {
   private adapterHistoryQueue = new Map<AcpProvider, Promise<void>>();
   private codexInstallAbort?: AbortController;
   private providerConnectionState: ProviderConnections = {};
+  private providerRuns = new Map<AcpProvider, AbortController>();
+  private providerLoginAttempts = new Map<AcpProvider, AbortController>();
   /**
    * Bounds on the live-session pool (see session-pool.ts). A backgrounded session
    * idle past {@link IDLE_TTL_MS}, or beyond the {@link MAX_LIVE_SESSIONS} LRU cap,
@@ -1069,7 +1072,6 @@ export class GrokSidebar {
     "remoteSignIn",
     "unlinkRemoteDevice",
   ]);
-  private readonly loginReprobeTimers = new Map<AcpProvider, ReturnType<typeof setTimeout>>();
   /** Headless sign-ins in flight, one per provider, with the remote client that
    *  asked. Keyed by provider rather than by client because the CREDENTIAL is
    *  per-provider: two phones both connecting Grok want one flow and one code,
@@ -1611,6 +1613,26 @@ export class GrokSidebar {
     return this.providerConnectionState;
   }
 
+  private hasProviderConsent(provider: AcpProvider): boolean {
+    return this.providerConnections()?.[provider] === true;
+  }
+
+  /** A disconnect permanently invalidates work begun under the old consent. */
+  private providerRunSignal(provider: AcpProvider): AbortSignal {
+    if (!this.hasProviderConsent(provider)) return AbortSignal.abort();
+    const runs = this.providerRuns ??= new Map();
+    let controller = runs.get(provider);
+    if (!controller) runs.set(provider, controller = new AbortController());
+    return controller.signal;
+  }
+
+  private execProviderCli(provider: AcpProvider, cliPath: string, args: readonly string[],
+    options: Parameters<typeof execGrokCli>[2] = {}): ReturnType<typeof execGrokCli> {
+    const signal = this.providerRunSignal(provider);
+    if (signal.aborted) return Promise.reject(new Error(`${providerDisplayName(provider)} is not connected.`));
+    return execGrokCli(cliPath, args, { ...options, signal });
+  }
+
   /** Session-start snapshot of `grok.acp.*` timeouts (#117). */
   private acpClientTimeouts() {
     const cfg = this.host.getConfiguration("grok");
@@ -1751,19 +1773,7 @@ export class GrokSidebar {
   private migrateProviderConnections(): ProviderConnections {
     const existing = this.state.get<ProviderConnections>(PROVIDER_CONNECTIONS_KEY);
     if (existing !== undefined) return existing;
-    const home = resolveGrokHome(process.env);
-    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-    const configured = !!this.host.getConfiguration("grok").get<string>("cliPath", "").trim();
-    const usedBefore = configured || Object.keys(overrides).length > 0 || [
-      path.join(home, "auth.json"),
-      path.join(home, "config.toml"),
-      path.join(home, "sessions"),
-    ].some((candidate) => fs.existsSync(candidate));
-    const migrated: ProviderConnections = {
-      grok: usedBefore && !!this.locateProvider("grok"),
-      codex: false,
-      claude: false,
-    };
+    const migrated: ProviderConnections = {};
     void this.state.update(PROVIDER_CONNECTIONS_KEY, migrated);
     return migrated;
   }
@@ -1772,6 +1782,14 @@ export class GrokSidebar {
     const current = this.providerConnections();
     if (!connected || !current[provider]) this.invalidateSubscriptionUsage(provider);
     this.providerConnectionState = { ...current, [provider]: connected };
+    if (!connected) {
+      this.providerRuns?.get(provider)?.abort();
+      this.providerRuns?.delete(provider);
+      this.providerLoginAttempts?.get(provider)?.abort();
+      this.providerLoginAttempts?.delete(provider);
+      this.deviceLogins?.get(provider)?.handle.cancel();
+      this.deviceLogins?.delete(provider);
+    }
     if (!connected && usesAdapterHistory(provider)) {
       const history = this.adapterHistory(provider);
       history?.cache.clear();
@@ -1783,7 +1801,15 @@ export class GrokSidebar {
       history?.at.clear();
     }
     this.postProviderState();
-    if (connected) void this.probeProviderVersion(provider);
+    // Consent is recorded above, so this is now a plain local `--version` read:
+    // the chain that used to make it expensive (probe -> refreshModelsIfCliChanged
+    // -> a full ACP session) is broken, and refreshModelsIfCliChanged is called
+    // explicitly by the two callers that want a catalog. Without it a freshly
+    // connected agent shows no version until the next Providers refresh, and
+    // the version is what decides `updateAvailable`.
+    // Advisory: a `--version` read must never escape as an unhandled
+    // rejection on the connect path.
+    if (connected) void this.probeProviderVersion(provider).catch(() => {});
   }
 
   private async persistProviderConnections(): Promise<void> {
@@ -1842,12 +1868,17 @@ export class GrokSidebar {
   }
 
   private async warmConnectedCodexModels(): Promise<boolean> {
+    if (!this.hasProviderConsent("codex")) return false;
+    const signal = this.providerRunSignal("codex");
     const cliPath = this.locateProvider("codex");
     if (!cliPath) return false;
     try {
       await warmCodexModelCache({
         cliPath,
-        onModels: (models, currentModelId) => this.cacheProviderModels("codex", models, currentModelId),
+        signal,
+        onModels: (models, currentModelId) => {
+          if (!signal.aborted) return this.cacheProviderModels("codex", models, currentModelId);
+        },
         log: (message) => this.host.appendLine(message),
         // Codex answered "Internal error" for a session in a bare temp dir on
         // Windows, so the cache never filled and a freshly connected Codex was
@@ -1855,9 +1886,11 @@ export class GrokSidebar {
         // workspace is the cwd a real session uses, so it is known to work.
         fallbackCwd: this.workspaceRoot() || undefined,
       });
+      if (signal.aborted) return false;
       this.setProviderNeedsLogin("codex", false);
       return true;
     } catch (error) {
+      if (signal.aborted) return false;
       this.host.appendLine(`[codex] model-cache warm-up failed: ${(error as Error).message}`);
       // The warm-up is the first thing that talks to the agent after a connect,
       // so its failure is the earliest honest answer about the credentials —
@@ -1878,12 +1911,17 @@ export class GrokSidebar {
   }
 
   private async warmConnectedClaudeModels(): Promise<boolean> {
+    if (!this.hasProviderConsent("claude")) return false;
+    const signal = this.providerRunSignal("claude");
     const cliPath = this.locateProvider("claude");
     if (!cliPath) return false;
     try {
       await warmClaudeModelCache({
         cliPath,
-        onModels: (models, currentModelId) => this.cacheProviderModels("claude", models, currentModelId),
+        signal,
+        onModels: (models, currentModelId) => {
+          if (!signal.aborted) return this.cacheProviderModels("claude", models, currentModelId);
+        },
         log: (message) => this.host.appendLine(message),
         // Same refusal Codex saw: `session/new` answering "Internal error" for
         // a session in a bare temp directory on Windows, so the cache never
@@ -1891,9 +1929,11 @@ export class GrokSidebar {
         // the cwd a real session uses, so it is known to work.
         fallbackCwd: this.workspaceRoot() || undefined,
       });
+      if (signal.aborted) return false;
       this.setProviderNeedsLogin("claude", false);
       return true;
     } catch (error) {
+      if (signal.aborted) return false;
       this.host.appendLine(`[claude] model-cache warm-up failed: ${(error as Error).message}`);
       if (isClaudeCredentialError(error)) {
         this.setProviderNeedsLogin("claude", true);
@@ -1912,6 +1952,8 @@ export class GrokSidebar {
   /** Explicit credential observation. Unlike history refresh this never obeys
    * the listing freshness clock, so a completed sign-in is visible at once. */
   private async reprobeProviderCredentials(provider: AcpProvider): Promise<boolean> {
+    if (!this.hasProviderConsent(provider)) return false;
+    const signal = this.providerRunSignal(provider);
     // MSP exposes no credential-status operation. A catalog read cannot prove sign-in.
     if (provider === "muse") return false;
     if (provider === "codex" || provider === "claude") {
@@ -1936,6 +1978,7 @@ export class GrokSidebar {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "grok-cred-probe-"));
     const envCwd = this.workspaceRoot() || scratch;
     const client = new AcpClient({
+      signal: this.providerRunSignal("grok"),
       cliPath,
       cwd: scratch,
       env: this.buildEnv(envCwd),
@@ -1944,10 +1987,13 @@ export class GrokSidebar {
     });
     try {
       await client.start();
+      if (signal.aborted) return false;
       await client.newSession();
+      if (signal.aborted) return false;
       this.setProviderNeedsLogin("grok", false);
       return true;
     } catch (error) {
+      if (signal.aborted) return false;
       this.host.appendLine(`[grok] credential re-probe failed: ${errorDetail(error)}`);
       if (client.isCredentialError(error) || isCredentialError(error)) {
         this.setProviderNeedsLogin("grok", true);
@@ -1979,7 +2025,9 @@ export class GrokSidebar {
     provider: AcpProvider,
     cliPath: string,
     clientId?: string,
+    opts: { remote: boolean } = { remote: true },
   ): Promise<void> {
+    if (!this.hasProviderConsent(provider)) return;
     const displayName = providerDisplayName(provider);
     // The entry is created before the runner so `send` reads the CURRENT
     // client off it: a phone that visits the vendor's code page and comes
@@ -2097,6 +2145,11 @@ export class GrokSidebar {
       this.host.appendLine(`[${provider}] device login restarted by an explicit press`);
     }
 
+    const attempts = this.providerLoginAttempts ??= new Map();
+    attempts.get(provider)?.abort();
+    const attempt = new AbortController();
+    attempts.set(provider, attempt);
+    const signal = attempt.signal;
     send({ status: "starting" });
     this.host.appendLine(`[${provider}] device login started`);
     // Before the CLI is even spawned: the window that kills these flows opens
@@ -2111,12 +2164,18 @@ export class GrokSidebar {
     let handle: DeviceLoginHandle | undefined;
     handle = runDeviceLogin(cliPath, plan.args, {
       onPrompt: (prompt) => {
+        if (signal.aborted || !this.hasProviderConsent(provider)) return;
         send({
           status: "waiting",
           url: prompt.url,
           code: prompt.code,
           ...(prompt.needsCode ? { needsCode: true } : {}),
         });
+        if (!opts.remote && provider === "muse") {
+          void Promise.resolve(this.host.openExternal(prompt.url)).catch(() => {
+            // The card retains the URL if the OS cannot launch a browser.
+          });
+        }
       },
       onDone: (result) => {
         settled = true;
@@ -2129,6 +2188,10 @@ export class GrokSidebar {
         // Cancellation arrives here too (runDeviceLogin settles `cancelled`),
         // so this covers the cancel path without the handler knowing the token.
         if (!result.ok) this.endDeviceLoginWork(workId);
+        if (signal.aborted || !this.hasProviderConsent(provider)) {
+          this.endDeviceLoginWork(workId);
+          return;
+        }
         const elapsed = Math.round((Date.now() - startedAt) / 1000);
         if (!result.ok && "cancelled" in result) {
           // Every settle leaves a line. The first real cloud test needed
@@ -2148,7 +2211,7 @@ export class GrokSidebar {
           // during a silent 30s probe was the owner's very first retest note.
           send({ status: "verifying" });
           void this.confirmDeviceLogin(provider, send, displayName, workId,
-            () => ({ clientId: entry.clientId, tabToken: entry.tabToken }));
+            () => ({ clientId: entry.clientId, tabToken: entry.tabToken }), signal);
           return;
         }
         this.host.appendLine(`[${provider}] device login failed (${result.failure}) after ${elapsed}s: ${result.output.slice(-2000)}`);
@@ -2221,9 +2284,10 @@ export class GrokSidebar {
     displayName: string,
     workId: number,
     currentClient: () => { clientId?: string; tabToken?: string },
+    signal: AbortSignal,
   ): Promise<void> {
     try {
-      await this.confirmDeviceLoginInner(provider, send, displayName, currentClient);
+      await this.confirmDeviceLoginInner(provider, send, displayName, currentClient, signal);
     } finally {
       // One door out, whatever happened above — and only this operation's.
       this.endDeviceLoginWork(workId);
@@ -2235,11 +2299,15 @@ export class GrokSidebar {
     send: (device: Extract<HostMsg, { type: "onboarding" }>["device"]) => void,
     displayName: string,
     currentClient: () => { clientId?: string; tabToken?: string } = () => ({}),
+    signal: AbortSignal = this.providerRunSignal(provider),
   ): Promise<void> {
     const delays = [0, 2_000, 5_000, 10_000, 20_000];
     for (const delay of delays) {
       if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-      if (await this.deviceLoginCredentialReady(provider)) {
+      if (signal.aborted || !this.hasProviderConsent(provider)) return;
+      const ready = await this.deviceLoginCredentialReady(provider);
+      if (signal.aborted || !this.hasProviderConsent(provider)) return;
+      if (ready) {
         this.host.appendLine(`[${provider}] device login: credential verified`);
         // Say it about the needs-login flag too, and not only about `connected`.
         // For grok and codex this is a no-op -- `reprobeProviderCredentials`
@@ -2256,11 +2324,6 @@ export class GrokSidebar {
         // and (since the flag is also what re-arms auth recovery) the next send
         // reuses the process built on the dead token. A refresh does not fix it.
         this.setProviderNeedsLogin(provider, false);
-        // Promote on evidence, exactly as the Providers refresh does. The probe
-        // just proved the account works; without this the persisted `connected`
-        // flag stays false, so Settings keeps offering Connect and never offers
-        // Sign out for an account that is plainly signed in (owner, 2026-08-31).
-        await this.setProviderConnected(provider, true);
         send({ status: "done" });
         // The same follow-through Settings' "Check again" runs. Promoting the
         // account is not the job — putting an agent on the screen that just
@@ -2315,11 +2378,14 @@ export class GrokSidebar {
    * Any later authentication failure uses the normal needs-login path.
    */
   private async deviceLoginCredentialReady(provider: AcpProvider): Promise<boolean> {
+    if (!this.hasProviderConsent(provider)) return false;
+    const signal = this.providerRunSignal(provider);
     if (provider === "muse") return this.providerCredentialFilePresent(provider);
     if (provider === "claude") {
       const cliPath = this.locateProvider("claude");
       if (!cliPath) return false;
       const loggedIn = await probeClaudeAuthStatus(cliPath);
+      if (signal.aborted) return false;
       if (loggedIn === true) return true;
       if (loggedIn === false) return false;
       return this.reprobeProviderCredentials(provider);
@@ -2348,26 +2414,54 @@ export class GrokSidebar {
   /** Stop every headless sign-in. Called on dispose so a child polling a device
    *  endpoint does not outlive the window that started it. */
   private cancelAllDeviceLogins(): void {
+    for (const attempt of this.providerLoginAttempts?.values() ?? []) attempt.abort();
+    this.providerLoginAttempts?.clear();
     for (const { handle } of this.deviceLogins.values()) handle.cancel();
     this.deviceLogins.clear();
     this.githubDeviceLogin?.handle?.cancel();
     this.githubDeviceLogin = undefined;
   }
 
+  private loginReprobeTimers = new Map<AcpProvider, ReturnType<typeof setTimeout>>();
+
   /** Observe an interactive terminal login without requiring a reload. Terminal
    * APIs do not expose CLI completion portably, so retry on a short bounded
-   * cadence and stop at the first authenticated probe. */
+   * cadence and stop at the first authenticated probe.
+   *
+   * REMOVED IN 4.11.1 AND RESTORED THE SAME DAY. #171 says we never run an
+   * agent the person has not connected, and this ladder was read as exactly
+   * the speculative polling that rule forbids. It is not. It starts only from
+   * the Connect press, one line after consent is recorded, and every probe it
+   * makes goes through `reprobeProviderCredentials`, which returns false
+   * without consent and runs under `providerRunSignal` — so disconnecting
+   * mid-ladder aborts it. It observes work the person just asked for, which is
+   * the one honest job a probe has.
+   *
+   * What its absence cost, measured on the owner's desk: a finished terminal
+   * sign-in was noticed by nothing, so Grok, Codex and Claude each sat showing
+   * their Connect button until Re-check was pressed by hand. Cloud and Muse
+   * were unaffected and that is the tell — both verify through
+   * `confirmDeviceLogin`, and the desk terminal is the only path with no
+   * completion signal of its own. */
   private watchProviderLogin(provider: AcpProvider): void {
-    const previous = this.loginReprobeTimers.get(provider);
+    // `??=` for the same reason as `providerRuns`: prototype-built test hosts
+    // skip field initializers.
+    const timers = this.loginReprobeTimers ??= new Map();
+    const previous = timers.get(provider);
     if (previous) clearTimeout(previous);
     const delays = [0, 2_000, 5_000, 10_000, 20_000, 30_000, 60_000];
     const attempt = async (index: number): Promise<void> => {
-      this.loginReprobeTimers.delete(provider);
-      if (await this.reprobeProviderCredentials(provider)) return;
+      timers.delete(provider);
+      if (!this.hasProviderConsent(provider)) return;
+      // A probe that throws is "not signed in yet", never an unhandled
+      // rejection: this runs detached, so nothing else would catch it.
+      let signedIn = false;
+      try { signedIn = await this.reprobeProviderCredentials(provider); } catch { /* next rung */ }
+      if (signedIn) return;
       const delay = delays[index + 1];
       if (delay === undefined) return;
       const timer = setTimeout(() => void attempt(index + 1), delay);
-      this.loginReprobeTimers.set(provider, timer);
+      timers.set(provider, timer);
     };
     void attempt(0);
   }
@@ -2479,10 +2573,9 @@ export class GrokSidebar {
    *
    * Settings → Providers is derived from a persisted connection flag, a cached
    * CLI path and the last credential probe — none of which re-check themselves.
-   * Sign out inside a terminal, install a CLI, let a token lapse, and the page
-   * keeps repeating what it last heard. This is the way to make it tell the
-   * truth, and it runs both from the page's Refresh button and when the page
-   * is opened.
+   * Install a CLI, let a token lapse, and the page keeps repeating what it last
+   * heard. This is the way to make it tell the truth, and it runs both from the
+   * page's Refresh button and when the page is opened.
    *
    * THE TWO HALVES ARE NOT THE SAME COST, and conflating them was #171.
    *
@@ -2493,86 +2586,43 @@ export class GrokSidebar {
    * to api.anthropic.com, 5 to mcp-proxy.anthropic.com, one to a telemetry
    * endpoint, about three seconds, and the person's MCP connectors started
    * along with it. No prompt is ever sent, so nothing is billed — but it
-   * happened for an account the reporter had never connected to this
-   * extension, because they opened a settings page.
+   * happened for an account the reporter had never connected to this extension,
+   * because they opened a settings page.
    *
-   * So `credentials` splits them. The page's own arrival asks for the local
-   * half; the Refresh button and a row's Check ask for both, because a person
-   * pressed something. `credentials` absent means both, so an older client's
-   * Refresh keeps working — see the message's doc comment in protocol.ts.
+   * So `credentials` splits them, and it is opt-IN: absent means the local half
+   * only. A client that did not ask to contact a vendor has not asked for it.
    *
-   * Every INSTALLED agent is probed, not just the ones already marked connected.
-   * Signing in happens outside this extension — a browser OAuth approval, a
-   * `grok login` in any terminal — and the desk has no way to hear about it.
-   * Probing only the already-connected set made the button useless in exactly
-   * the case people press it: approve Grok in the browser, press Refresh, and
-   * it skipped Grok because the stale flag said "not connected" (owner, and it
-   * meant opening the chat and pressing Check instead).
+   * NEITHER HALF RUNS FOR AN AGENT THAT IS NOT CONNECTED, and that is the whole
+   * of #171. This used to probe every INSTALLED agent and promote whichever one
+   * answered — which reads as helpful (approve Grok in a browser, press Refresh,
+   * see it appear) and is in fact the extension deciding on the user's behalf to
+   * run a vendor's binary and keep the result. Connection is a fact the person
+   * states by pressing Connect; a refresh only re-reads what they already said.
+   * The case that motivated the promotion — signing in somewhere we cannot see —
+   * is served by pressing Connect, which is one click and is unambiguous.
    *
-   * A provider whose CLI is not installed is still skipped — there is nothing
-   * to run and nothing to learn.
-   *
-   * Still NOT `recheckConnection`: that marks its provider connected BEFORE
-   * probing, so a failed sign-in leaves an account the user never had. Here the
-   * probe comes first and only a SUCCESS promotes — evidence, not assumption.
-   * A failure never demotes: a lapsed account keeps its row and gets the
-   * sign-in action (see setProviderNeedsLogin), and one that was never
-   * connected simply stays that way.
+   * A provider whose CLI is not installed is still skipped: nothing to run and
+   * nothing to learn. A failed probe never demotes — a lapsed account keeps its
+   * row and gets the sign-in action (see setProviderNeedsLogin).
    */
   private async refreshProviderStates(opts: { credentials?: boolean } = {}): Promise<void> {
-    const probeCredentials = opts.credentials !== false;
     if (this.providerRefreshInFlight) return;
     this.providerRefreshInFlight = true;
-    // Say it started before the slow part. The button reads `checking` off this
-    // frame, so posting it first is what makes the click feel answered.
     this.postProviderState();
     try {
-      // Drop the located paths so the locators genuinely re-run. `locateProvider`
-      // only invalidates a cached path when the file is gone, so a CLI installed
-      // or repointed since boot would otherwise stay invisible.
       if (!this.testForceMissingGrokCli) this.cliPath = undefined;
       this.codexCliPath = undefined;
       this.claudeCliPath = undefined;
-      // Read AFTER dropping the paths, so a CLI that appeared since boot counts.
+      this.museCliPath = undefined;
+      // Installation discovery is always local and remains available before Connect.
       const located = this.locatedProviders();
-      const installed = INTERNAL_PROVIDERS.filter((provider) => located[provider]);
-      const connectedBefore = this.providerConnections();
-      // Failures are the answer here, not an error: a rejected probe is how a
-      // lapsed account gets its needsLogin flag. reprobeProviderCredentials
-      // already classifies and records that, so nothing is swallowed.
-      //
-      // Versions ARE re-probed. They used not to be, on the grounds that they
-      // "do not appear on this page" — true then, and untrue since the CLI
-      // update feature: the version is what decides `updateAvailable`, so a
-      // CLI changed in a terminal left the offer stuck on whatever was read
-      // at boot. The probe is memoized for the life of the host process, and
-      // on a cloud machine there is no window to reload to clear it, which
-      // made Refresh the only door and it was shut.
-      await Promise.all(installed.map(async (provider) => {
-        // Local-only pass: the locators have already re-run above, the version
-        // is re-read below, and nothing here contacts a vendor. A row keeps
-        // whatever the last real probe established — which is honest, since
-        // nothing has been learned to change it.
-        const authenticated = probeCredentials
-          ? await this.reprobeProviderCredentials(provider).catch(() => false)
-          : false;
-        // Adapter CLI versions feed About and, where supported,
-        // `updateAvailable`; Grok has its own update check, and re-probing it
-        // would re-run the locator this method deliberately leaves alone when
-        // a test forces the CLI missing.
+      await Promise.all(INTERNAL_PROVIDERS.map(async provider => {
+        if (!located[provider] || !this.hasProviderConsent(provider)) return;
+        if (opts.credentials === true) await this.reprobeProviderCredentials(provider).catch(() => false);
         if (provider !== "grok") await this.reprobeProviderVersion(provider);
-        // Promote on a SUCCESSFUL probe only. This is the sign-in that happened
-        // somewhere the desk could not see; the probe is what makes it a fact
-        // rather than a guess. Persisted, so it survives a reload the way the
-        // connect flow's own state does.
-        if (authenticated && connectedBefore[provider] !== true) {
-          await this.setProviderConnected(provider, true);
-        }
       }));
     } finally {
       this.providerRefreshInFlight = false;
-      // Always the last word, however the probes went — a spinner that outlives
-      // its refresh is worse than a stale row, because it never resolves.
       this.postProviderState();
       void this.refreshGithubState();
     }
@@ -5989,6 +6039,7 @@ Only continue if you trust this code.`,
   private async clientForWorktreeCreate(
     sourcePath: string,
   ): Promise<{ client: AcpClient; disposeAfter: boolean } | undefined> {
+    if (!this.hasProviderConsent("grok")) return undefined;
     // Reuse a live workspace-root session when we have one (cheap + no orphan).
     for (const s of this.pool) {
       if (s.client?.sessionId && pathsEqual(this.sessionCwd(s), sourcePath)) {
@@ -6002,6 +6053,7 @@ Only continue if you trust this code.`,
     const cliPath = this.locateProvider("grok");
     if (!cliPath) return undefined;
     const client = new AcpClient({
+      signal: this.providerRunSignal("grok"),
       cliPath,
       cwd: sourcePath,
       env: this.buildEnv(sourcePath),
@@ -8600,7 +8652,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const logoutArgs = provider === "claude" ? ["auth", "logout"] : ["logout"];
       try {
-        await execGrokCli(cliPath, logoutArgs, { timeout: 30_000, windowsHide: true });
+        await this.execProviderCli(provider, cliPath, logoutArgs, { timeout: 30_000, windowsHide: true });
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code === "ENOENT" || code === "EACCES" || code === "EPERM") {
@@ -8653,7 +8705,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // credential — the desk path can be optimistic because a person is watching
     // the terminal it opened.
     try {
-      await execGrokCli(cliPath, ["logout"], { timeout: 30_000, windowsHide: true });
+      await this.execProviderCli("grok", cliPath, ["logout"], { timeout: 30_000, windowsHide: true });
     } catch (error) {
       fail(`Grok sign-out failed: ${errorDetail(error)}. The account remains connected.`);
       this.postProviderState();
@@ -9030,9 +9082,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.reaper) { clearInterval(this.reaper); this.reaper = undefined; }
     if (this.routineTimer) { clearInterval(this.routineTimer); this.routineTimer = undefined; }
     if (this.workflowTimer) { clearInterval(this.workflowTimer); this.workflowTimer = undefined; }
-    for (const timer of this.loginReprobeTimers.values()) clearTimeout(timer);
+    for (const timer of this.loginReprobeTimers?.values() ?? []) clearTimeout(timer);
     this.cancelAllDeviceLogins();
-    this.loginReprobeTimers.clear();
+    this.loginReprobeTimers?.clear();
+    for (const controller of this.providerRuns.values()) controller.abort();
     for (const timer of this.turnOrderTimers) clearTimeout(timer);
     this.turnOrderTimers.clear();
     this.uplink?.dispose();
@@ -9074,8 +9127,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** Read `grok --version` for policy checks. Returns "" on failure (logged). */
   private async readGrokVersion(cliPath: string, timeout = 30_000): Promise<string> {
+    if (!this.hasProviderConsent("grok")) return "";
     try {
-      const { stdout } = await execGrokCli(cliPath, ["--version"], { timeout });
+      const { stdout } = await this.execProviderCli("grok", cliPath, ["--version"], { timeout });
       const output = stdout?.trim() ?? "";
       const parsed = parseGrokVersion(output);
       if (parsed) this.providerCliVersions.grok = parsed.join(".");
@@ -9109,6 +9163,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const inFlight = provider === "muse" ? this.museVersionProbe
       : provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe;
     await inFlight?.catch(() => "");
+    if (!this.hasProviderConsent(provider)) return;
     if (provider === "muse") this.museVersionProbe = undefined;
     else if (provider === "codex") this.codexVersionProbe = undefined;
     else this.claudeVersionProbe = undefined;
@@ -9116,6 +9171,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private probeProviderVersion(provider: AcpProvider): Promise<string> {
+    if (!this.hasProviderConsent(provider)) return Promise.resolve("");
     if (provider === "codex") return this.probeCodexVersion();
     if (provider === "claude") return this.probeClaudeVersion();
     if (provider === "muse") return this.probeMuseVersion();
@@ -9150,7 +9206,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * documents.
    */
   private async refreshModelsIfCliChanged(provider: AcpProvider, version: string): Promise<void> {
-    if (!version) return;
+    if (!version || !this.hasProviderConsent(provider)) return;
+    const signal = this.providerRunSignal(provider);
     const cache = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
     const cached = cache[provider];
     // Nothing cached yet: the ordinary warm-up owns that case and a re-probe
@@ -9164,7 +9221,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.host.appendLine(
       `[${provider}] CLI ${cached.cliVersion ?? "unknown"} -> ${version}; re-reading the model catalog`,
     );
-    await this.reprobeProviderCredentials(provider);
+    if (!signal.aborted) await this.reprobeProviderCredentials(provider);
   }
 
   /**
@@ -9187,12 +9244,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Memoize `codex --version` until an explicit update. The adapter handshake reports
    * its own package version, not the binary it launches. */
   private probeCodexVersion(): Promise<string> {
+    if (!this.hasProviderConsent("codex")) return Promise.resolve("");
     if (this.codexVersionProbe) return this.codexVersionProbe;
     this.codexVersionProbe = (async () => {
       const cliPath = this.locateProvider("codex");
       if (!cliPath) return "";
       try {
-        const { stdout } = await execGrokCli(cliPath, ["--version"], {
+        const { stdout } = await this.execProviderCli("codex", cliPath, ["--version"], {
           timeout: 30_000,
           windowsHide: true,
         });
@@ -9200,7 +9258,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (!version) throw new Error("unrecognized version output");
         this.providerCliVersions.codex = version;
         this.postProviderState();
-        await this.refreshModelsIfCliChanged("codex", version);
         return version;
       } catch (error) {
         this.host.appendLine(`codex --version failed: ${(error as Error).message}`);
@@ -9214,12 +9271,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Memoize `claude --version` until an explicit update. The adapter handshake version
    * is a stale package constant (0.49.0 on 0.69.0) and must not be displayed. */
   private probeClaudeVersion(): Promise<string> {
+    if (!this.hasProviderConsent("claude")) return Promise.resolve("");
     if (this.claudeVersionProbe) return this.claudeVersionProbe;
     this.claudeVersionProbe = (async () => {
       const cliPath = this.locateProvider("claude");
       if (!cliPath) return "";
       try {
-        const { stdout } = await execGrokCli(cliPath, ["--version"], {
+        const { stdout } = await this.execProviderCli("claude", cliPath, ["--version"], {
           timeout: 30_000,
           windowsHide: true,
         });
@@ -9227,7 +9285,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (!version) throw new Error("unrecognized version output");
         this.providerCliVersions.claude = version;
         this.postProviderState();
-        await this.refreshModelsIfCliChanged("claude", version);
         return version;
       } catch (error) {
         this.host.appendLine(`claude --version failed: ${(error as Error).message}`);
@@ -9240,12 +9297,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** Probe the installed CLI, not the SDK/adapter package version. */
   private probeMuseVersion(): Promise<string> {
+    if (!this.hasProviderConsent("muse")) return Promise.resolve("");
     if (this.museVersionProbe) return this.museVersionProbe;
     this.museVersionProbe = (async () => {
       const cliPath = this.locateProvider("muse");
       if (!cliPath) return "";
       try {
-        const { stdout } = await execGrokCli(cliPath, ["--version"], {
+        const { stdout } = await this.execProviderCli("muse", cliPath, ["--version"], {
           timeout: 30_000,
           windowsHide: true,
         });
@@ -9269,6 +9327,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * that cannot reach x.ai would otherwise re-charge that wait on every
    * window. */
   private async maybeUpdateCliOnUpgrade(cliPath: string): Promise<void> {
+    if (!this.hasProviderConsent("grok")) return;
     if (this.cliUpdateChecked) return;
     this.cliUpdateChecked = true;
     const current = this.context.extensionVersion;
@@ -9295,7 +9354,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // is reachable and 68s where it is not (measured by funkpopo behind a
         // blocked x.ai, PR #129), so a short budget separates the two without
         // needing to detect which network we are on.
-        const { stdout, stderr } = await execGrokCli(cliPath, args, { timeout: 20_000 });
+        const { stdout, stderr } = await this.execProviderCli("grok", cliPath, args, { timeout: 20_000 });
         if (stdout?.trim()) this.host.appendLine(stdout.trim());
         if (stderr?.trim()) this.host.appendLine(stderr.trim());
       } catch (e) {
@@ -9422,6 +9481,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   /** Pin the bounded Windows stdio-hang range before spawning ACP. */
   private async maybePinBrokenCli(cliPath: string): Promise<void> {
+    if (!this.hasProviderConsent("grok")) return;
     if (this.brokenCliPinned) return;
     const versionOutput = await this.readGrokVersion(cliPath);
     if (!versionOutput) return;
@@ -9450,7 +9510,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     );
     this.post({ type: "cliUpdating" });
     try {
-      const { stdout, stderr } = await execGrokCli(
+      const { stdout, stderr } = await this.execProviderCli(
+        "grok",
         cliPath,
         ["update", "--version", GROK_STDIO_DOWNGRADE_TARGET],
         { timeout: 180_000 },
@@ -9474,6 +9535,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * safe while a session is live. Posts a grokUpdateStatus back to the webview.
    */
   private async checkGrokUpdate(): Promise<void> {
+    if (!this.hasProviderConsent("grok")) return;
     const connected = this.connectedProviders();
     if (connected.includes("codex")) void this.probeCodexVersion();
     if (!connected.includes("grok")) return;
@@ -9487,7 +9549,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // unsupported Windows build. Independent of the --check result below.
     const policy = grokUpdatePolicy(await this.readGrokVersion(cliPath), process.platform);
     try {
-      const { stdout } = await execGrokCli(cliPath, ["update", "--check", "--json"], { timeout: 30_000 });
+      const { stdout } = await this.execProviderCli("grok", cliPath, ["update", "--check", "--json"], { timeout: 30_000 });
       const info = JSON.parse(stdout) as {
         currentVersion?: string;
         latestVersion?: string;
@@ -9514,6 +9576,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * Connected · v<new>) shows progress.
    */
   private async updateGrokCliOnDemand(): Promise<void> {
+    if (!this.hasProviderConsent("grok")) return;
     const cliPath = this.locateProvider("grok");
     if (!cliPath) {
       this.post({ type: "onboarding", state: "missing-cli", platform: process.platform, provider: "grok" });
@@ -9540,7 +9603,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // require", and a pinned move must not be talked out of it by the wrong one.
     if (!policy.target) {
       try {
-        const { stdout } = await execGrokCli(cliPath, ["update", "--check", "--json"], { timeout: 30_000 });
+        const { stdout } = await this.execProviderCli("grok", cliPath, ["update", "--check", "--json"], { timeout: 30_000 });
         const info = JSON.parse(stdout) as {
           currentVersion?: string;
           latestVersion?: string;
@@ -9645,6 +9708,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private async updateProviderCliOnDemand(provider: "codex" | "claude"): Promise<void> {
+    if (!this.hasProviderConsent(provider)) return;
     if (this.providerCliUpdate || Object.values(this.providerCliUpdates ?? {}).some((u) => u.status === "running")) return;
     const name = provider === "codex" ? "Codex CLI" : "Claude Code CLI";
     const status = (state: "running" | "succeeded" | "failed", message: string) => {
@@ -9742,7 +9806,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           ? [process.platform === "win32" ? "npm.cmd" : "npm",
             ["install", "-g", "--prefix", plan.prefix, plan.packageSpec]]
           : [cliPath, selfUpdateArgs(provider, plan.kind === "self" ? plan.target : undefined)];
-        const { stdout, stderr } = await execGrokCli(command, args, {
+        const { stdout, stderr } = await this.execProviderCli(provider, command, args, {
           timeout: 180_000, windowsHide: true, closeStdin: true,
         });
         if (stdout.trim()) this.host.appendLine(stdout.trim());
@@ -9760,10 +9824,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.providerCliUpdate = undefined;
       status("running", `Checking ${name} version and models…`);
       // Start the fresh probe BEFORE releasing queued starts, so they share it.
-      // It calls refreshModelsIfCliChanged, which re-reads the model catalog.
+      // Catalog refresh is explicit; plain version reads never start ACP.
       const observed = this.probeProviderVersion(provider);
       release();
       const version = await observed;
+      await this.refreshModelsIfCliChanged(provider, version);
       status(failure ? "failed" : "succeeded", failure
         ? `${name} update failed: ${failure}`
         : version ? `Update completed · ${name} v${version}`
@@ -9812,7 +9877,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const { stdout, stderr } = await execGrokCli(cliPath, updateArgs, { timeout: 180_000 });
+        const { stdout, stderr } = await this.execProviderCli("grok", cliPath, updateArgs, { timeout: 180_000 });
         if (stdout?.trim()) this.host.appendLine(stdout.trim());
         if (stderr?.trim()) this.host.appendLine(stderr.trim());
         return true;
@@ -10306,8 +10371,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // failure only (auth and the Windows stdio pin keep their own paths).
     const startSpawnAttempts = 3;
     const startSpawnBackoffMs = [300, 900] as const;
+    const runSignal = this.providerRunSignal(session.provider);
     const createBoundClient = (): AcpClient => {
+    runSignal.throwIfAborted();
     const client = new AcpClient({
+      signal: runSignal,
       cliPath,
       cwd,
       env,
@@ -12160,13 +12228,31 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           });
           break;
         }
-        // A remote has no terminal to look at and no keyboard attached to the
-        // host, so the desk path is not merely worse there — it does nothing
-        // visible at all. Run the CLI's headless flow instead and put the URL
-        // and code in the transcript. Everything below this branch is the desk
-        // path and is deliberately unchanged.
+        const renewing = !!this.providerNeedsLogin?.[provider];
+        // Consent is the press. The CREDENTIAL is not proven by it, and the two
+        // must not be collapsed: every surface reads `connected && !needsLogin`
+        // as a healthy account, so recording consent alone made Settings clear
+        // the bar that finishes the sign-in and offer Sign out in its place --
+        // and Sign out runs the vendor logout, destroying the credential the
+        // person pressed Connect to create. Each flow below clears this the
+        // moment it has evidence.
+        //
+        // ORDER IS THE WHOLE FIX. Marking it afterwards was no fix at all:
+        // `setProviderConnected` posts a frame of its own, Settings reads that
+        // first frame as a finished account and drops the Re-check bar, and the
+        // later frame never puts it back. The flag has to be true BEFORE the
+        // first frame that says connected.
+        this.setProviderNeedsLogin(provider, true);
+        await this.setProviderConnected(provider, true);
+        if (!this.hasProviderConsent(provider)) break;
+        // Remote users read the URL on their own device. Muse also needs the
+        // captured URL on the desk because its CLI does not open a browser.
         if (origin === "remote") {
           await this.startDeviceLogin(provider, cliPath, clientId);
+          break;
+        }
+        if (provider === "muse") {
+          await this.startDeviceLogin(provider, cliPath, clientId, { remote: false });
           break;
         }
         // Official CLI owns login. For Claude this is `claude auth login`
@@ -12174,7 +12260,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // Connecting an account and RENEWING one are different errands, and
         // only the second is about the conversation on screen. Read the flag
         // before the probe below can clear it.
-        const renewing = !!this.providerNeedsLogin?.[provider];
         const loginArgs = provider === "claude" ? ["auth", "login"] : ["login"];
         const term = this.host.createTerminal({
           name: `${providerDisplayName(provider)} Login`,
@@ -12183,10 +12268,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         });
         term.show();
         // The terminal is outside the host protocol, so completion cannot be
-        // observed directly. Probe immediately as well: browser/desktop login
-        // helpers may already have completed, and the explicit Re-check below
-        // remains available for interactive terminals still in progress.
-        if (provider !== "muse") this.watchProviderLogin(provider);
+        // observed directly. Probe on a bounded ladder as well: browser/desktop
+        // login helpers may already have completed, and the explicit Re-check
+        // below remains available for interactive terminals still in progress.
+        // Muse never reaches here -- it takes the device flow above, which
+        // verifies its own credential.
+        this.watchProviderLogin(provider);
         // Connecting an agent is about the NEXT conversation, not the one on
         // screen. Showing its sign-in panel over a session with history covered
         // that transcript, and the confirmation afterwards had nowhere sensible
@@ -12259,6 +12346,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           break;
         }
         const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : "grok";
+        this.providerLoginAttempts?.get(provider)?.abort();
+        this.providerLoginAttempts?.delete(provider);
         const running = this.deviceLogins.get(provider);
         if (!running) break;
         this.deviceLogins.delete(provider);
@@ -12288,31 +12377,26 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           });
           break;
         }
-        const pendingLoginProbe = this.loginReprobeTimers.get(provider);
+        if (!this.hasProviderConsent(provider)) break;
+        // An explicit Re-check supersedes the ladder still running behind a
+        // terminal login, so the two cannot probe over each other.
+        const pendingLoginProbe = this.loginReprobeTimers?.get(provider);
         if (pendingLoginProbe) clearTimeout(pendingLoginProbe);
-        this.loginReprobeTimers.delete(provider);
-        // Evidence, then promotion — never the other way round. Marking the
-        // account connected BEFORE the probe meant a failed check left it
-        // "connected but needs to sign in again" for an account that was
-        // never signed in at all, which is exactly what the owner saw on a
-        // fresh cloud machine (2026-08-31). The Providers refresh has always
-        // promoted this way; this handler was the one that did not.
-        //
-        // A failure never demotes, either: a lapsed account keeps its row and
-        // gets the sign-in action, which is what needsLogin is for.
+        this.loginReprobeTimers?.delete(provider);
+        const signal = this.providerRunSignal(provider);
         if (provider === "muse") {
           const client = await this.adapterHistoryClient(provider, this.locateProvider(provider)!);
           if (!client) break;
           // The user acknowledges CLI sign-in here; MSP has no auth-status RPC.
           // A turn reports any remaining credential error through the normal path.
           this.setProviderNeedsLogin(provider, false);
-          await this.setProviderConnected(provider, true);
+          if (signal.aborted) break;
           await this.adoptSessionsForConnectedProvider(provider, session);
           for (const target of this.sessionsForModelRefresh()) this.postSessionModels(target);
           break;
         }
-        const rechecked = await this.reprobeProviderCredentials(provider);
-        if (rechecked) await this.setProviderConnected(provider, true);
+        await this.reprobeProviderCredentials(provider);
+        if (signal.aborted) break;
         await this.adoptSessionsForConnectedProvider(provider, session);
         break;
       }
@@ -12351,9 +12435,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         );
         break;
       case "refreshProviders":
-        // Absent means true — see the message's own doc comment. An older
-        // client's Refresh button sends nothing and must keep working.
-        await this.refreshProviderStates({ credentials: msg.credentials !== false });
+        // Absent means FALSE — see the message's own doc comment. The field is
+        // opt-IN because the expensive half of a refresh is the half that talks
+        // to a vendor, and a client that did not ask for that has not asked for
+        // it. An older client's Refresh still re-reads the local half, which is
+        // the half its button was pointing at anyway.
+        await this.refreshProviderStates({ credentials: msg.credentials === true });
         break;
       case "checkGrokUpdate":
         await this.checkGrokUpdate();
@@ -13841,6 +13928,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    * repo the process had never been in.
    */
   private async adapterHistoryClient(provider: AcpProvider, cliPath: string): Promise<AcpClient | undefined> {
+    if (!this.hasProviderConsent(provider)) return undefined;
+    const signal = this.providerRunSignal(provider);
     if (provider === "muse" && this.museCliChange) {
       await this.museCliChange;
       const currentPath = this.locateProvider(provider);
@@ -13853,6 +13942,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const generation = this.museHistoryGeneration ?? 0;
     const start = async () => {
+      if (signal.aborted) return undefined;
       const existing = this.adapterHistoryClients.get(provider);
       if (existing && existing.cliPath === cliPath) return existing.client;
       // A relocated or upgraded CLI is a different program. Never keep talking to
@@ -13861,9 +13951,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.adapterHistoryClients.delete(provider);
         await existing.client.dispose();
       }
+      if (signal.aborted) return undefined;
       const backend = this.createProviderBackend(provider);
       if (!backend) return undefined;
       const client = new AcpClient({
+        signal: this.providerRunSignal(provider),
         cliPath,
         cwd: this.projectHomeDir(),
         env: { ...process.env },
@@ -13871,6 +13963,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         log: (message) => this.host.appendLine(message),
       });
       if (provider === "muse") client.on("initialized", (init) => {
+        if (signal.aborted) return;
         const catalog = init?._meta?.models;
         if (!Array.isArray(catalog?.availableModels)) return;
         const models = catalog.availableModels.map((m: any) => ({ modelId: m.modelId, name: m.name,
@@ -13891,7 +13984,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await client.dispose();
         throw error;
       }
-      if (exited || provider === "muse" && generation !== (this.museHistoryGeneration ?? 0)) {
+      if (signal.aborted || exited || provider === "muse" && generation !== (this.museHistoryGeneration ?? 0)) {
         await client.dispose();
         throw new Error("Provider history connection was closed during startup");
       }
@@ -13933,9 +14026,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // they now share one process, so the opening burst becomes N cheap round
     // trips instead of N spawns. A previous listing's failure belongs to its
     // own caller and must not break the chain for the next one.
+    const signal = this.providerRunSignal(provider);
     const run = (this.adapterHistoryQueue.get(provider) ?? Promise.resolve())
       .catch(() => { /* handled by whoever awaited it */ })
-      .then(() => this.listAdapterHistory(provider, cwd, key));
+      .then(() => { if (!signal.aborted) return this.listAdapterHistory(provider, cwd, key); });
     this.adapterHistoryQueue.set(provider, run.catch(() => { /* keep the chain alive */ }));
     return run;
   }
@@ -13947,9 +14041,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const cliPath = this.locateProvider(provider);
     if (!history || !cliPath || !this.connectedProviders().includes(provider)) return;
     if (this.providerCliUpdate?.provider === provider) return;
+    const signal = this.providerRunSignal(provider);
     const client = await this.adapterHistoryClient(provider, cliPath);
-    if (!client) return;
+    if (!client || signal.aborted) return;
     const result = await client.listSessions(cwd, process.platform);
+    if (signal.aborted) return;
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const stableOverrides: SessionMetaOverrides = { ...overrides };
     // First-seen adapter listing time is a baseline only. Claude restamps
@@ -14757,6 +14853,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       try {
         const cliPath = this.locateProvider(provider);
         const backend = this.createProviderBackend(provider);
+        if (!this.hasProviderConsent(provider)) throw new Error(`${name} is not connected.`);
         if (!cliPath || !backend) throw new Error(`${name} CLI is not available.`);
         // DISPOSING FIRST WAS TRIED HERE AND REVERTED. It looks obviously
         // right — the comment above asks for it and the Grok branch does it —
@@ -14770,6 +14867,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Independent review found all three. The defect was the RECOVERY
       // below, which used to return before our own cleanup; it no longer does.
         const client = live?.client ?? (temporary = new AcpClient({
+          signal: this.providerRunSignal(provider),
           cliPath,
           cwd,
           env: { ...process.env },
@@ -15043,8 +15141,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       try {
         const cliPath = this.locateProvider(provider);
         const backend = this.createProviderBackend(provider);
+        if (!this.hasProviderConsent(provider)) throw new Error(`${name} is not connected.`);
         if (!cliPath || !backend) throw new Error(`${name} CLI is not available.`);
         client = new AcpClient({
+          signal: this.providerRunSignal(provider),
           cliPath,
           cwd,
           env: { ...process.env },
@@ -17611,7 +17711,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // before the user has done anything, so it rides the initial burst rather
     // than waiting for a first attempt.
     this.postProjectSetup();
-    for (const provider of this.connectedProviders()) void this.probeProviderVersion(provider);
+    for (const provider of this.connectedProviders()) {
+      const signal = this.providerRunSignal(provider);
+      void this.probeProviderVersion(provider).then(version => {
+        if (!signal.aborted) return this.refreshModelsIfCliChanged(provider, version);
+      }).catch(() => { /* advisory: a version read must not reject into the void */ });
+    }
     this.post({
       type: "summarizeRepliesAloud",
       value: this.host.getConfiguration("grok").get<boolean>("summarizeRepliesAloud", true),
@@ -19503,7 +19608,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     cwd: string,
     liveClient?: AcpClient,
   ): Promise<boolean> {
-    if (!id || !supportsSessionDeletion(provider)) return false;
+    if (!id || !supportsSessionDeletion(provider) || !this.hasProviderConsent(provider)) return false;
     let temporary: AcpClient | undefined;
     try {
       let client = liveClient;
@@ -19512,6 +19617,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const backend = this.createProviderBackend(provider);
         if (!cliPath || !backend) throw new Error(`${providerDisplayName(provider)} CLI is not available.`);
         client = temporary = new AcpClient({
+          signal: this.providerRunSignal(provider),
           cliPath,
           cwd,
           env: { ...process.env },
