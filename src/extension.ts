@@ -1,7 +1,5 @@
 import * as vscode from "vscode";
 import { GrokSidebar } from "./sidebar";
-import { GrokSessionsView } from "./sessions-view";
-import { runHostMaintenance } from "./host-update";
 import { createVsCodeHost, createVsCodeHostContext, fromVsCodeUri, wrapWebviewView } from "./vscode-host";
 import {
   GROK_VIEW_ID,
@@ -9,6 +7,7 @@ import {
   PANEL_CONTAINER_ID,
   PRIMARY_CONTAINER_ID,
   SECONDARY_CONTAINER_ID,
+  revealCommandFor,
   viewPlacementCorrection,
   isFirstEverRun,
   MOVE_VIEW_HINT_USED_KEY,
@@ -162,14 +161,10 @@ export function activate(context: vscode.ExtensionContext): GrokExtensionApi {
   // view, nobody chose it — that is the entire licence the placement correction
   // has to move it, and it evaporates the moment any other subsystem writes.
   const firstEverRun = isFirstEverRun(context.globalState.keys());
-  const output = vscode.window.createOutputChannel("Grok30m");
+  const output = vscode.window.createOutputChannel("Grok");
   const host = createVsCodeHost(output, context);
   const hostContext = createVsCodeHostContext(context);
   const sidebar = new GrokSidebar(hostContext, host);
-  const sessionsView = new GrokSessionsView(sidebar);
-  // Fetch GitHub Releases on this host (computer or SSH remote), drop leftover
-  // community copies that hide Grok30m's views, and say when community is ahead.
-  void runHostMaintenance(context, output);
   // Test host only. Latch missing-CLI discovery before ensureViewPlacement can
   // reveal the view (ready → startSession). Production never takes this branch.
   const testHooks = context.extensionMode === vscode.ExtensionMode.Test
@@ -194,13 +189,6 @@ export function activate(context: vscode.ExtensionContext): GrokExtensionApi {
     // the two views together. No Cursor special-casing: registering a view in
     // the primary bar works the same in both editors (Cursor only reserves the
     // *secondary* bar for its agent UI).
-    vscode.window.registerWebviewViewProvider(GrokSessionsView.viewId, {
-      resolveWebviewView(view) {
-        sessionsView.resolveWebviewView(wrapWebviewView(view));
-      },
-    }, {
-      webviewOptions: { retainContextWhenHidden: true },
-    }),
     vscode.window.registerWebviewViewProvider(
       GROK_PROJECTS_VIEW_ID,
       {
@@ -215,9 +203,14 @@ export function activate(context: vscode.ExtensionContext): GrokExtensionApi {
     ),
     output,
     { dispose: () => sidebar.dispose() },
-    vscode.commands.registerCommand("grok.open", () => sidebar.openPreferred()),
-    vscode.commands.registerCommand("grok.panel.open", () => sidebar.openPanel()),
-    vscode.commands.registerCommand("grok.sidebar.open", () => sidebar.openSidebar()),
+    vscode.commands.registerCommand("grok.open", async () => {
+      // Resolved per invocation rather than baked in: the view can be moved
+      // between docks from the gear menu, and in a host that refuses the
+      // secondary side bar the container this used to hardcode never exists at
+      // all — which is how `grok.open` came to fail with "command not found".
+      const cmds = await vscode.commands.getCommands(true);
+      await vscode.commands.executeCommand(revealCommandFor(cmds));
+    }),
     // Reachable from the palette when the view itself is not — which is the
     // state this whole mechanism exists for. Records nothing: the automatic
     // correction fires only on a first-ever run, so there is no later one for a
@@ -289,10 +282,7 @@ export function activate(context: vscode.ExtensionContext): GrokExtensionApi {
     vscode.commands.registerCommand("grok.collapseAllToolDetails", () => sidebar.setAllToolDetails(false)),
     vscode.commands.registerCommand("grok.continueOnPhone", () => sidebar.continueOnPhone()),
     vscode.commands.registerCommand("grok.findInSession", () => sidebar.findInSession()),
-    vscode.commands.registerCommand("grok.logout", () => sidebar.logout()),
-    vscode.commands.registerCommand("grok.checkForUpdates", () =>
-      runHostMaintenance(context, output, { forceCheck: true, notifyIfCurrent: true }),
-    ),
+    vscode.commands.registerCommand("grok.logout", () => sidebar.signOutAgentCli()),
     vscode.commands.registerCommand("grok.linkRemote", () => sidebar.linkRemoteDevice()),
     vscode.commands.registerCommand("grok.unlinkRemote", () => sidebar.unlinkRemoteDevice()),
     vscode.commands.registerCommand("grok.composerForward", () => sidebar.moveComposerCaret("forward")),
