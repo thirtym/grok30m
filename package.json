@@ -1,21 +1,21 @@
 {
-  "name": "grok30m",
-  "displayName": "Grok30m",
-  "description": "Grok30m — fork of the community Grok Build VS Code client with Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
-  "version": "2.1.20",
-  "publisher": "grok30m",
+  "name": "grok-vscode-phuryn",
+  "displayName": "AFK Pilot: Grok Build, Muse Code, Claude, Codex & more in one place",
+  "description": "One place for Grok Build (Grok 4.7) and Muse Code (Muse Wonder), plus Codex (GPT-6 Astra), Claude Code (Opus 5.5) and Google Antigravity (Gemini 4 Argon, experimental). Previously Grok Build (Community). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI), Meta, OpenAI, Anthropic or Google.",
+  "version": "4.15.0",
+  "publisher": "PawelHuryn",
   "author": {
-    "name": "Grok30m contributors",
-    "url": "https://github.com/thirtym/grok30m"
+    "name": "Paweł Huryn",
+    "url": "https://www.productcompass.pm"
   },
   "license": "FSL-1.1-MIT",
-  "homepage": "https://github.com/thirtym/grok30m",
+  "homepage": "https://github.com/phuryn/grok-build-vscode",
   "bugs": {
-    "url": "https://github.com/thirtym/grok30m/issues"
+    "url": "https://github.com/phuryn/grok-build-vscode/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/thirtym/grok30m.git"
+    "url": "https://github.com/phuryn/grok-build-vscode"
   },
   "engines": {
     "vscode": "^1.106.0"
@@ -30,14 +30,10 @@
     "xai",
     "xai-grok",
     "acp",
-    "acp-client",
     "agent-client-protocol",
     "agent",
     "ai",
     "chat",
-    "thinking",
-    "tool-calls",
-    "sidebar",
     "codex",
     "openai-codex",
     "claude",
@@ -46,43 +42,49 @@
     "muse-code",
     "meta",
     "coding-agent",
-    "gui"
+    "gui",
+    "antigravity",
+    "gemini",
+    "afk-pilot",
+    "remote-control",
+    "multi-agent",
+    "argon",
+    "gemini-4",
+    "muse-wonder",
+    "gpt",
+    "opus",
+    "anthropic"
   ],
   "icon": "resources/grok-icon.png",
   "main": "./out/extension.js",
   "activationEvents": [
-    "onStartupFinished",
-    "onView:grok.sessions",
-    "onWebviewPanel:grok.panel",
-    "onCommand:grok.panel.open",
-    "onCommand:grok.sidebar.open",
-    "onCommand:grok.checkForUpdates"
+    "onStartupFinished"
   ],
   "contributes": {
     "viewsContainers": {
       "secondarySidebar": [
         {
           "id": "grokSidebar",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         }
       ],
       "activitybar": [
         {
           "id": "grokPrimary",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         },
         {
           "id": "grokProjects",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         }
       ],
       "panel": [
         {
           "id": "grokPanel",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         }
       ]
@@ -92,140 +94,146 @@
         {
           "type": "webview",
           "id": "grok.chat",
-          "name": "Chat",
-          "when": "config.grok.preferredLocation == 'sidebar' || !config.grok.sessionsSidebar"
+          "name": "AFK Pilot"
         }
       ],
       "grokProjects": [
         {
           "type": "webview",
           "id": "grok.projects",
-          "name": "Projects",
-          "when": "!config.grok.sessionsSidebar"
-        }
-      ],
-      "grokPrimary": [
-        {
-          "type": "webview",
-          "id": "grok.sessions",
-          "name": "Sessions",
-          "when": "config.grok.sessionsSidebar"
+          "name": "Projects"
         }
       ]
     },
     "commands": [
       {
         "command": "grok.continueOnPhone",
-        "title": "Grok30m: Continue on Phone"
+        "title": "Continue on Phone",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.open",
-        "title": "Grok30m: Open"
+        "title": "Open",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.moveView",
-        "title": "Grok30m: Move Chat View"
+        "title": "Move Chat View",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.newSession",
-        "title": "Grok30m: New Session"
+        "title": "New Session",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.newWorktreeSession",
-        "title": "Grok30m: New Worktree Session"
+        "title": "New Worktree Session",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.applyWorktree",
-        "title": "Grok30m: Apply Worktree"
+        "title": "Apply Worktree",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.removeWorktree",
-        "title": "Grok30m: Remove Worktree"
+        "title": "Remove Worktree",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.rewind",
-        "title": "Grok30m: Rewind Conversation"
+        "title": "Rewind Conversation",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.compact",
-        "title": "Grok30m: Compact Conversation"
+        "title": "Compact Conversation",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.pickModel",
-        "title": "Grok30m: Pick Model"
+        "title": "Pick Model",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.toggleMode",
-        "title": "Grok30m: Toggle Plan / Agent Mode"
+        "title": "Toggle Plan / Agent Mode",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.sendSelection",
-        "title": "Add Selection to Grok30m"
+        "title": "Add Selection to AFK Pilot"
       },
       {
         "command": "grok.sendFile",
-        "title": "Add to Grok30m chat"
+        "title": "Add to AFK Pilot chat"
       },
       {
         "command": "grok.insertAtMention",
-        "title": "Grok30m: Insert @-Mention"
+        "title": "Insert @-Mention",
+        "category": "AFK Pilot"
+      },
+      {
+        "command": "grok.rebuildProjects",
+        "title": "Rebuild Projects from recent activity",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.showLogs",
-        "title": "Grok30m: Show Logs"
+        "title": "Show Logs",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.settings",
-        "title": "Grok30m: Settings",
+        "title": "Settings",
+        "category": "AFK Pilot",
         "icon": "$(gear)"
       },
       {
         "command": "grok.expandAllToolDetails",
-        "title": "Grok30m: Expand All Tool Details (This Session)"
+        "title": "Expand All Tool Details (This Session)",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.collapseAllToolDetails",
-        "title": "Grok30m: Collapse All Tool Details (This Session)"
+        "title": "Collapse All Tool Details (This Session)",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.findInSession",
-        "title": "Grok30m: Find in Conversation"
+        "title": "Find in Conversation",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.logout",
-        "title": "Grok30m: Log Out"
+        "title": "Log Out",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.linkRemote",
-        "title": "AFK Pilot: Link this device"
+        "title": "Link this device",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.unlinkRemote",
-        "title": "AFK Pilot: Unlink this device"
+        "title": "Unlink this device",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok._debugDummyPlan",
-        "title": "Grok30m: Debug — Show dummy plan card (for testing Approve/Reject/Cancel)"
+        "title": "Debug — Show dummy plan card (for testing Approve/Reject/Cancel)",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.composerForward",
-        "title": "Grok30m: Composer — Move Forward"
+        "title": "Composer — Move Forward",
+        "category": "AFK Pilot"
       },
       {
         "command": "grok.composerPreviousLine",
-        "title": "Grok30m: Composer — Move to Previous Line"
-      },
-      {
-        "command": "grok.panel.open",
-        "title": "Grok30m: Open in Editor Tab"
-      },
-      {
-        "command": "grok.sidebar.open",
-        "title": "Grok30m: Open in Sidebar"
-      },
-      {
-        "command": "grok.checkForUpdates",
-        "title": "Grok30m: Check for Updates"
+        "title": "Composer — Move to Previous Line",
+        "category": "AFK Pilot"
       }
     ],
     "keybindings": [
@@ -301,7 +309,7 @@
       ]
     },
     "configuration": {
-      "title": "Grok30m",
+      "title": "AFK Pilot",
       "properties": {
         "grok.cliPath": {
           "type": "string",
@@ -343,6 +351,21 @@
           "default": "",
           "description": "Path to the Anthropic Claude Code CLI (`claude`). Empty = auto-discover on PATH, then well-known user-bin locations. Authentication stays in Anthropic's own CLI."
         },
+        "grok.askToAddProjects": {
+          "type": "boolean",
+          "default": true,
+          "description": "The first time you send a message in a conversation whose folder is not one of your projects, offer to add it to Projects. Turn off to stop asking; \"Never for this folder\" stops it for one folder."
+        },
+        "grok.experimentalAntigravity": {
+          "type": "boolean",
+          "default": false,
+          "description": "Experimental: offer Google's Antigravity as an agent on this computer (not on cloud machines). Set it up in Settings → Providers: Install Antigravity downloads Google's ACP server into this app's storage, and Connect signs in with your Google account in the browser, or with a Gemini API key."
+        },
+        "grok.agyServerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Google's Antigravity ACP server (`agy_acp_server`). Empty = the copy this app installs."
+        },
         "grok.defaultModel": {
           "type": "string",
           "default": "",
@@ -353,15 +376,17 @@
           "enum": [
             "",
             "agent",
+            "auto",
             "yolo"
           ],
           "enumDescriptions": [
-            "Agent mode (CLI default)",
+            "The agent's own default: Auto mode where the agent has one (Claude Code), Agent mode elsewhere",
             "Agent mode",
+            "Auto mode where the agent has one (Claude Code decides what is safe and asks about the rest); Agent mode elsewhere",
             "Auto accept — auto-approve every permission request"
           ],
           "default": "",
-          "description": "Mode for new sessions. Updated automatically to remember your last switch between Agent and Auto accept (Plan is never remembered). Empty = Agent."
+          "description": "Mode for new sessions. Updated automatically to remember your last switch between Agent, Auto and Auto accept (Plan is never remembered). Empty = Auto mode where the agent has one (Claude Code), Agent mode elsewhere. If Claude Code's Auto mode is not available for the model, the conversation stays in Agent mode."
         },
         "grok.includeActiveFileByDefault": {
           "type": "boolean",
@@ -436,12 +461,12 @@
         "grok.showThinking": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Show Grok's reasoning (thinking) traces in chat. Off by default — a lightweight \"Thinking…\" indicator stands in while Grok reasons. Also toggleable live from the gear menu → **Config & debug → Show thinking traces** (applies to already-loaded sessions too)."
+          "markdownDescription": "Show the agent's reasoning (thinking) traces in chat. Off by default — a lightweight \"Thinking…\" indicator stands in while the agent reasons. Also toggleable live from Settings → **General → Show thinking traces** (applies to already-loaded sessions too)."
         },
         "grok.expandCommandOutputs": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Expand tool details by default — each shell command's IN/OUT block (full command text + captured output) and each edit's inline diff (useful for auditing Auto-accept sessions). With this setting on, groups containing command or edit details (such as \"Ran N commands\" or \"Edited N files\") open too; read/explore-only groups stay collapsed, and a lone command outside a group opens its details. Off: click a row or group header (›) to expand it — edit rows always show a `+N −M` change count, even when their diff is closed. Also toggleable live from the gear menu → **Config & debug → Expand tool details**."
+          "markdownDescription": "Expand tool details by default — each shell command's IN/OUT block (full command text + captured output) and each edit's inline diff (useful for auditing Auto-accept sessions). With this setting on, groups containing command or edit details (such as \"Ran N commands\" or \"Edited N files\") open too; read/explore-only groups stay collapsed, and a lone command outside a group opens its details. Off: click a row or group header (›) to expand it — edit rows always show a `+N −M` change count, even when their diff is closed. Also toggleable live from Settings → **General → Expand tool details**."
         },
         "grok.expandDiffCard": {
           "type": "boolean",
@@ -451,7 +476,7 @@
         "grok.steerByDefault": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Send straight into the running turn instead of queueing it. Off (default): a message you send while the agent is working waits, and is sent as one prompt when the turn ends — you can still steer it on demand with the **Steer** button on the pending message. On: sending while it works **skips the queue** and injects the message into the turn immediately, so the agent changes course mid-answer. Steering never cancels the turn and never discards in-flight tool work — it is not a Stop. It carries your text and the files you attached to that message, but not the ambient editor selection. **Grok** and **OpenAI Codex** take a mid-turn correction; **Claude Code** does not, and there a message always falls back to the queue. Images are the one thing that can still be refused: an older Grok Build CLI ignores them, so a message carrying pictures is queued whole rather than arriving without them. Also toggleable live from the gear menu → **Config & debug → Steer by default**."
+          "markdownDescription": "Send straight into the running turn instead of queueing it. Off (default): a message you send while the agent is working waits, and is sent as one prompt when the turn ends — you can still steer it on demand with the **Steer** button on the pending message. On: sending while it works **skips the queue** and injects the message into the turn immediately, so the agent changes course mid-answer. Steering never cancels the turn and never discards in-flight tool work — it is not a Stop. It carries your text and the files you attached to that message, but not the ambient editor selection. **Grok** and **OpenAI Codex** take a mid-turn correction; **Claude Code** does not, and there a message always falls back to the queue. Images are the one thing that can still be refused: an older Grok Build CLI ignores them, so a message carrying pictures is queued whole rather than arriving without them. Also toggleable live from Settings → **General → Steer by default**."
         },
         "grok.pinLiveWorkflows": {
           "type": "boolean",
@@ -466,27 +491,27 @@
         "grok.soundNotifications": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Play a short sound when Grok finishes a turn or hits an error — a rising chime on completion, a lower tone on error. Off by default. Plays **only when the Grok panel isn't focused** (you've switched to the editor or another window), so it notifies you when you've stepped away without beeping while you watch. Also toggleable live from the gear menu → **Config & debug → Sound notifications**."
+          "markdownDescription": "Play a short sound when the agent finishes a turn or hits an error — a rising chime on completion, a lower tone on error. Off by default. Plays **only when the AFK Pilot panel isn't focused** (you've switched to the editor or another window), so it notifies you when you've stepped away without beeping while you watch. Also toggleable live from Settings → **Notifications → Sound notifications**."
         },
         "grok.processingSound": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Play a quiet repeating sound while Grok is still working. The first cue waits seven seconds, then repeats every eight seconds until the turn ends. Off by default and separate from the completion/error sound. Also toggleable live from the gear menu → **Config & debug → Still-processing sound**."
+          "markdownDescription": "Play a quiet repeating sound while the agent is still working. The first cue waits seven seconds, then repeats every eight seconds until the turn ends. Off by default and separate from the completion/error sound. Also toggleable live from Settings → **Notifications → Still-processing sound**."
         },
         "grok.readRepliesAloud": {
           "type": "boolean",
           "default": false,
-          "description": "Read completed Grok replies aloud in the VS Code chat. Code blocks are skipped."
+          "description": "Read completed replies aloud in the VS Code chat. Code blocks are skipped."
         },
         "grok.summarizeRepliesAloud": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Read simplified summaries of spoken Grok replies. Each reply costs an extra xAI call and adds network delay; the full reply is used if summarization fails. Uses the same credential resolution as Voice input. AFK Pilot keeps its own per-device browser preference."
+          "markdownDescription": "Read simplified summaries of spoken replies. Each reply costs an extra xAI call and adds network delay; the full reply is used if summarization fails. Uses the same credential resolution as Voice input. AFK Pilot keeps its own per-device browser preference."
         },
         "grok.remote.keepAwake": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Keep this machine awake while it's linked to an **AFK Pilot** account, so a remote turn isn't cut off by idle sleep. Only active once you've signed in (gear → AFK Pilot → *Sign in*); unlinking releases the lock immediately. The display is still free to sleep — only system/idle sleep is blocked. Uses `caffeinate` on macOS, `SetThreadExecutionState` on Windows and `systemd-inhibit` on Linux. **A closed laptop lid still sleeps** on every platform — that's an OS-level decision no application can override."
+          "markdownDescription": "Keep this machine awake while it's linked to an **AFK Pilot** account, so a remote turn isn't cut off by idle sleep. Only active once you've signed in (Settings → Remote control → *Sign in*); unlinking releases the lock immediately. The display is still free to sleep — only system/idle sleep is blocked. Uses `caffeinate` on macOS, `SetThreadExecutionState` on Windows and `systemd-inhibit` on Linux. **A closed laptop lid still sleeps** on every platform — that's an OS-level decision no application can override."
         },
         "grok.thumbsFeedback": {
           "type": "boolean",
@@ -503,7 +528,7 @@
           "default": 100,
           "minimum": 60,
           "maximum": 300,
-          "markdownDescription": "Zoom for the Grok chat panel only, as a percent (100 = default). Scales the whole chat UI — text, icons, spacing — without affecting the rest of VS Code (unlike `Ctrl/Cmd+Shift+=`). Applies live, no reload needed. Supports User (global) and Workspace (local) scope."
+          "markdownDescription": "Zoom for the AFK Pilot chat panel only, as a percent (100 = default). Scales the whole chat UI — text, icons, spacing — without affecting the rest of VS Code (unlike `Ctrl/Cmd+Shift+=`). Applies live, no reload needed. Supports User (global) and Workspace (local) scope."
         },
         "grok.voiceApiKey": {
           "type": "string",
@@ -568,34 +593,6 @@
           ],
           "default": "gpt-live-transcribe",
           "description": "OpenAI Realtime transcription model. Dictionary terms become model-specific vocabulary hints. The explicit batch mode uses gpt-4o-transcribe."
-        },
-        "grok.autoUpdate": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Keep Grok30m current from the public GitHub Releases feed ([thirtym/grok30m](https://github.com/thirtym/grok30m/releases/latest)). Checks on this computer *and* on SSH remotes (each host has its own install). Turn off to only update when you run **Grok30m: Check for Updates**."
-        },
-        "grok.preferredLocation": {
-          "type": "string",
-          "enum": [
-            "panel",
-            "sidebar"
-          ],
-          "enumDescriptions": [
-            "Editor tab — chat stays open while you edit files (Claude Code style)",
-            "Sidebar — original Grok layout with chat in the side panel"
-          ],
-          "default": "panel",
-          "description": "Where Grok chat opens by default."
-        },
-        "grok.sessionsSidebar": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show session history in a dedicated Sessions sidebar view instead of the in-chat history dropdown."
-        },
-        "grok.hideAutoSessions": {
-          "type": "boolean",
-          "default": true,
-          "description": "Hide automated sessions tagged [Auto:review], [Auto:deploy], or [Auto:robot] from session history. Toggle live in the Sessions sidebar."
         }
       }
     }
@@ -686,8 +683,5 @@
     "electron-updater": {
       "builder-util-runtime": "9.7.0"
     }
-  },
-  "extensionKind": [
-    "workspace"
-  ]
+  }
 }

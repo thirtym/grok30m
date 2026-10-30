@@ -64,6 +64,8 @@
     // this is the mark that actually needs the evenodd rule; Lobe ships all
     // four with it and the other three render the same either way.
     muse: "M6.897 4c1.915 0 3.516.932 5.43 3.376l.282-.373c.19-.246.383-.484.58-.71l.313-.35C14.588 4.788 15.792 4 17.225 4c1.273 0 2.469.557 3.491 1.516l.218.213c1.73 1.765 2.917 4.71 3.053 8.026l.011.392.002.25c0 1.501-.28 2.759-.818 3.7l-.14.23-.108.153c-.301.42-.664.758-1.086 1.009l-.265.142-.087.04a3.493 3.493 0 01-.302.118 4.117 4.117 0 01-1.33.208c-.524 0-.996-.067-1.438-.215-.614-.204-1.163-.56-1.726-1.116l-.227-.235c-.753-.812-1.534-1.976-2.493-3.586l-1.43-2.41-.544-.895-1.766 3.13-.343.592C7.597 19.156 6.227 20 4.356 20c-1.21 0-2.205-.42-2.936-1.182l-.168-.184c-.484-.573-.837-1.311-1.043-2.189l-.067-.32a8.69 8.69 0 01-.136-1.288L0 14.468c.002-.745.06-1.49.174-2.23l.1-.573c.298-1.53.828-2.958 1.536-4.157l.209-.34c1.177-1.83 2.789-3.053 4.615-3.16L6.897 4zm-.033 2.615l-.201.01c-.83.083-1.606.673-2.252 1.577l-.138.199-.01.018c-.67 1.017-1.185 2.378-1.456 3.845l-.004.022a12.591 12.591 0 00-.207 2.254l.002.188c.004.18.017.36.04.54l.043.291c.092.503.257.908.486 1.208l.117.137c.303.323.698.492 1.17.492 1.1 0 1.796-.676 3.696-3.641l2.175-3.4.454-.701-.139-.198C9.11 7.3 8.084 6.616 6.864 6.616zm10.196-.552l-.176.007c-.635.048-1.223.359-1.82.933l-.196.198c-.439.462-.887 1.064-1.367 1.807l.266.398c.18.274.362.56.55.858l.293.475 1.396 2.335.695 1.114c.583.926 1.03 1.6 1.408 2.082l.213.262c.282.326.529.54.777.673l.102.05c.227.1.457.138.718.138.176.002.35-.023.518-.073.338-.104.61-.32.813-.637l.095-.163.077-.162c.194-.459.29-1.06.29-1.785l-.006-.449c-.08-2.871-.938-5.372-2.2-6.798l-.176-.189c-.67-.683-1.444-1.074-2.27-1.074z",
+    // Google Antigravity's mark, from the same Lobe set (1.95.1).
+    agy: "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z",
   };
 
   /**
@@ -377,12 +379,24 @@
 
   const PROVIDER_CLI_NAMES = { grok: "Grok", codex: "Codex", claude: "Claude Code", muse: "Muse" };
 
+  function agyAdvertised(s) {
+    return ((s && s.providers) || []).some((p) => p && p.id === "agy");
+  }
+
   /** `remote`: a remote row has no Disconnect button to explain (desk hosts
    *  keep `logout` host-local), so it keeps the plain sentence. */
   function providerDescription(provider, remote) {
     const connected = provider.connected === true;
     const needsLogin = connected && provider.needsLogin === true;
     if (needsLogin) return "This account is connected but needs to sign in again before it can be used.";
+    if (connected && !needsLogin && provider.id === "agy") {
+      const how = provider.signInMethod === "api-key" ? "a Gemini API key" : "your Google account";
+      if (remote) return "Connected with " + how + " on the computer running this workspace.";
+      return "Connected with " + how + "."
+        + (provider.keepsCliSignIn === true
+          ? " Disconnect turns it off here and keeps the " + (provider.signInMethod === "api-key" ? "saved key" : "Google sign-in") + "."
+          : "");
+    }
     if (connected && provider.keepsCliSignIn === true && !remote) {
       const cli = PROVIDER_CLI_NAMES[provider.id] || "agent";
       return "This account is connected on this machine. Disconnect turns it off here; the " + cli + " CLI stays signed in.";
@@ -591,7 +605,7 @@
       id: "showThinking",
       category: "general",
       title: "Show thinking traces",
-      description: "Show Grok's reasoning traces in chat, including on already-loaded sessions.",
+      description: "Show the agent's reasoning traces in chat, including on already-loaded sessions.",
       kind: "toggle",
       defaultValue: false,
       visible: (s) => purposeOf(s) === "coding",
@@ -807,7 +821,7 @@
       id: "soundNotifications",
       category: "notifications",
       title: "Sound notifications",
-      description: "Play a short sound when a turn finishes or errors, only when the Grok panel is not focused.",
+      description: "Play a short sound when a turn finishes or errors, only when the AFK Pilot panel is not focused.",
       kind: "toggle",
       defaultValue: false,
       get: (s) => !!(s && s.soundNotifications),
@@ -1061,14 +1075,14 @@
       message: (s) => ({ type: providerConnectedNow(s, "muse") ? "logout" : "runGrokLogin", provider: "muse" }),
     },
     {
-      id: "museShellSandbox", category: "providers", title: "Shell sandbox",
+      id: "museShellSandbox", category: "providers", group: "museSettings", title: "Shell sandbox",
       description: "For new Muse Code conversations in Prompt unmatched. On request always uses the sandbox; Allow all disables it. On request is unavailable in a running process without the sandbox.", kind: "toggle", hostLocal: true,
       visible: (s) => !!s.museSettings && (s.providers || []).some(p => p.id === "muse"),
       defaultValue: true, get: (s) => s.museSettings.shellSandbox,
       message: (value) => ({ type: "setMuseSetting", key: "museShellSandbox", value }),
     },
     {
-      id: "museSandboxNetwork", category: "providers", title: "Sandbox network",
+      id: "museSandboxNetwork", category: "providers", group: "museSettings", title: "Sandbox network",
       description: "Sandbox network access for new Muse Code conversations in Prompt unmatched or On request.", kind: "select", hostLocal: true,
       visible: (s) => !!s.museSettings && (s.providers || []).some(p => p.id === "muse"),
       defaultValue: "proxy-only", get: (s) => s.museSettings.sandboxNetwork,
@@ -1076,12 +1090,30 @@
       message: (value) => ({ type: "setMuseSetting", key: "museSandboxNetwork", value }),
     },
     {
-      id: "museTrustWorkspaces", category: "providers", title: "Trust workspaces",
+      id: "museTrustWorkspaces", category: "providers", group: "museSettings", title: "Trust workspaces",
       description: "For new Muse Code conversations in Prompt unmatched or On request. Allow all always trusts the workspace. A trusted workspace also runs the repository's hooks.",
       kind: "toggle", hostLocal: true,
       visible: (s) => !!s.museSettings && (s.providers || []).some(p => p.id === "muse"),
       defaultValue: false, get: (s) => s.museSettings.trustWorkspaces,
       message: (value) => ({ type: "setMuseSetting", key: "museTrustWorkspaces", value }),
+    },
+    // Antigravity is desk-only: Google's sign-in opens a browser on the
+    // machine running it. A remote gets a status row and never a Connect.
+    {
+      id: "providerAgy", category: "providers", logo: "agy", provider: "agy",
+      title: "Antigravity", vendor: "Google", description: "", kind: "action", keepOpen: true,
+      visible: (s, env) => !!(env && !env.isRemote && env.providersKnown && agyAdvertised(s)),
+      describe: (s) => providerDescription(providerOf(s, "agy")),
+      actionLabel: (s) => providerAction(providerOf(s, "agy")),
+      message: (s) => ({ type: providerConnectedNow(s, "agy") ? "logout" : "runGrokLogin", provider: "agy" }),
+    },
+    {
+      id: "providerAgyStatus", category: "providers", logo: "agy", provider: "agy",
+      title: "Antigravity", vendor: "Google", description: "", kind: "status",
+      visible: (s, env) => !!(env && env.isRemote && env.providersKnown && agyAdvertised(s)),
+      describe: (s) => providerConnectedNow(s, "agy")
+        ? providerDescription(providerOf(s, "agy"), true)
+        : "Connect Antigravity on the computer running this workspace.",
     },
     {
       id: "githubConnection",
@@ -1261,7 +1293,7 @@
       id: "showLogs",
       category: "advanced",
       title: "Show logs",
-      description: "Open the host log for this Grok client.",
+      description: "Open the host log for this AFK Pilot client.",
       kind: "action",
       actionLabel: (s, env) => logsLabel(env),
       hostLocal: true,
@@ -1279,10 +1311,24 @@
       message: () => ({ type: "toggleDevTools" }),
     },
     {
+      id: "experimentalAntigravity",
+      category: "advanced",
+      title: "Experimental: Antigravity",
+      description: "Offer Google's Antigravity as an agent on this computer. Connect it under Providers.",
+      kind: "toggle",
+      hostLocal: true,
+      defaultValue: false,
+      visible: (s, env) => !!(env && !env.isRemote && !hostIsCloud(env)),
+      // The host names Antigravity in providerState exactly when the setting is
+      // on (desk only), so that frame is the setting's state.
+      get: (s) => agyAdvertised(s),
+      message: (value) => ({ type: "setExperimentalAntigravity", value }),
+    },
+    {
       id: "openVsCodeSettings",
       category: "advanced",
       title: "Open VS Code settings",
-      description: "Open the host Settings editor focused on Grok.",
+      description: "Open the host Settings editor focused on AFK Pilot.",
       kind: "action",
       actionLabel: "Open",
       hostLocal: true,
@@ -1293,7 +1339,7 @@
       id: "moveView",
       category: "advanced",
       title: "Move view",
-      description: "Open the editor's own picker so you can move the Grok chat to another dock.",
+      description: "Open the editor's own picker so you can move the AFK Pilot chat to another dock.",
       kind: "action",
       actionLabel: "Move view…",
       hostLocal: true,
@@ -1359,7 +1405,7 @@
     {
       id: "aboutHostProduct",
       category: "about",
-      title: (s) => (s && s.hostKind === "desktop") ? "Grok Build Desktop" : "Grok30m",
+      title: (s) => (s && s.hostKind === "desktop") ? "Grok Build Desktop" : "AFK Pilot extension",
       kind: "value",
       visible: (s, env) => remoteAbout(s, env),
       get: (s) => versionLabel(s && s.extVersion),
@@ -1367,40 +1413,10 @@
     {
       id: "aboutThisExtension",
       category: "about",
-      title: "Grok30m",
+      title: "This extension",
       kind: "value",
       visible: (s, env) => !remoteAbout(s, env),
       get: (s) => versionLabel(s && s.extVersion),
-    },
-    {
-      id: "aboutCommunityBase",
-      category: "about",
-      title: "Based on community",
-      kind: "status",
-      visible: (s, env) => !remoteAbout(s, env) && !!(s && s.communityBase),
-      describe: (s) => {
-        const base = s && s.communityBase;
-        const latest = s && s.communityLatest;
-        if (s && s.communityError) {
-          return (base || "") + " · couldn't reach GitHub";
-        }
-        if (s && s.communityBehind && latest) {
-          return latest + " is out (this build: " + base + ")";
-        }
-        if (latest) return latest + " — up to date";
-        return base ? (base + " · checking…") : "";
-      },
-    },
-    {
-      id: "aboutCommunityReleases",
-      category: "about",
-      icon: "github",
-      title: "Community releases",
-      description: "phuryn/grok-build-vscode — the build this fork tracks.",
-      kind: "action",
-      actionLabel: "Open",
-      href: "https://github.com/phuryn/grok-build-vscode/releases",
-      visible: (s, env) => !remoteAbout(s, env),
     },
     {
       id: "aboutGrokCli",
@@ -1799,10 +1815,6 @@
       // than spinning on a refresh that is never coming.
       providersChecking: false,
       extVersion: "",
-      communityBase: "",
-      communityLatest: "",
-      communityBehind: false,
-      communityError: "",
       cliVersion: "",
       hostKind: "",
       hostName: "",
@@ -3106,6 +3118,29 @@
     el.appendChild(form);
   }
 
+  /**
+   * Rows that belong to one provider sit in a collapsible group under it, so a
+   * setting like "Shell sandbox" is plainly that provider's. A native
+   * <details>, as for the provider config files: keyboard-operable, and the
+   * open state is announced. Collapsed by default.
+   */
+  const ROW_GROUPS = {
+    museSettings: { title: "Muse Code (Meta) settings" },
+  };
+
+  function renderRowGroup(id, open, onToggle) {
+    const el = document.createElement("details");
+    el.className = "settings-row-group";
+    el.dataset.group = id;
+    el.open = open;
+    el.ontoggle = () => onToggle(el.open);
+    const summary = document.createElement("summary");
+    summary.className = "settings-row-group-title";
+    summary.textContent = ROW_GROUPS[id].title;
+    el.appendChild(summary);
+    return el;
+  }
+
   function renderRow(row, snapshot, env, keyForm, githubTokenForm, githubCliStarted) {
     if (row.kind === "providerConfigs") {
       const el = document.createElement("details");
@@ -3313,6 +3348,8 @@
     let githubTokenForm = { open: false, value: "" };
     let githubCliStarted = false;
     let providerConfigsOpen = false;
+    /** Row groups the person opened, kept across repaints of this mount. */
+    const openRowGroups = new Set();
     let pendingRestore = null;
     let aboutChecked = false;
     let providersChecked = false;
@@ -3803,6 +3840,7 @@
         }
       } else {
         let lastSection = "";
+        let group = null;
         for (const row of rows) {
           const section = connectorSection(row, env);
           if (section && section !== lastSection) {
@@ -3812,7 +3850,17 @@
             heading.textContent = section;
             body.appendChild(heading);
           }
-          body.appendChild(renderRow(row, snapshot, env, keyForm, githubTokenForm, githubCliStarted));
+          // Search lists rows flat (above), so a match is never hidden in a group.
+          const groupId = row.group && Object.hasOwn(ROW_GROUPS, row.group) ? row.group : "";
+          if (!groupId) group = null;
+          else if (!group || group.dataset.group !== groupId) {
+            group = renderRowGroup(groupId, openRowGroups.has(groupId), (open) => {
+              if (open) openRowGroups.add(groupId);
+              else openRowGroups.delete(groupId);
+            });
+            body.appendChild(group);
+          }
+          (group || body).appendChild(renderRow(row, snapshot, env, keyForm, githubTokenForm, githubCliStarted));
         }
         if (categoryId === "about") {
           const disclaimer = document.createElement("p");

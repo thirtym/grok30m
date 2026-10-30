@@ -27,6 +27,7 @@ import {
 } from "../protocol";
 import { MAX_CONNECTOR_KEY_CHARS } from "../mcp-connectors";
 import { MAX_GITHUB_TOKEN_CHARS } from "../github-auth";
+import { MAX_AGY_API_KEY_CHARS } from "../agy-auth";
 import { ROUTINE_PROMPT_MAX } from "../routines";
 import { isInternalProvider } from "../acp-backend";
 
@@ -168,6 +169,8 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "runMuseInstallCmd":
     case "installCodex":
     case "cancelCodexInstall":
+    case "installAgy":
+    case "cancelAgyInstall":
     case "checkGrokUpdate":
     case "updateGrok":
     case "updateCodex":
@@ -253,6 +256,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       } else return null;
       return { type, key: raw.key, value: raw.value } as WebviewMsg;
     case "setShowThinking":
+    case "setExperimentalAntigravity":
     case "setSoundNotifications":
     case "setProcessingSound":
     case "setReadRepliesAloud":
@@ -344,7 +348,11 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       if (!opt(raw.cwd, isString)) return null;
       break;
     case "selectRepo":
+    case "addToProjects":
       if (!isString(raw.cwd)) return null;
+      break;
+    case "answerProjectPrompt":
+      if (!isString(raw.cwd) || (raw.choice !== "notNow" && raw.choice !== "never")) return null;
       break;
     case "toggleRepoPin":
       if (!isString(raw.cwd) || !isBoolean(raw.pinned)) return null;
@@ -509,6 +517,10 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "githubLoginWithToken":
       if (!isString(raw.token) || !raw.token || raw.token.length > MAX_GITHUB_TOKEN_CHARS) return null;
+      break;
+    case "agySignIn":
+      if (raw.method !== "google" && raw.method !== "api-key") return null;
+      if (raw.key !== undefined && (raw.method !== "api-key" || !isString(raw.key) || raw.key.length > MAX_AGY_API_KEY_CHARS)) return null;
       break;
     case "welcomeTipShown":
     case "dismissWelcomeTip":

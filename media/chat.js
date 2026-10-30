@@ -2,17 +2,24 @@
   const hostApi = acquireVsCodeApi();
   let museAdvertised = false;
   let museAvailable = false;
-  function namesMuse(value) {
+  // Antigravity exists only where the host names it in providerState: desk
+  // hosts with the experimental setting on. Nothing else draws or sends it.
+  let agyAdvertised = false;
+  function namesProvider(value, id) {
     if (!value || typeof value !== "object") return false;
     return Object.entries(value).some(([key, child]) =>
-      key === "provider" && child === "muse" || child && typeof child === "object" && namesMuse(child));
+      key === "provider" && child === id || child && typeof child === "object" && namesProvider(child, id));
   }
   const vscode = { getState: () => hostApi.getState(), setState: value => hostApi.setState(value),
     postMessage: message => {
-      if (namesMuse(message) && !museAvailable) return false;
+      if (namesProvider(message, "muse") && !museAvailable) return false;
+      if (namesProvider(message, "agy") && !agyAdvertised) return false;
       return hostApi.postMessage(message);
     } };
-  function offeredProviders() { return Object.keys(globalThis.GrokWebviewHelpers.PROVIDER_ACTIONS).filter(id => id !== "muse" || museAvailable); }
+  function offeredProviders() {
+    return Object.keys(globalThis.GrokWebviewHelpers.PROVIDER_ACTIONS)
+      .filter(id => (id !== "muse" || museAvailable) && (id !== "agy" || agyAdvertised));
+  }
   const hostWait = window.GrokHostWait.get();
   const pendingPreferences = new Map();
   let sendWait = null;
@@ -518,9 +525,10 @@
   const CLAUDE_ACTIVITY_VERB = "Clauding";
   const COMPOSER_PLACEHOLDER = {
     grok: "Ask Grok\u2026",
-    codex: "Ask GPT\u2026",
+    codex: "Ask Codex\u2026",
     claude: "Ask Claude\u2026",
     muse: "Ask Muse…",
+    agy: "Ask Antigravity…",
   };
   // What each level MEANS. The name is prepended from `effortLabel` rather than
   // spelled here, so one level cannot be called two things in one popover — the
@@ -568,6 +576,9 @@
     signInCardFor: "",
     currentModelId: null,
     activeProvider: "grok",
+    /** Whether the host named the conversation's agent (a session frame with a
+     *  provider), so copy can say which agent rather than guess Grok. */
+    activeProviderNamed: false,
     providersKnown: false,
     providers: [],
     // Settings → Providers re-observation in flight. Host-owned; see the
@@ -581,6 +592,7 @@
      *  Settings so a connect started there reports where the click happened. */
     deviceLoginByProvider: {},
     codexInstall: { phase: "idle", receivedBytes: 0, totalBytes: 0, reason: "" },
+    agyInstall: { phase: "idle", receivedBytes: 0, totalBytes: 0, reason: "" },
     availableModels: [],
     currentModeId: "agent",
     // Null until a host sends `modeChanged.modes`. Absent means the old rule:
@@ -754,6 +766,9 @@
     // pushes it; the client never has to ask, and an older host simply never
     // sends it, leaving the group absent rather than empty.
     pinnedSessions: [],
+    // The host's own Recent (`recentSessions`): null until a host that builds
+    // one says so, and then the rail shows exactly it. See railRecentRows.
+    recentSessions: null,
     // Capability latch: the host announces per-session pinning by sending the
     // frame at all — even empty. Without this the pin renders against a host
     // that drops `toggleSessionPin`, which is a control that looks broken
@@ -928,6 +943,10 @@
     // priming spinner clears (setBusy:false). See the initialized/setBusy cases.
     cliVersion: "",
     startingPhase: false,
+    // The model chip has nothing real to offer until THIS conversation's
+    // provider has published its catalog (the `session` frame) -- from boot, and
+    // again from every `initialized`. See modelChipLoading.
+    modelCatalogPending: true,
     planModeAvailable: true,
     planModeUnavailableReason: "",
     // Unverified version probe: Plan row stays clickable so a pick re-probes.
@@ -1148,9 +1167,14 @@
 
   const MODE_META = {
     agent: { icon: ICON.bot, label: "Agent mode" },
+    // A provider's own Auto mode; only a host that advertises it offers it.
+    auto: { icon: ICON.shield, label: "Auto mode" },
     plan: { icon: ICON.listTree, label: "Plan mode" },
     yolo: { icon: ICON.zap, label: "Auto accept" },
   };
+  // Each provider's own name for what Auto accept runs it in. Antigravity's
+  // is not named here: the host answers its requests itself.
+  const AUTO_ACCEPT_NATIVE_NAMES = { grok: "YOLO", claude: "Bypass permissions", codex: "Full access" };
   const MUSE_MODE_META = {
     yolo: { icon: ICON.zap, label: "Allow all", description: "No prompts; everything runs." },
     agent: { icon: ICON.shieldQuestion, label: "Prompt unmatched", description: "Prompt for anything no rule matches (the interactive default)." },
@@ -1336,7 +1360,12 @@
   document.addEventListener("pointerdown", unlockAudio, { passive: true });
   document.addEventListener("keydown", unlockAudio, { passive: true });
 
+  /** The meter's label: whole thousands below a million, and from a million up
+   *  millions to two decimals with trailing zeros gone -- 256K, 500K, 1M,
+   *  1.05M for Gemini's 1,048,576 (which read "1049K"). From 999,500, because
+   *  the K branch rounds that to "1000K": a million in the wrong unit. */
   function toK(n) {
+    if (Math.abs(n) >= 999_500) return (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
     return Math.round(n / 1000) + "K";
   }
 
@@ -1392,7 +1421,7 @@
   function offeredModeIds() {
     if (Array.isArray(state.offeredModes)) return state.offeredModes;
     if (state.activeProvider === "muse") return [];
-    return Object.keys(MODE_META).filter((id) => id !== "plan" || state.activeProvider !== "codex");
+    return Object.keys(MODE_META).filter((id) => id !== "auto" && (id !== "plan" || state.activeProvider !== "codex"));
   }
 
   function offersMuseModes() {
@@ -1413,13 +1442,19 @@
     if (state.activeProvider === "muse") {
       if (state.hostCaps && state.hostCaps.museNativeModes) {
         if (id === "agent") return "Muse Code asks for approval. Sandbox and trust change on reopen or in a new conversation";
-        if (id === "yolo") return "Muse Code full access (YOLO). Sandbox and trust change on reopen or in a new conversation";
+        if (id === "yolo") return "Muse Code runs everything without asking (Allow all). Sandbox and trust change on reopen or in a new conversation";
       }
       if (id === "agent") return `Follows ${name}'s own approval rules`;
       if (id === "yolo") return `Answers every approval ${name} raises. This may look the same as Agent, because ${name} asks rarely by default`;
     }
+    if (id === "auto") return `${name} decides which actions are safe to run and asks you about the rest`;
     if (id === "plan") return `${name} explores and proposes a plan; file writes and commands are blocked until you approve it`;
-    if (id === "yolo") return `${name} automatically approves all permission requests (YOLO)`;
+    // "YOLO" is Grok Build's own word for it; elsewhere the provider's name
+    // for the mode this runs in, or none.
+    if (id === "yolo") {
+      const native = AUTO_ACCEPT_NATIVE_NAMES[state.activeProvider];
+      return `${name} automatically approves all permission requests${native ? ` (${native})` : ""}`;
+    }
     return `${name} acts directly, asking approval only for changes it judges sensitive`;
   }
 
@@ -4400,7 +4435,9 @@
     // in its place ("Codex default") reads as something you can select — so its
     // rows are replaced by the one action that can actually help.
     const signInProviders = offeredProviders().filter(providerNeedsLogin);
-    models = models.filter((model) => ((model.provider || state.activeProvider) !== "muse" || museAvailable) && !signInProviders.includes(model.provider || state.activeProvider));
+    models = models.filter((model) => ((model.provider || state.activeProvider) !== "muse" || museAvailable)
+      && ((model.provider || state.activeProvider) !== "agy" || agyAdvertised)
+      && !signInProviders.includes(model.provider || state.activeProvider));
     if (grouped) {
       models = offeredProviders().flatMap((provider) => models.filter((model) =>
         (model.provider || state.activeProvider) === provider));
@@ -4541,6 +4578,7 @@
     gearPopover.classList.remove("popover-centered");
     // The chip opens model + effort directly; the rail gear keeps the app menu.
     const surface = fromBtn && fromBtn.id === "rail-gear-btn" ? "rail" : "composer";
+    if (surface === "composer" && modelChipLoading()) return;
     // Clicking the button that is already showing closes it — clicking the OTHER
     // one switches to it. Closing on any open popover made the two surfaces
     // cost two clicks to move between: the first only dismissed the other menu.
@@ -5068,6 +5106,39 @@
       && (!m.provider || m.provider === state.activeProvider));
   }
 
+  /**
+   * The chip is a closed door while the catalog is on its way: a session is
+   * starting (Antigravity's server alone can take over a minute on Windows) and
+   * the picker could only show the previous conversation's models or a
+   * placeholder. Not while the agent cannot start at all -- signed out, not
+   * connected -- because the picker is where recovery lives, and not forever:
+   * the end of startup, an error, an exit or a long failsafe all open it again
+   * on whatever the picker shows on failure.
+   */
+  function modelChipLoading() {
+    if (!state.modelCatalogPending) return false;
+    if (!state.providersKnown) return true;
+    const active = state.providers.find((p) => p && p.id === state.activeProvider);
+    return !!(active && active.connected && !active.needsLogin);
+  }
+
+  const MODEL_CATALOG_FAILSAFE_MS = 150000;
+  let modelCatalogFailsafe = null;
+  function setModelCatalogPending(pending) {
+    state.modelCatalogPending = !!pending;
+    clearTimeout(modelCatalogFailsafe);
+    modelCatalogFailsafe = null;
+    if (pending) {
+      modelCatalogFailsafe = setTimeout(() => {
+        modelCatalogFailsafe = null;
+        setModelCatalogPending(false);
+      }, Number(window.__grokModelCatalogFailsafeMs) > 0 ? Number(window.__grokModelCatalogFailsafeMs) : MODEL_CATALOG_FAILSAFE_MS);
+      // A picker already open on the old catalog closes with it.
+      if (!gearPopover.hidden && state.gearSurface === "composer") closePopovers();
+    }
+    syncModelChip();
+  }
+
   function modelSelectionLocked() {
     if (state.activeProvider === "grok" && (state.busy || state.contextWindowSelection?.changing)) return true;
     return state.busy || !currentModel() || (state.providersKnown
@@ -5104,10 +5175,16 @@
     word.className = "model-chip-effort";
     word.textContent = effort;
     gearBtn.replaceChildren(model, word);
-    gearBtn.disabled = false; // Selection can lock; provider recovery cannot.
-    gearBtn.title = [name, effort, "Model and effort"].filter(Boolean).join(" · ")
-      + (modelSelectionLocked() ? " — selection available once the session is ready" : "");
-    gearBtn.setAttribute("aria-label", gearBtn.title);
+    // Selection can lock and stay openable, because provider recovery lives
+    // in there. Only a catalog still on its way closes the chip itself.
+    const loading = modelChipLoading();
+    gearBtn.disabled = loading;
+    gearBtn.setAttribute("aria-disabled", String(loading));
+    gearBtn.classList.toggle("model-chip-loading", loading);
+    gearBtn.title = loading ? "Loading models…"
+      : [name, effort, "Model and effort"].filter(Boolean).join(" · ")
+        + (modelSelectionLocked() ? " — selection available once the session is ready" : "");
+    gearBtn.setAttribute("aria-label", loading ? "Model and effort: loading models" : gearBtn.title);
   }
 
   function refreshModelControls() {
@@ -5195,6 +5272,7 @@
       state.offeredModes = original ? modelBaseline.modes : null;
       state.currentModeId = original ? modelBaseline.modeId : "agent";
       state.activeProvider = provider;
+      state.activeProviderNamed = true;
       // Nothing can take a mode until the new provider's session exists, so
       // show its modes but hold them; the host's modeChanged releases them.
       const waiting = `Available once ${providerDisplayName(provider)} has started`;
@@ -5457,6 +5535,8 @@
     // this is the mark that actually needs the evenodd rule; Lobe ships all
     // four with it and the other three render the same either way.
     muse: "M6.897 4c1.915 0 3.516.932 5.43 3.376l.282-.373c.19-.246.383-.484.58-.71l.313-.35C14.588 4.788 15.792 4 17.225 4c1.273 0 2.469.557 3.491 1.516l.218.213c1.73 1.765 2.917 4.71 3.053 8.026l.011.392.002.25c0 1.501-.28 2.759-.818 3.7l-.14.23-.108.153c-.301.42-.664.758-1.086 1.009l-.265.142-.087.04a3.493 3.493 0 01-.302.118 4.117 4.117 0 01-1.33.208c-.524 0-.996-.067-1.438-.215-.614-.204-1.163-.56-1.726-1.116l-.227-.235c-.753-.812-1.534-1.976-2.493-3.586l-1.43-2.41-.544-.895-1.766 3.13-.343.592C7.597 19.156 6.227 20 4.356 20c-1.21 0-2.205-.42-2.936-1.182l-.168-.184c-.484-.573-.837-1.311-1.043-2.189l-.067-.32a8.69 8.69 0 01-.136-1.288L0 14.468c.002-.745.06-1.49.174-2.23l.1-.573c.298-1.53.828-2.958 1.536-4.157l.209-.34c1.177-1.83 2.789-3.053 4.615-3.16L6.897 4zm-.033 2.615l-.201.01c-.83.083-1.606.673-2.252 1.577l-.138.199-.01.018c-.67 1.017-1.185 2.378-1.456 3.845l-.004.022a12.591 12.591 0 00-.207 2.254l.002.188c.004.18.017.36.04.54l.043.291c.092.503.257.908.486 1.208l.117.137c.303.323.698.492 1.17.492 1.1 0 1.796-.676 3.696-3.641l2.175-3.4.454-.701-.139-.198C9.11 7.3 8.084 6.616 6.864 6.616zm10.196-.552l-.176.007c-.635.048-1.223.359-1.82.933l-.196.198c-.439.462-.887 1.064-1.367 1.807l.266.398c.18.274.362.56.55.858l.293.475 1.396 2.335.695 1.114c.583.926 1.03 1.6 1.408 2.082l.213.262c.282.326.529.54.777.673l.102.05c.227.1.457.138.718.138.176.002.35-.023.518-.073.338-.104.61-.32.813-.637l.095-.163.077-.162c.194-.459.29-1.06.29-1.785l-.006-.449c-.08-2.871-.938-5.372-2.2-6.798l-.176-.189c-.67-.683-1.444-1.074-2.27-1.074z",
+    // Google Antigravity's mark, from the same Lobe set (1.95.1).
+    agy: "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z",
   };
 
   /**
@@ -5492,11 +5572,20 @@
     if (provider === "codex") return "Codex";
     if (provider === "claude") return "Claude";
     if (provider === "muse") return "Muse Code";
+    if (provider === "agy") return "Antigravity";
     return "Grok";
   }
 
+  // The conversation's agent by name, once the host has named it. A host that
+  // did not is "the agent": this renderer is newer than any host, so a guess
+  // of Grok would be wrong for every other provider.
+  function agentName(capitalized) {
+    if (state.activeProviderNamed) return providerDisplayName(state.activeProvider);
+    return capitalized ? "The agent" : "the agent";
+  }
+
   function providerLogoId(provider) {
-    if (provider === "codex" || provider === "claude" || provider === "muse") return provider;
+    if (provider === "codex" || provider === "claude" || provider === "muse" || provider === "agy") return provider;
     return "grok";
   }
 
@@ -5817,7 +5906,7 @@
     if (!state.repos.length) {
       const empty = document.createElement("div");
       empty.className = "history-empty";
-      empty.textContent = "No repositories with Grok sessions.";
+      empty.textContent = "No repositories with AFK Pilot sessions.";
       repoPopover.appendChild(empty);
       return;
     }
@@ -6232,10 +6321,26 @@
   // cold session/load over a slow link and short enough that a dropped request
   // is still visibly "nothing happened" rather than a stuck selection.
   const RAIL_TRANSITION_TIMEOUT_MS = 10000;
+  // A NEW conversation is a CLI start, not a load: ~7 s warm and ~30 s cold on a
+  // desk (measured 2026-10-16), and the host sends nothing in between. At 10 s
+  // the "New session" placeholder vanished mid-start, so there was no sign the
+  // conversation was being made until its real row appeared. Any error the host
+  // sends still ends the transition at once.
+  const RAIL_NEW_TRANSITION_TIMEOUT_MS = 60000;
+  /** Projects are folders you chose, so an empty list says how they get there. */
+  const RAIL_NO_PROJECTS = "Your projects appear here. Open a folder, create one, or add one from Recent.";
+  // Once the host has said it is opening the click (`sessionOpening`), the
+  // silence that timer guards against is ruled out: the host ends the open with
+  // the conversation or with `failed`. A cold load can take a minute (and a
+  // click can wait behind another view's load), so this only backs up a host
+  // that dies mid-open.
+  const RAIL_TRANSITION_ACKED_TIMEOUT_MS = 10 * 60_000;
 
   let railEl = null;
   let railResolved = false;
   const railProbeTimers = {};
+  /** Projects whose preview has had its one extra wait (armRailProbeDeadline). */
+  const railProbeExtended = {};
   // Monotonic renderer-local counter for railTransition.token. Not a grok
   // session id — never sent to the host; only used so superseded timers and
   // late frames cannot complete a transition that a later click replaced.
@@ -6899,6 +7004,15 @@
     // broken on the project a machine boots into: the host stored the choice,
     // this returned false, and the row never moved.
     if (sameCwd(repo.cwd, state.selectedRepoCwd)) return false;
+    // A conversation is being made here. The host has not selected the project
+    // yet and an empty one has no rows, so the age rule hid it -- placeholder
+    // and all -- for the seconds until the new conversation arrived.
+    const pendingNew = state.railTransition;
+    if (pendingNew && pendingNew.kind === "new" && sameCwd(repo.cwd, pendingNew.repoCwd)) return false;
+    // You opened it here: its rows arrive because you asked for them, and the
+    // age rule moving it into Archive under your cursor would answer that by
+    // taking it away. (An explicit Archive, above, still wins.)
+    if (state.railCollapsed[cwdKey(repo.cwd)] === false) return false;
     // The age rule NEVER runs on a guess. Without the project's conversations we
     // do not know when it was last worked in: `repo.updatedAt` is the session
     // DIRECTORY's mtime, and that does not move when you continue an existing
@@ -7106,6 +7220,78 @@
     }
   }
 
+  // ---------- "Add <folder> to Projects?" ----------
+  // The host asks once, the first time you send in a conversation whose folder
+  // is not one of your projects (projectPrompt). A strip above the message box,
+  // not a dialog: the message is already on its way, and the question can wait
+  // for whenever you look at it. Whoever answers -- desk or phone -- writes the
+  // host's list, and the host takes the strip down everywhere (`done`).
+  let projectPromptFor = null;
+  // The conversation on screen, from its `session` frame: a prompt about any
+  // other one is not for this view.
+  let projectPromptView = "";
+  function removeProjectPrompt() {
+    const strip = document.querySelector(".project-prompt");
+    if (strip) strip.remove();
+    projectPromptFor = null;
+  }
+  function renderProjectPrompt(msg) {
+    removeProjectPrompt();
+    const composer = document.querySelector("footer.composer");
+    if (!composer || !msg.cwd) return;
+    const strip = document.createElement("div");
+    strip.className = "project-prompt";
+    strip.setAttribute("role", "group");
+    strip.setAttribute("aria-label", "Add this folder to Projects");
+    strip.title = msg.cwd;
+    const text = document.createElement("span");
+    text.className = "project-prompt-text";
+    text.textContent = `Add ${msg.label || cwdLeaf(msg.cwd)} to Projects?`;
+    strip.appendChild(text);
+    const answer = (label, primary, message) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "project-prompt-btn" + (primary ? " primary" : "");
+      btn.textContent = label;
+      btn.onclick = () => { removeProjectPrompt(); vscode.postMessage(message); };
+      strip.appendChild(btn);
+    };
+    answer("Add", true, { type: "addToProjects", cwd: msg.cwd });
+    answer("Not now", false, { type: "answerProjectPrompt", cwd: msg.cwd, choice: "notNow" });
+    answer("Never for this folder", false, { type: "answerProjectPrompt", cwd: msg.cwd, choice: "never" });
+    composer.insertBefore(strip, composer.querySelector(".composer-card"));
+    projectPromptFor = { sessionId: msg.sessionId || "", cwd: msg.cwd };
+  }
+  function noteProjectPrompt(msg) {
+    if (msg.done) {
+      if (projectPromptFor && sameCwd(projectPromptFor.cwd, msg.cwd)) removeProjectPrompt();
+      return;
+    }
+    // Asked about another conversation than the one on screen: not ours.
+    const onScreen = state.activeSessionId || projectPromptView;
+    if (msg.sessionId && onScreen && msg.sessionId !== onScreen) return;
+    renderProjectPrompt(msg);
+  }
+
+  /** The host has the click on `msg.sessionId` (see RAIL_TRANSITION_ACKED_TIMEOUT_MS).
+   *  The highlight stays on it until the host confirms or reports `failed`,
+   *  rather than snapping back after ten seconds of a slow load. */
+  function noteSessionOpening(msg) {
+    const t = state.railTransition;
+    if (!t || t.kind !== "resume" || !msg || t.sessionId !== msg.sessionId) return;
+    if (msg.failed) { abortRailTransition(); return; }
+    clearRailTransitionTimer();
+    const token = t.token;
+    railTransitionTimer = setTimeout(() => {
+      railTransitionTimer = null;
+      if (state.railTransition && state.railTransition.token === token) abortRailTransition();
+    }, RAIL_TRANSITION_ACKED_TIMEOUT_MS);
+    if (msg.queued && !t.queued) {
+      t.queued = true;
+      renderRail();
+    }
+  }
+
   // Composer text belongs to a conversation, independently of transcript replay.
   const composerDrafts = new Map();
   let composerSessionId = null;
@@ -7256,7 +7442,7 @@
     }
     const ms = Number(window.__grokRailTransitionTimeoutMs) > 0
       ? Number(window.__grokRailTransitionTimeoutMs)
-      : RAIL_TRANSITION_TIMEOUT_MS;
+      : fields.kind === "new" ? RAIL_NEW_TRANSITION_TIMEOUT_MS : RAIL_TRANSITION_TIMEOUT_MS;
     railTransitionTimer = setTimeout(() => {
       railTransitionTimer = null;
       if (state.railTransition && state.railTransition.token === token) {
@@ -7510,11 +7696,53 @@
    *  entirely until the host proves it answers — one probe for the first repo,
    *  and the rest only once a `repoSessions` frame has come back. Without this
    *  an old host would be sent one dead request per repo on every catalog push. */
+  /** Projects shown open until you fold or open them yourself. Beyond these
+   *  a project starts folded, and its conversations are fetched only when it
+   *  is opened: a phone opening every project at once asked the host for every
+   *  list at the same moment, and many came back as "Loading…" or "Couldn't
+   *  load these conversations". */
+  const RAIL_OPEN_BY_DEFAULT = 3;
+  /** railDefaultOpenKeys for the rows of one render pass, computed once. */
+  let railOpenKeysForRender = null;
+
+  /** The projects that are open when you have not said otherwise: the first
+   *  few available ones in Projects, and those in Project Archive while that
+   *  group is open (opening the group is the act that asks for them). */
+  function railDefaultOpenKeys() {
+    const sections = railSections();
+    const keys = new Set(sections.active.filter((r) => r.available)
+      .slice(0, RAIL_OPEN_BY_DEFAULT).map((r) => cwdKey(r.cwd)));
+    if (!railGroupIsCollapsed("archived")) for (const r of sections.archived) keys.add(cwdKey(r.cwd));
+    return keys;
+  }
+
+  /**
+   * Whether a project's section is open. `railCollapsed[key]` is your own
+   * choice -- `true` folded, `false` opened -- and is kept per viewer. Without
+   * one: the selected project, the one holding the live conversation, an
+   * unavailable one (it has nothing to fetch) and railDefaultOpenKeys are open,
+   * the rest folded.
+   */
+  function railRepoExpanded(repo, openKeys) {
+    const key = cwdKey(repo.cwd);
+    const choice = state.railCollapsed[key];
+    if (choice === true) return false;
+    if (choice === false) return true;
+    if (!repo.available) return true;
+    if (sameCwd(repo.cwd, state.selectedRepoCwd) || key === state.railLiveRepoKey) return true;
+    return (openKeys || railDefaultOpenKeys()).has(key);
+  }
+
   function requestRailPreviews() {
     if (!rail() || !state.reposKnown) return;
     // Before capability proof there is exactly one probe. If it failed, only
     // the visible Retry may send it again; catalog repaints are not retries.
     if (!state.repoPreviewsSupported && Object.keys(state.repoPreviewErrors).length) return;
+    // Every project, folded or not, as the VS Code rail does: the Archive's age
+    // rule needs a project's own rows, so a folded project fetched only on
+    // opening stayed in Projects here while VS Code had archived it. Folding is
+    // display only. Fetching on open was a workaround for previews that took a
+    // second each on a large desk; they take milliseconds now.
     const wanted = railRepos().filter(
       (r) => r.available
         && !sameCwd(r.cwd, state.selectedRepoCwd)
@@ -7578,6 +7806,17 @@
     railProbeTimers[key] = setTimeout(() => {
       delete railProbeTimers[key];
       if (!state.repoPreviewsAsked[key]) return;
+      // One more round of "Loading…" before saying it failed: a host busy
+      // starting up, or a tab that reconnected under the request, answers
+      // late, and "Couldn't load" followed by the rows read as broken. The
+      // request is sent again, since one sent before a reconnect is lost.
+      if (!railProbeExtended[key]) {
+        railProbeExtended[key] = true;
+        delete state.repoPreviewsAsked[key];
+        const repo = railRepos().find((r) => sameCwd(r.cwd, cwd));
+        if (repo) { requestRailPreview(repo); return; }
+      }
+      delete railProbeExtended[key];
       failRailPreview(cwd, "deadline-expired");
     }, ms);
   }
@@ -7669,8 +7908,11 @@
     // user most needs the rail, because it is where the only useful control
     // lives. Hiding it made the empty-state action unreachable and left the
     // File menu — which the desktop hides — as the sole route in.
+    // Projects are folders you chose now, so a host can have none while Recent
+    // holds conversations you sent in -- that is still a rail worth showing.
     const on = railChromeBeforeCatalog() ||
-      (railAvailable() && (state.repos.length > 0 || canAddProjectFolder()));
+      (railAvailable() && (state.repos.length > 0 || canAddProjectFolder()
+        || (Array.isArray(state.recentSessions) && state.recentSessions.length > 0)));
     const panel = railPanel();
     if (panel) panel.hidden = !on;
     root.hidden = !on;
@@ -7769,7 +8011,10 @@
     // a rail with nothing to press -- and `!shownAnything` could not rescue it,
     // because the archive section below had already set it.
     const emptyProjects = !repos.length && !q && archivedRepos.length > 0;
-    if (repos.length || emptyProjects) {
+    // No project at all yet while Recent or Pinned are showing: Projects still
+    // says where they come from. (With nothing showing, the note below does.)
+    const noProjects = !repos.length && !archivedRepos.length && !q && state.reposKnown && shownAnything;
+    if (repos.length || emptyProjects || noProjects) {
       const forcedOpen = !!q;
       const open = forcedOpen || !railGroupIsCollapsed("projects");
       root.appendChild(railCollapsibleGroupHead({
@@ -7785,9 +8030,12 @@
       if (open) {
         const list = document.createElement("div");
         list.className = "rail-list rail-projects";
+        railOpenKeysForRender = railDefaultOpenKeys();
         for (const repo of repos) list.appendChild(renderRailRepo(repo, false));
+        railOpenKeysForRender = null;
         root.appendChild(list);
         if (emptyProjects) root.appendChild(railNote("Every project is archived."));
+        if (noProjects) root.appendChild(railNote(RAIL_NO_PROJECTS));
         // Full-width target under the list, not only the small "+" in the group
         // head. With one project or none the rail is mostly empty space and the
         // header glyph is easy to miss — and on a phone, easy to miss AND hard
@@ -7814,7 +8062,9 @@
       if (open) {
         const list = document.createElement("div");
         list.className = "rail-list rail-archived";
+        railOpenKeysForRender = railDefaultOpenKeys();
         for (const repo of archived) list.appendChild(renderRailRepo(repo, true));
+        railOpenKeysForRender = null;
         root.appendChild(list);
       }
       shownAnything = true;
@@ -7826,11 +8076,11 @@
       } else if (!q && canAddProjectFolder()) {
         // An empty rail that only says "No projects yet" is a dead end on the
         // one screen where the user has nothing else to click.
-        const empty = railNote("No projects yet");
+        const empty = railNote(RAIL_NO_PROJECTS);
         empty.appendChild(railAddProjectWide());
         root.appendChild(empty);
       } else {
-        root.appendChild(railNote(q ? "No matches." : "No projects yet"));
+        root.appendChild(railNote(q ? "No matches." : RAIL_NO_PROJECTS));
       }
     }
 
@@ -7926,6 +8176,8 @@
       // Toggle: currently open → collapse; currently closed → expand.
       setRailGroupCollapsed(opts.group, opts.open);
       renderRail();
+      // Opening Project Archive opens the projects in it, which fetches them.
+      if (!opts.open) requestRailPreviews();
     };
     head.appendChild(btn);
     if (opts.action) head.appendChild(opts.action());
@@ -8252,6 +8504,10 @@
    * Newest first. The final rail render assigns every id to one visible group.
    */
   function railRecentRows() {
+    // A host that builds Recent itself (conversations you sent in or opened,
+    // across every folder, automation left out) is the whole answer: composing
+    // one from the loaded previews would add every listed conversation back.
+    if (Array.isArray(state.recentSessions)) return state.recentSessions.slice();
     const byId = new Map();
     for (const repo of state.repos || []) {
       const known = railKnownRows(repo);
@@ -8801,7 +9057,7 @@
     // the positive form so the icon cannot drift from the list (closed icon on
     // an open section was a real screenshot bug when the two read different
     // shapes of the same store).
-    const expanded = !state.railCollapsed[key];
+    const expanded = railRepoExpanded(repo, railOpenKeysForRender || undefined);
 
     // No marker for the selected or the live project. The conversation you are
     // reading is highlighted where it sits, which says which project you are in
@@ -8857,9 +9113,14 @@
     head.appendChild(name);
 
     const toggleRepoExpand = () => {
-      if (expanded) state.railCollapsed[key] = true;
-      else delete state.railCollapsed[key];
+      // Remembered either way, so a project you opened stays open on this
+      // device and one you folded stays folded.
+      state.railCollapsed[key] = expanded;
       saveRailShape();
+      if (!expanded && repo.available && !sameCwd(repo.cwd, state.selectedRepoCwd)
+        && !state.repoPreviews[key] && state.repoPreviewsSupported !== false) {
+        requestRailPreview(repo);
+      }
       renderRail();
     };
     head.onclick = (e) => {
@@ -9022,7 +9283,7 @@
         danger: true,
         disabled: !repo.available || knownEmpty || !reachable,
         title: !reachable
-          ? "Update Grok Build on your computer to clear another project's history from here"
+          ? "Update AFK Pilot (previously Grok Build) on your computer to clear another project's history from here"
           : knownEmpty
             ? "This project has no history"
             : "Delete supported providers' conversations in this repository",
@@ -9200,6 +9461,15 @@
     if (s.worktreeLabel && name.startsWith("(WT)")) name = name.slice(4).trim() || "Worktree";
     label.textContent = name;
     row.appendChild(label);
+    // The click is waiting for a load another view started (sessionOpening).
+    const opening = state.railTransition;
+    if (active && opening && opening.kind === "resume" && opening.queued && opening.sessionId === s.id) {
+      row.classList.add("opening");
+      const note = document.createElement("span");
+      note.className = "rail-session-opening";
+      note.textContent = "opening…";
+      row.appendChild(note);
+    }
 
     // In the Pinned group a row has left its project behind, so it has to say
     // which one it came from — two conversations called "Untitled" are otherwise
@@ -9361,6 +9631,13 @@
       label: "Continue on phone…", icon: ICON.smartphone,
       onSelect: () => openRemoteHandoff("rail", s.id, repo.cwd),
     });
+    // A Recent conversation in a folder that is not one of your projects. The
+    // host names the folder (`addableCwd`) only where it can add it.
+    if (s.addableCwd) items.push({
+      label: "Add to Projects",
+      icon: ICON.folder,
+      onSelect: () => vscode.postMessage({ type: "addToProjects", cwd: s.addableCwd }),
+    });
     // Capability, never a version: a host that has never sent `pinnedSessions`
     // will silently drop `toggleSessionPin`, so offering the control there gives
     // a control that does nothing — worse than not having one. The frame arrives
@@ -9385,7 +9662,7 @@
       danger: true,
       disabled: activeUndeletable,
       title: activeUndeletable
-        ? "Update Grok Build on your computer to delete the conversation you have open"
+        ? "Update AFK Pilot (previously Grok Build) on your computer to delete the conversation you have open"
         : "Delete",
       onSelect: () => {
         uiConfirm({
@@ -9419,7 +9696,7 @@
    *  to it, and says the extra part out loud when a turn is still running. */
   function deleteSessionWarning(active) {
     if (!active) return "This cannot be undone.";
-    const stopping = state.busy ? " Grok is still working; that stops." : "";
+    const stopping = state.busy ? ` ${agentName(true)} is still working; that stops.` : "";
     return "This is the conversation you have open. It will close and a new one will start in the same project."
       + stopping + " This cannot be undone.";
   }
@@ -9643,7 +9920,7 @@
     // exist. `role`/`tabindex`/keydown put back the semantics the anchor was
     // providing.
     tip.innerHTML =
-      `<span class="welcome-tip-bulb">${ICON.idea}</span> <b>To move Grok to the right</b>` +
+      `<span class="welcome-tip-bulb">${ICON.idea}</span> <b>To move AFK Pilot to the right</b>` +
       "<br>After moving, click <b>Toggle Agents Side Bar</b> to show it." +
       '<br><span id="welcome-tip-link" class="muted-link" role="button" tabindex="0">Click here</span>' +
       " and select <b>New Secondary Side Bar Entry</b>.";
@@ -9689,7 +9966,7 @@
     const host = state.welcomeTips || {};
     const providers = state.providers || [];
     const altConnected = providers.some(
-      (p) => p && (p.id === "codex" || p.id === "claude" || p.id === "muse" && museAdvertised) && p.connected,
+      (p) => p && (p.id === "codex" || p.id === "claude" || p.id === "muse" && museAdvertised || p.id === "agy" && agyAdvertised) && p.connected,
     );
     return {
       appPurpose: state.appPurpose === "coding" ? "coding" : "knowledge",
@@ -10802,11 +11079,11 @@
   function remoteConnectPanel(mode, info, ver) {
     const device = info.device;
     const provider = info.provider
-      || (mode === "codex-login" ? "codex" : mode === "claude-login" ? "claude" : mode === "muse-login" ? "muse" : mode === "auth-required" ? "grok" : "");
+      || (mode === "codex-login" ? "codex" : mode === "claude-login" ? "claude" : mode === "muse-login" ? "muse" : mode === "agy-login" ? "agy" : mode === "auth-required" ? "grok" : "");
     // The products' own names, everywhere this panel speaks. Not "Grok": that
     // is the model, the extension is Grok Build, and a heading that disagrees
     // with the button beneath it reads as two different things to connect.
-    const NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code", muse: "Muse Code" };
+    const NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code", muse: "Muse Code", agy: "Antigravity" };
     const name = NAMES[provider] || "an agent";
     const status = (text) => { if (ver) setWelcomeStatus(text, false); };
 
@@ -10887,7 +11164,9 @@
       status("Starting sign-in");
       return `<div class="onb">` +
         `<p class="onb-heading">Connecting ${escapeHtml(name)}</p>` +
-        `<p class="onb-desc">Asking the ${escapeHtml(name)} CLI for a sign-in code&hellip;</p>` +
+        `<p class="onb-desc">${provider === "agy"
+          ? "Starting Antigravity&hellip; Google's sign-in opens in your browser in a moment."
+          : `Asking the ${escapeHtml(name)} CLI for a sign-in code&hellip;`}</p>` +
         cancel +
       `</div>`;
     }
@@ -10963,7 +11242,8 @@
     // frame's provider is the specific thing being asked for again.
     const nothingConnected = !((state.providers || []).some((p) => p && p.connected));
     const cloudFresh = !!(state.hostCaps && state.hostCaps.remoteAgentSignOut) && nothingConnected;
-    const offer = (provider && !cloudFresh ? [provider] : offeredProviders()).filter(id => id !== "muse" || museAvailable);
+    const offer = (provider && !cloudFresh ? [provider] : offeredProviders())
+      .filter(id => (id !== "muse" || museAvailable) && (id !== "agy" || !IS_REMOTE));
     // A cloud machine's three agents are not equal offers: Grok is the native
     // one. Ranking is the cloud-only part; every agent that has a headless
     // flow is offered, including Claude Code's paste-code sign-in.
@@ -11077,6 +11357,11 @@
       connectWizard.body.innerHTML = museOnboardingPanel(connectWizard.museOnboarding.mode, connectWizard.museOnboarding.info);
       return;
     }
+    if (connectWizard.agyOnboarding) {
+      const { mode, info } = connectWizard.agyOnboarding;
+      connectWizard.body.innerHTML = mode === "agy-login" ? agyChoicePanel(info) : agyOnboardingPanel(mode, info);
+      return;
+    }
     // The mirror is the live source, but a confirmed account retires its
     // mirror, so a settled panel keeps its own copy of the last thing it was
     // told rather than falling back to the empty-state offer.
@@ -11087,6 +11372,7 @@
       connectWizard.body.innerHTML = connectWizard.checking
         ? `<div class="onb"><p class="onb-heading">Checking…</p><p class="onb-desc">Checking the CLI's existing sign-in.</p></div>`
         : provider === "muse" ? museOnboardingPanel("muse-login", {})
+        : provider === "agy" ? agyChoicePanel({})
         : `<div class="onb"><p class="onb-heading">Sign in to continue</p>`
           + `<p class="onb-desc">${launched ? "Finish signing in in the terminal, then continue here." : "Start sign-in with the CLI when you are ready."}</p>`
           + `<button class="onb-action" data-act="connectProvider" data-provider="${provider}">Open terminal &amp; run <code>${command}</code></button>`
@@ -11111,13 +11397,42 @@
     if (!IS_REMOTE && connectWizard && connectWizard.provider === provider) {
       connectWizard.checking = false;
       connectWizard.launched = !!(info && info.launched);
-      if (!device && provider !== "muse") {
+      if (!device && provider !== "muse" && provider !== "agy") {
         if (mode === "provider-connected" || !CONNECT_ONBOARDING_MODES[mode]) closeConnectWizard();
         else renderConnectWizard();
         return;
       }
     }
-    if (!IS_REMOTE && provider !== "muse") return;
+    if (!IS_REMOTE && provider !== "muse" && provider !== "agy") return;
+    // Antigravity's install and sign-in panels, at the desk. A missing server
+    // answers with a `failed` device, as Muse's does, so the wizard opens on
+    // the Install button wherever Connect was pressed. Its sign-in itself is a
+    // device flow, handled below like every other one.
+    if (provider === "agy" && agyAdvertised && !IS_REMOTE) {
+      const ownsWizard = !!connectWizard && connectWizard.provider === provider;
+      // A Connect press answers with the choice of how to sign in, wherever
+      // it was pressed: Settings, the card, the composer's sign-in prompt.
+      if (mode === "agy-login" && !device && info && info.agyChoice) {
+        openConnectWizard(provider);
+        connectWizard.agyOnboarding = { mode, info };
+        renderConnectWizard();
+        return;
+      }
+      if (mode === "missing-agy" && (device || ownsWizard)) {
+        openConnectWizard(provider);
+        connectWizard.agyOnboarding = { mode, info: info || {} };
+        renderConnectWizard();
+        return;
+      }
+      if (ownsWizard && !device) {
+        if (mode === "agy-login") {
+          connectWizard.agyOnboarding = { mode, info: info || {} };
+          renderConnectWizard();
+        } else if (mode === "provider-connected") closeConnectWizard();
+        return;
+      }
+      if (ownsWizard) connectWizard.agyOnboarding = null;
+    }
     // A missing CLI never started a login flow. Keep its response over Settings
     // and existing conversations, including bare replies from older hosts.
     if (provider === "muse" && museAdvertised && mode === "missing-muse"
@@ -11181,6 +11496,7 @@
     "codex-login": true,
     "claude-login": true,
     "muse-login": true,
+    "agy-login": true,
     "auth-required": true,
   };
 
@@ -11231,9 +11547,97 @@
       + '<button class="onb-action onb-secondary" type="button" data-act="recheckProvider" data-provider="muse">Re-check</button></div>';
   }
 
+  /**
+   * Antigravity's own panels: install (a managed download, like Codex's) and
+   * Google sign-in. A remote gets neither -- signing in opens a browser on the
+   * desk, so it says where to do it instead.
+   */
+  function agyOnboardingPanel(mode, info) {
+    if (IS_REMOTE) {
+      return `<div class="onb"><p class="onb-heading">Connect Antigravity at the computer</p>`
+        + `<p class="onb-desc">Antigravity signs in with Google in a browser on the computer running this workspace. Connect it there, then use it from here.</p></div>`;
+    }
+    if (mode === "missing-agy") {
+      const install = state.agyInstall;
+      const installing = install.phase !== "idle";
+      const percent = install.totalBytes > 0
+        ? Math.min(100, Math.round((install.receivedBytes / install.totalBytes) * 100))
+        : null;
+      const progressLabel = install.phase === "downloading"
+        ? `Downloading Antigravity${percent == null ? "" : ` (${percent}%)`}...`
+        : install.phase === "verifying" ? "Verifying the download..."
+        : install.phase === "installing" ? "Unpacking Antigravity..." : "";
+      const reason = (info && info.reason) || install.reason;
+      return `<div class="onb"><p class="onb-heading">Install Antigravity</p>`
+        + `<p class="onb-desc">Download Google's Antigravity agent server into this app's storage. It is a large download: about 125 MB, and more on Linux.</p>`
+        + (reason ? `<p class="onb-install-error" role="alert">${escapeHtml(reason)}</p>` : "")
+        + (installing
+          ? `<div class="onb-install-progress" role="status"><span>${escapeHtml(progressLabel)}</span>`
+            + (percent == null ? "" : `<progress max="100" value="${percent}">${percent}%</progress>`)
+            + `<button class="onb-action onb-secondary" type="button" data-act="cancelAgyInstall">Cancel</button></div>`
+          : `<button class="onb-action" type="button" data-act="installAgy">Install Antigravity</button>`)
+        + `<button class="onb-action onb-secondary" type="button" data-act="recheckProvider" data-provider="agy">Re-check</button></div>`;
+    }
+    const provider = (state.providers || []).find(p => p.id === "agy");
+    const connected = !!(provider && provider.connected);
+    const reason = info && info.reason;
+    return `<div class="onb"><p class="onb-heading">${connected ? "Sign in to Antigravity" : "Connect Antigravity"}</p>`
+      + (reason ? `<p class="onb-install-error" role="alert">${escapeHtml(reason)}</p>` : "")
+      + `<p class="onb-desc">Sign in with your Google account, or use a Gemini API key.</p>`
+      + `<button class="onb-action" data-act="connectProvider" data-provider="agy">${connected ? "Sign in again" : "Connect Antigravity"}</button></div>`;
+  }
+
+  /**
+   * The choice of how Antigravity signs in: Google, or a pasted Gemini API
+   * key. One card, in the connect dialog. Stored ways are marked so a person
+   * who Disconnected can see what Connect will reuse; the key itself never
+   * reaches the renderer -- only that one is saved.
+   */
+  function agyChoicePanel(info) {
+    const provider = (state.providers || []).find(p => p.id === "agy") || {};
+    const saved = Array.isArray(provider.savedSignIns) ? provider.savedSignIns : [];
+    const last = provider.signInMethod;
+    const reason = info && info.reason;
+    const lastUsed = (method) => last === method ? " (last used)" : "";
+    return `<div class="onb onb-agy-choice"><p class="onb-heading">Connect Antigravity</p>`
+      + (reason ? `<p class="onb-install-error" role="alert">${escapeHtml(reason)}</p>` : "")
+      + `<p class="onb-desc">Choose how Antigravity signs in on this computer.</p>`
+      + `<button class="onb-action" type="button" data-act="agySignInGoogle">Sign in with Google${lastUsed("google")}</button>`
+      + `<p class="onb-desc">${saved.includes("google")
+        ? "Already signed in on this computer, so no browser is needed."
+        : "Opens Google's sign-in page in your browser."}</p>`
+      + `<p class="onb-or">or</p>`
+      + `<p class="onb-desc"><strong>Gemini API key${lastUsed("api-key")}</strong> &mdash; get one at `
+      + `<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com/apikey</a>. `
+      + `It is kept in this app's secure storage on this computer.</p>`
+      + (saved.includes("api-key")
+        ? `<button class="onb-action onb-secondary" type="button" data-act="agySignInSavedKey">Use the saved key</button>`
+          + `<p class="onb-desc">Or replace it:</p>`
+        : "")
+      + `<div class="onb-cmd onb-code-entry">`
+      + `<input class="onb-code-input onb-agy-key" type="password" maxlength="512" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste API key" aria-label="Gemini API key">`
+      + `<button class="onb-action" type="button" data-act="agySignInKey">Use key</button></div></div>`;
+  }
+
+  /** A host that did not name Muse or Antigravity gets no card for it. */
+  function onboardingAdvertised(mode, info) {
+    if ((info.provider === "muse" || mode === "muse-login" || mode === "missing-muse") && !museAdvertised) return false;
+    return agyAdvertised || !(info.provider === "agy" || mode === "agy-login" || mode === "missing-agy");
+  }
+
+  /** Antigravity's install and sign-in cards; its live sign-in flow is drawn
+   *  by the shared device-flow panel instead. True when it painted. */
+  function paintAgyCard(mode, info, onb, ver) {
+    if (!(mode === "missing-agy" || mode === "agy-login" && (IS_REMOTE || !info.device))) return false;
+    if (ver) setWelcomeStatus(mode === "missing-agy" ? "Antigravity not installed" : "Connect Antigravity", false);
+    onb.innerHTML = agyOnboardingPanel(mode, info);
+    updateSendButton();
+    return true;
+  }
+
   function showOnboarding(mode, info, beforeRender) {
     info = info || {};
-    if ((info.provider === "muse" || mode === "muse-login" || mode === "missing-muse") && !museAdvertised) return;
+    if (!onboardingAdvertised(mode, info)) return;
     state.onboardingMode = mode;
     state.onboardingInfo = info;
     if (beforeRender) beforeRender();
@@ -11250,7 +11654,8 @@
     const onb = $("welcome-onboarding");
     const ver = $("welcome-version");
     if (!onb) return;
-    if ((IS_REMOTE || info.provider === "muse" && museAvailable && info.device) && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required" || mode === "muse-login" && museAvailable)) {
+    if (paintAgyCard(mode, info, onb, ver)) return;
+    if ((IS_REMOTE || info.device && (info.provider === "muse" && museAvailable || info.provider === "agy")) && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required" || mode === "muse-login" && museAvailable || mode === "agy-login")) {
       // The card is an ENTRY POINT, not a second renderer: a live flow belongs
       // to the wizard, so the card keeps showing the offer underneath it.
       // The card NEVER renders a live flow. Stripping it only while the wizard
@@ -11308,7 +11713,8 @@
       const id = info.provider || "grok";
       const done = id === "codex"
         ? "You can start working with OpenAI!"
-        : id === "claude" ? "You can start clauding!" : id === "muse" ? "Muse Code is connected." : "You can start grokking!";
+        : id === "claude" ? "You can start clauding!" : id === "muse" ? "Muse Code is connected."
+        : id === "agy" ? "Antigravity is connected." : "You can start grokking!";
       if (ver) setWelcomeStatus("Connected", false);
       onb.innerHTML =
         `<div class="onb onb-connected">` +
@@ -11342,6 +11748,9 @@
             `</button>` +
             (museAvailable ? `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="muse">` +
               `<span class="onb-agent-mark">${providerLogoMarkup("muse")}</span><span><strong>Muse Code</strong><small>Meta Muse CLI</small></span>` +
+            `</button>` : "") +
+            (agyAdvertised ? `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="agy">` +
+              `<span class="onb-agent-mark">${providerLogoMarkup("agy")}</span><span><strong>Antigravity</strong><small>Google Antigravity (experimental)</small></span>` +
             `</button>` : "") +
           `</div>` +
         `</div>`;
@@ -13918,7 +14327,8 @@
     // Capability, never a version check: a host built before remote sign-in
     // drops `runGrokLogin` silently, and a button that does nothing is worse
     // than the honest dead end. Same rule the connect panel already follows.
-    const canSignIn = !IS_REMOTE || !!(state.hostCaps && state.hostCaps.remoteAgentSignIn);
+    // Antigravity signs in only at the desk: Google's page opens there.
+    const canSignIn = !IS_REMOTE || !!(state.hostCaps && state.hostCaps.remoteAgentSignIn) && provider !== "agy";
     // A sign-in already running is not an offer to make one. The code entry
     // closes the moment the code is submitted, but verifying it takes a second
     // or two -- and the card underneath went straight back to "Sign in", which
@@ -16208,15 +16618,12 @@
   function activityVerb() {
     if (state.activeProvider === "codex") return CODEX_ACTIVITY_VERB;
     if (state.activeProvider === "claude") return CLAUDE_ACTIVITY_VERB;
-    if (state.activeProvider === "muse") return "Working";
+    if (state.activeProvider === "muse" || state.activeProvider === "agy") return "Working";
     return GROK_ACTIVITY_VERB;
   }
 
   function activityAriaLabel() {
-    if (state.activeProvider === "codex") return "OpenAI is working";
-    if (state.activeProvider === "claude") return "Claude is working";
-    if (state.activeProvider === "muse") return "Muse Code is working";
-    return "Grok is working";
+    return `${agentName(true)} is working`;
   }
 
   function syncProviderVoice() {
@@ -16241,7 +16648,7 @@
     const el = document.createElement("div");
     el.className = "thinking-indicator";
     el.innerHTML = `<span class="thinking-indicator-icon">${ICON.brain}</span><span class="thinking-indicator-label">Thinking</span>${BLINK_DOTS}`;
-    el.setAttribute("aria-label", "Grok is thinking");
+    el.setAttribute("aria-label", `${agentName(true)} is thinking`);
     appendTranscriptChild(el);
     state.thinkingIndicatorEl = el;
     scrollToBottom();
@@ -16846,7 +17253,7 @@
 
   // ---------- question card (ask_user_question) ----------
 
-  // A "Grok is asking" label + the question text, prominent. Shared by the live
+  // An "<agent> is asking" label + the question text, prominent. Shared by the live
   // and restored cards so they look identical.
   function buildQuestionHead(el, headingText) {
     const title = document.createElement("div");
@@ -16888,7 +17295,7 @@
     el.className = "card question";
     el.dataset.questionReqId = String(req.id);
 
-    const title = buildQuestionHead(el, "Grok is asking");
+    const title = buildQuestionHead(el, `${agentName(true)} is asking`);
 
     // selections[i] = array of chosen labels for question i.
     const selections = questions.map(() => []);
@@ -17356,7 +17763,7 @@
     feedback.className = "plan-feedback";
     feedback.rows = 2;
     feedback.setAttribute("dir", "auto");
-    feedback.placeholder = "Optional comment — Grok decides what to do with it";
+    feedback.placeholder = `Optional comment — ${agentName(true)} decides what to do with it`;
     el.appendChild(feedback);
 
     const actions = document.createElement("div");
@@ -17918,8 +18325,10 @@
     strip.hidden = !!(link && (!link.reachable || !link.restored));
     const seconds = Math.floor(Math.max(0, Date.now() - startup.startedAt) / 1000);
     // A CLI update routinely takes minutes; only a stalled start is "slow".
-    const slow = seconds >= 20 && startup.stage !== "updating";
-    const provider = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse" }[startup.provider] || "Grok";
+    // Antigravity's Windows server unpacks itself on every start: 15-25 s is
+    // its ordinary start, not a stall.
+    const slow = seconds >= (startup.provider === "agy" ? 60 : 20) && startup.stage !== "updating";
+    const provider = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse", agy: "Antigravity" }[startup.provider] || "Grok";
     const count = Number.isInteger(startup.messageCount) && startup.messageCount >= 0 ? startup.messageCount + " " : "";
     const label = { updating: "Updating the " + provider + " CLI", starting: "Starting " + provider,
       opening: "Opening the conversation", loading: "Loading " + count + "messages" }[startup.stage];
@@ -17977,7 +18386,7 @@
       }
     } else if (state.startupStatus) {
       sendBtn.innerHTML = ICON.spinner;
-      const name = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse" }[state.startupStatus.provider] || "Grok";
+      const name = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse", agy: "Antigravity" }[state.startupStatus.provider] || "Grok";
       sendBtn.title = name + (state.startupStatus.stage === "updating" ? " is updating" : " is still starting");
       sendBtn.classList.add("initializing");
       sendBtn.disabled = true;
@@ -17996,7 +18405,7 @@
       sendBtn.disabled = true;
     } else if (composerHasSendIntent(input.value, state.chips)) {
       sendBtn.innerHTML = ICON.arrowUp;
-      sendBtn.title = "Queue — sends when Grok finishes";
+      sendBtn.title = `Queue — sends when ${agentName()} finishes`;
       sendBtn.disabled = false;
     } else {
       sendBtn.innerHTML = ICON.square;
@@ -18019,7 +18428,7 @@
     // Everything or nothing: an older host would ignore extra chips and queue
     // the text alone. Refuse rather than silently drop attachments.
     if (chips.length && !(state.hostCaps && state.hostCaps.queueSendChips)) {
-      addError("This host cannot queue attachments. Wait until Grok finishes, then send.");
+      addError(`This host cannot queue attachments. Wait until ${agentName()} finishes, then send.`);
       return true;
     }
     stopVoiceForManualSend();
@@ -18909,7 +19318,7 @@
     tag.innerHTML = `${ICON.clock}<span>${state.queuedSubmissionRejected || rejected ? "Not sent" : "Queued"}</span>`;
     tag.title = state.queuedSubmissionRejected || rejected
       ? "The relay rejected this prompt. Edit it to retry, or remove it."
-      : "Sends when Grok finishes";
+      : `Sends when ${agentName()} finishes`;
     const actions = document.createElement("span");
     actions.className = "queued-actions";
     const editBtn = document.createElement("button");
@@ -18957,7 +19366,7 @@
     if (state.steerSupported && steerableProvider()) {
       const steerBtn = document.createElement("button");
       steerBtn.className = "queued-action queued-steer";
-      steerBtn.title = "Steer — submit now without interrupting Grok";
+      steerBtn.title = `Steer — submit now without interrupting ${agentName()}`;
       steerBtn.innerHTML = `${ICON.cornerDownRight}<span>Steer</span>`;
       // pointerdown, NOT click: the queued block is pinned to the end of the
       // chat and every streamed chunk runs scrollToBottom, so while the agent is
@@ -20056,6 +20465,7 @@
       case "providerState":
         museAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "muse");
         museAvailable = museAdvertised && msg.providers.some(p => p && p.id === "muse" && !p.unavailableReason);
+        agyAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "agy");
         state.providersKnown = true;
         state.providers = Array.isArray(msg.providers) ? msg.providers.filter((provider) =>
           provider && Object.hasOwn(globalThis.GrokWebviewHelpers.PROVIDER_ACTIONS, provider.id)) : [];
@@ -20154,7 +20564,8 @@
         state.routineSavePending = false;
         state.routines = Array.isArray(msg.entries) ? msg.entries : [];
         state.routineProjects = Array.isArray(msg.projects) ? msg.projects : [];
-        state.routineModels = (Array.isArray(msg.models) ? msg.models : []).filter(m => m.provider !== "muse" || museAvailable);
+        state.routineModels = (Array.isArray(msg.models) ? msg.models : [])
+          .filter(m => (m.provider !== "muse" || museAvailable) && (m.provider !== "agy" || agyAdvertised));
         state.routineError = msg.error || "";
         state.routineErrorId = msg.errorId || "";
         refreshSettingsOverlay();
@@ -20168,6 +20579,21 @@
         };
         if (state.onboardingMode === "missing-codex") {
           showOnboarding("missing-codex", { ...state.onboardingInfo, reason: state.codexInstall.reason });
+        }
+        break;
+      case "agyInstallProgress":
+        state.agyInstall = {
+          phase: msg.phase || "idle",
+          receivedBytes: Number.isFinite(msg.receivedBytes) ? msg.receivedBytes : 0,
+          totalBytes: Number.isFinite(msg.totalBytes) ? msg.totalBytes : 0,
+          reason: typeof msg.reason === "string" ? msg.reason : "",
+        };
+        if (state.onboardingMode === "missing-agy") {
+          showOnboarding("missing-agy", { ...state.onboardingInfo, reason: state.agyInstall.reason });
+        }
+        if (connectWizard && connectWizard.agyOnboarding && connectWizard.agyOnboarding.mode === "missing-agy") {
+          connectWizard.agyOnboarding.info = { ...connectWizard.agyOnboarding.info, reason: state.agyInstall.reason };
+          renderConnectWizard();
         }
         break;
       case "planModeAvailability":
@@ -20542,6 +20968,7 @@
         if (!msg.info.provider || msg.info.provider === "grok") state.cliVersion = msg.info.version || "";
         state.startingPhase = true;
         state.onboardingMode = null;
+        setModelCatalogPending(true);
         if (!welcomeHoldActive()) setWelcomeStatus("Starting", true);
         const onb = $("welcome-onboarding");
         if (onb) onb.innerHTML = "";
@@ -20569,12 +20996,17 @@
         break;
       }
       case "session": {
+        // The question was about the conversation that was on screen.
+        if (projectPromptFor && projectPromptFor.sessionId && msg.sessionId !== projectPromptFor.sessionId) removeProjectPrompt();
+        projectPromptView = msg.sessionId || "";
         if (state.contextSelectionSessionId !== msg.sessionId) state.contextWindowSelection = undefined;
         state.contextSelectionSessionId = msg.sessionId;
 
         state.subscriptionWindows = [];
         state.currentModelId = msg.currentModelId;
-        state.activeProvider = msg.provider === "codex" || msg.provider === "claude" || msg.provider === "muse" && museAvailable ? msg.provider : "grok";
+        state.activeProvider = msg.provider === "codex" || msg.provider === "claude" || msg.provider === "muse" && museAvailable
+          || msg.provider === "agy" && agyAdvertised ? msg.provider : "grok";
+        state.activeProviderNamed = typeof msg.provider === "string" && !!msg.provider;
         // modeChanged is posted before session, so the button was painted for
         // the previous provider. Repaint once this frame names the new one.
         updateModeBtn(state.currentModeId);
@@ -20592,12 +21024,13 @@
         // whichever provider a later optimistic model pick happens to select.
         state.availableModels = (msg.models || [])
           .map(m => ({ ...m, provider: m.provider || state.activeProvider }))
-          .filter(m => m.provider !== "muse" || museAvailable);
+          .filter(m => (m.provider !== "muse" || museAvailable) && (m.provider !== "agy" || agyAdvertised));
         if (currentModel()?.reasoningEffort) state.effort = currentModel().reasoningEffort;
         refreshModelControls();
         renderProviderSignInCard();
         const m = state.availableModels.find((x) => x.modelId === msg.currentModelId && (!x.provider || x.provider === state.activeProvider));
         if (m?.totalContextTokens) state.contextWindow = m.totalContextTokens;
+        setModelCatalogPending(false);
         state.contextBreakdown = null;
         updateDonut(0);
         reportRemotePreferences();
@@ -21252,7 +21685,7 @@
         if (!state.replaying && (msg.req.options || []).length > 0) {
           // Tool titles can expose commands or file operations. The accessibility
           // cue says what the user must do without reading tool details aloud.
-          speakWaitingPrompt("Grok is waiting for your permission. Review the request and choose an option.");
+          speakWaitingPrompt(`${agentName(true)} is waiting for your permission. Review the request and choose an option.`);
         }
         break;
       case "permissionOptions":
@@ -21299,7 +21732,7 @@
             .map((question) => questionText(question))
             .filter(Boolean)
             .join(" ");
-          speakWaitingPrompt(questions || "Grok is waiting for your answer.");
+          speakWaitingPrompt(questions || `${agentName(true)} is waiting for your answer.`);
         }
         break;
       case "planHistory":
@@ -21469,6 +21902,7 @@
         speakCompletedTurn();
         break;
       case "exit":
+        if (state.modelCatalogPending) setModelCatalogPending(false);
         stopProcessingCue();
         hideGrokking();
         // A clean exit on an empty view is not an error: the composer's own
@@ -21633,6 +22067,9 @@
             if (!welcomeHoldActive()) setWelcomeStatus(`Connected${ver}`, false); // settled — no spinner
           }
         }
+        // The end of startup opens the chip whether or not a catalog came: on
+        // a failed start it shows what the picker shows on failure.
+        if (!state.busy && !state.replaying && state.modelCatalogPending) setModelCatalogPending(false);
         // Refresh the gear popover's model/effort lock state if it's open.
         if (!gearPopover.hidden) renderGearMain();
         syncModelChip();
@@ -21652,6 +22089,7 @@
         addSessionContextBanner();
         break;
       case "clearMessages":
+        removeProjectPrompt();
         for (const el of document.querySelectorAll(".confirm-overlay[data-confirm-req-id]")) {
           el._resolveConfirm();
         }
@@ -21688,7 +22126,7 @@
             // AFTER the mirror: renderConnectWizard reads it, and syncing
             // first painted the previous state every time (caught by driving
             // the states in a browser, 2026-08-31).
-            syncConnectWizard(msg.provider, msg.device, msg.state, { platform: msg.platform, launched: msg.launched });
+            syncConnectWizard(msg.provider, msg.device, msg.state, { platform: msg.platform, launched: msg.launched, agyChoice: msg.agyChoice, reason: msg.reason });
             // The composer card reads the same mirror, and this is the only
             // frame that moves it. Without this call its "Signing in…" state
             // waits for the next providerState -- which is the frame that
@@ -21697,6 +22135,7 @@
           }
         break;
       case "error":
+        if (state.modelCatalogPending) setModelCatalogPending(false);
         // The host refused to restore a specific conversation, and named it.
         // Keeping that id meant the next reload asked for the same dead
         // session, drew the same error, and re-armed itself — the owner could
@@ -21801,6 +22240,12 @@
         break;
       case "xaiNotification":
         break;
+      case "sessionOpening":
+        noteSessionOpening(msg);
+        break;
+      case "projectPrompt":
+        noteProjectPrompt(msg);
+        break;
       case "sessionRemoved": {
         if (!msg.id) break;
         const removed = state.sessions.find((s) => s.id === msg.id);
@@ -21810,6 +22255,7 @@
         if (pendingPin) clearTimeout(pendingPin.timer);
         pendingPins.delete(msg.id);
         state.pinnedSessions = state.pinnedSessions.filter((s) => s.id !== msg.id);
+        if (Array.isArray(state.recentSessions)) state.recentSessions = state.recentSessions.filter((s) => s.id !== msg.id);
         for (const preview of Object.values(state.repoPreviews)) {
           const before = preview.entries.length;
           preview.entries = preview.entries.filter((s) => s.id !== msg.id);
@@ -21971,6 +22417,11 @@
         if (msg.activeId !== undefined && offset === 0) noteHostIdentityKnown(msg.activeId || null);
         break;
       }
+      case "recentSessions":
+        state.recentSessions = uniqueSessionRows(Array.isArray(msg.entries) ? msg.entries : []);
+        state.dots = Object.assign({}, state.dots, msg.dots || {});
+        renderRail();
+        break;
       case "pinnedSessions": {
         state.pinnedSessionsKnown = true;
         state.pinnedSessions = uniqueSessionRows(msg.entries);
@@ -21990,6 +22441,7 @@
         const key = cwdKey(msg.cwd);
         state.repoPreviewsSupported = true;
         clearRailProbeDeadline(msg.cwd);
+        delete railProbeExtended[key];
         delete state.repoPreviewsAsked[key];
         if (msg.error) {
           delete state.repoPreviews[key];
@@ -22943,6 +23395,7 @@
         (onbAction.querySelector("small") || onbAction).textContent = "Checking…";
         if (connectWizard && connectWizard.provider === onbAction.dataset.provider) {
           connectWizard.museOnboarding = null;
+          connectWizard.agyOnboarding = null;
           connectWizard.checking = true;
           renderConnectWizard();
         }
@@ -22953,6 +23406,18 @@
       }
       else if (act === "installCodex") vscode.postMessage({ type: "installCodex" });
       else if (act === "cancelCodexInstall") vscode.postMessage({ type: "cancelCodexInstall" });
+      else if (act === "installAgy" && !IS_REMOTE && agyAdvertised) vscode.postMessage({ type: "installAgy" });
+      else if (act === "agySignInGoogle" && !IS_REMOTE && agyAdvertised) vscode.postMessage({ type: "agySignIn", method: "google" });
+      else if (act === "agySignInSavedKey" && !IS_REMOTE && agyAdvertised) vscode.postMessage({ type: "agySignIn", method: "api-key" });
+      else if (act === "agySignInKey" && !IS_REMOTE && agyAdvertised) {
+        const input = onbAction.closest(".onb") && onbAction.closest(".onb").querySelector(".onb-agy-key");
+        const key = input ? String(input.value || "").trim() : "";
+        if (!key) return;
+        // Not kept in the page once it is on its way to the host.
+        input.value = "";
+        vscode.postMessage({ type: "agySignIn", method: "api-key", key });
+      }
+      else if (act === "cancelAgyInstall" && !IS_REMOTE) vscode.postMessage({ type: "cancelAgyInstall" });
       else if (act === "runLogin") vscode.postMessage({ type: "runGrokLogin" });
       else if (act === "recheck") vscode.postMessage({ type: "recheckConnection", provider: onbAction.dataset.provider });
       else if (act === "connectProvider") vscode.postMessage({ type: "runGrokLogin", provider: onbAction.dataset.provider });
@@ -23122,7 +23587,7 @@
     const input = e.target && e.target.closest && e.target.closest(".onb-code-input");
     if (!input || input.disabled) return;
     e.preventDefault();
-    const btn = input.closest(".onb") && input.closest(".onb").querySelector('[data-act="submitDeviceLoginCode"]');
+    const btn = input.closest(".onb") && input.closest(".onb").querySelector('[data-act="submitDeviceLoginCode"], [data-act="agySignInKey"]');
     if (btn && !btn.disabled) btn.click();
   });
 

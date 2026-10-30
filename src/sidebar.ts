@@ -5,6 +5,10 @@ import { CloudHostUpdate, cloudHostIsIdle, cloudHostBootSupportsUpdate, cloudLiv
 import { MuseBackend, withMuseCredentialBackend } from "./muse-backend";
 import { locateMuseCli, parseMuseVersionOutput } from "./muse-cli-locator";
 import { museInstallCommand } from "./muse-install";
+import { AgyBackend, agyAcpDir, agySessionsFor, listAgyCatalog } from "./agy-backend";
+import { agyGatewayAuth, agyGatewayEnv, agyGoogleAuth, agyGoogleSignInPresent, isAgySignInMethod, normalizeAgyApiKey, runAgySignIn, type AgySignInMethod } from "./agy-auth";
+import { AgyKeyRelay, type AgyModelListing, type AgyRelayLease } from "./agy-key-relay";
+import { installManagedAgy, locateAgyServer } from "./agy-managed-installer";
 import type {
   Host,
   HostCancellationToken,
@@ -27,6 +31,14 @@ import type { AcpProvider, BackendSessionListEntry } from "./acp-backend";
 import { usesAdapterHistory, isInternalProvider, INTERNAL_PROVIDERS, supportsSessionDeletion, supportsHistoryDeletion, supportsModeSwitching, supportsAutoAccept, supportsClientMcpServers, usesPerCallContextOccupancy } from "./acp-backend";
 import { CODEX_ACP_ADAPTER_VERSION, CodexBackend, isCodexCredentialError } from "./codex-backend";
 import { locateCodexCli, resolveCodexHome } from "./codex-cli-locator";
+import { foldersWithRecentSends } from "./project-init";
+import {
+  AUTOMATED_CLAUDE_ENTRYPOINT,
+  AUTOMATED_CODEX_ORIGINATOR,
+  claudeConfigDir,
+  claudeEntrypoint,
+  codexOriginators,
+} from "./automated-sessions";
 import { readCodexSubscriptionWindows } from "./codex-usage";
 import { CODEX_MANAGED_VERSION, codexManagedRoot, installManagedCodex } from "./codex-managed-installer";
 import { CLI_NPM_PACKAGE, cliUpdatePlan, selfUpdateArgs } from "./cli-update-plan";
@@ -63,6 +75,7 @@ import {
   validateRoutine,
   manualWindowKey,
   routineSessionName,
+  ROUTINE_SESSION_TAG,
   type Routine,
   type RoutineModelOption,
   type RoutineProjectOption,
@@ -105,7 +118,7 @@ import { summarizeForSpeech } from "./speech-summary";
 import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
 import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isResumeNotFound, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
 import { createMcpPrepareState, prepareMcpToolCall } from "./mcp-tool";
-import { EFFORT_PREFS_KEY, MUSE_MODE_PREF_KEY, MUSE_ON_REQUEST_UNAVAILABLE, MUSE_CLOUD_ON_REQUEST_UNAVAILABLE, configWriteTarget, isMuseModeId, modeToRemember, rememberedEffort, sessionModes, startsInYolo, musePosture, museShellSandboxEnabled, usesClientAutoAccept, type ModeId, type MuseSettings, type EffortPrefs } from "./mode-prefs";
+import { EFFORT_PREFS_KEY, MUSE_MODE_PREF_KEY, MUSE_ON_REQUEST_UNAVAILABLE, MUSE_CLOUD_ON_REQUEST_UNAVAILABLE, configWriteTarget, isMuseModeId, modeToRemember, rememberedEffort, sessionModes, startsInNativeAuto, startsInYolo, musePosture, museShellSandboxEnabled, usesClientAutoAccept, type ModeId, type MuseSettings, type EffortPrefs } from "./mode-prefs";
 import { supportsApprovalModeSwitching } from "./acp-backend";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
 import {
@@ -135,8 +148,9 @@ import {
   deviceLoginCodeNote,
   noRemoteSignInMessage,
   deviceLoginUnavailable,
+  type DeviceLoginPlan,
 } from "./device-login";
-import { probeClaudeAuthStatus, runDeviceLogin, type DeviceLoginHandle } from "./device-login-run";
+import { probeClaudeAuthStatus, runDeviceLogin, type DeviceLoginCallbacks, type DeviceLoginHandle } from "./device-login-run";
 import {
   GITHUB_CLI_BIN,
   githubDeviceLoginFailureText,
@@ -366,6 +380,9 @@ import {
   findSessionCatalogCwd,
   forkDisplayName,
   indexSessions,
+  withinHistoryHorizon,
+  HISTORY_HORIZON_MS,
+  isRecentConversation,
   isEmptySession,
   isPathInside,
   isRepoColor,
@@ -388,9 +405,6 @@ import {
   sessionCatalogDirs,
   sessionDirFor,
 } from "./sessions";
-import { shouldHideAutoSession } from "./session-tags";
-import { COMMUNITY_BASE_VERSION, COMMUNITY_RELEASES_PAGE } from "./community-sync";
-import { peekCommunityLag } from "./release-peek";
 import {
   base64DecodedByteLength,
   isTrustedCodexGeneratedImagePath,
@@ -526,6 +540,12 @@ const SESSION_META_KEY = "grok.sessionMeta";
 // Older booleans included silent credential-probe promotions. Never import them.
 const PROVIDER_CONNECTIONS_KEY = "grok.providerConnections.v2";
 const PROVIDER_MODEL_CACHE_KEY = "grok.providerModelCache";
+/** How Antigravity signs in on this machine: a preference, never a secret. */
+const AGY_SIGN_IN_METHOD_KEY = "grok.agySignInMethod";
+/** HostSecrets key for the pasted Gemini API key. Nowhere else holds it. */
+const AGY_API_KEY_SECRET = "grok.agy.geminiApiKey";
+/** The last Gemini model listing the key relay saw: model names, never the key. */
+const AGY_MODEL_LISTING_KEY = "grok.agyModelListing";
 const PROJECT_PROVIDER_DEFAULTS_KEY = "grok.projectProviderDefaults";
 const REPO_PINS_KEY = "grok.repoPins";
 /** Timestamped archive choices, stored under ~/.grok/client-state rather than
@@ -589,6 +609,19 @@ const EXTRA_PROJECT_FOLDERS_KEY = "grok.extraProjectFolders";
  * `globalState` rather than the shared client-state.
  */
 const REMOVED_PROJECT_FOLDERS_KEY = "grok.removedProjectFolders";
+/**
+ * Folders the one-time Projects initialization added (project-init.ts): those
+ * the person sent a message in during the 30 days before it ran. Kept apart from
+ * the hand-added list so "Rebuild Projects from recent activity" can redo exactly
+ * what the initialization did and nothing the person chose. VS Code-local like
+ * the two lists above.
+ */
+const AUTO_PROJECT_FOLDERS_KEY = "grok.autoProjectFolders";
+/** The initialization has run on this host: `{ at, added }`. */
+const PROJECTS_INIT_KEY = "grok.projectsInit";
+/** "Never for this folder" answers to the Add-to-Projects prompt:
+ *  normalized folder key -> `{ cwd, at }`. VS Code-local, like the lists. */
+const PROJECT_PROMPT_NEVER_KEY = "grok.projectPromptNever";
 /** Shared client-state key for the anonymous per-install telemetry GUID (survives
  *  updates and identifies this machine across clients).
  *
@@ -775,10 +808,6 @@ export class GrokSidebar {
   private view?: HostWebviewView;
   /** Second local consumer of catalog-shaped host messages. Absent until resolved. */
   private projectsRail?: HostWebviewView;
-  /** Dedicated Sessions sidebar (Grok30m). Absent until that view resolves. */
-  private sessionsView?: HostWebviewView;
-  public static readonly panelType = "grok.panel";
-  public static readonly sessionsViewId = "grok.sessions";
   /** The session currently shown in the chat — one member of {@link pool}. */
   private focused = this.newLocalSession();
   /**
@@ -797,22 +826,24 @@ export class GrokSidebar {
    * (it's just a read cache, never a source of truth).
    */
   private sessionCache = new Map<string, { mtimeMs: number; entry: SessionListEntry }>();
-  /** Adapter catalogs come from ACP session/list rather than Grok's disk index. */
+  /** Adapter catalogs come from ACP session/list rather than Grok's disk index.
+   *  Keyed by project; filled for every project at once (listAdapterHistory). */
   private codexSessionCache = new Map<string, SessionListEntry[]>();
-  private codexSessionCacheAt = new Map<string, number>();
-  private codexSessionRefresh = new Map<string, Promise<void>>();
   private claudeSessionCache = new Map<string, SessionListEntry[]>();
-  private claudeSessionCacheAt = new Map<string, number>();
-  private claudeSessionRefresh = new Map<string, Promise<void>>();
   /**
    * One history process per PROVIDER, reused across every repo — not one per
    * repo, which is what the projects rail used to cost. `adapterHistoryClient`
    * carries the measurement that makes a single process sufficient.
    */
   private adapterHistoryClients = new Map<AcpProvider, { cliPath: string; client: AcpClient }>();
-  /** Serialises history listings onto that shared process, per provider. */
-  private adapterHistoryQueue = new Map<AcpProvider, Promise<void>>();
+  /** The folders a provider's history is listed for: every one asked about. */
+  private adapterHistoryFolders?: Map<AcpProvider, Map<string, string>>;
+  /** When a provider's history was last listed, or refused on credentials. */
+  private adapterHistoryStamps?: Map<AcpProvider, { at: number; refused?: boolean }>;
+  /** The listing running for a provider, which every caller shares. Never rejects. */
+  private adapterHistoryRuns?: Map<AcpProvider, Promise<void>>;
   private codexInstallAbort?: AbortController;
+  private agyInstallAbort?: AbortController;
   private providerConnectionState: ProviderConnections = {};
   private providerRuns = new Map<AcpProvider, AbortController>();
   private providerLoginAttempts = new Map<AcpProvider, AbortController>();
@@ -929,6 +960,12 @@ export class GrokSidebar {
   private readonly pendingTurnDiffCaptures = new WeakSet<object>();
   /** Cold session/load claims the persisted id before ACP has emitted `session`. */
   private readonly sessionLoadReservations = new Map<string, SessionLoadReservation>();
+  /** The newest local click on a conversation. A click waiting behind another
+   *  view's load gives way to any later click (see reserveBehindInFlightLoad). */
+  private localOpenSeq = 0;
+  /** Same, per remote client, for explicit claims (a tab's own taps). Created
+   *  on first use. */
+  private remoteOpenSeq?: Map<string, number>;
   /** Sessions being spawned on a remote tab's behalf — a reconnect burst must
    *  not start the same one twice. */
   private readonly startingForRemote = new WeakSet<Session>();
@@ -1000,8 +1037,17 @@ export class GrokSidebar {
   private museHistoryStart?: Promise<AcpClient | undefined>;
   private museHistoryGeneration = 0;
   private museSessionCache = new Map<string, SessionListEntry[]>();
-  private museSessionCacheAt = new Map<string, number>();
-  private museSessionRefresh = new Map<string, Promise<void>>();
+  private agyServerPath?: string;
+  /** The one place a Gemini API key goes; see agy-key-relay.ts. */
+  private agyRelay?: AgyKeyRelay;
+  /** Models whose agent answered an Auto request with its fallback, this run:
+   *  new conversations on them start in Agent mode without asking again. */
+  private nativeAutoUnavailable?: Set<string>;
+  /** What is stored for each way of signing Antigravity in -- never the key. */
+  private agySaved?: { google: boolean; apiKey: boolean };
+  /** Why the last Antigravity credential was refused, for the choice card. */
+  private agySignInError?: string;
+  private agySessionCache = new Map<string, SessionListEntry[]>();
   private readonly providerCliVersions: Partial<Record<AcpProvider, string>> = {};
   /** Accounts that are configured but answered an auth-shaped failure. Not the
    *  same as disconnected: the CLI is installed and the user meant to use it,
@@ -1044,6 +1090,7 @@ export class GrokSidebar {
     "setRoutinePaused",
     "runRoutineNow",
     "setShowThinking",
+    "setExperimentalAntigravity",
     "setAppPurpose",
     "setExpandCommandOutputs",
     "setSteerByDefault",
@@ -1775,6 +1822,14 @@ export class GrokSidebar {
       this.museCliPath = locateMuseCli({ configuredPath: this.host.getConfiguration("grok").get<string>("museCliPath", "") });
       return this.museCliPath;
     }
+    if (provider === "agy") {
+      if (this.agyServerPath && fs.existsSync(this.agyServerPath)) return this.agyServerPath;
+      this.agyServerPath = locateAgyServer({
+        configuredPath: this.host.getConfiguration("grok").get<string>("agyServerPath", ""),
+        managedStorageRoot: this.context.globalStorageUri.fsPath,
+      });
+      return this.agyServerPath;
+    }
     if (this.claudeCliPath && fs.existsSync(this.claudeCliPath)) return this.claudeCliPath;
     const located = locateClaudeCli({
       configuredPath: this.host.getConfiguration("grok").get<string>("claudeCliPath", ""),
@@ -1798,7 +1853,7 @@ export class GrokSidebar {
     await Promise.all(exiting);
     const { muse: _oldMuse, ...rest } = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
     await this.state.update(PROVIDER_MODEL_CACHE_KEY, rest);
-    this.museSessionCache.clear(); this.museSessionCacheAt.clear();
+    this.museSessionCache.clear(); this.adapterHistoryStamps?.delete("muse");
     this.postProviderState();
   }
 
@@ -1808,23 +1863,47 @@ export class GrokSidebar {
       codex: !!this.locateProvider("codex"),
       claude: !!this.locateProvider("claude"),
       muse: !!this.locateProvider("muse"),
+      // Not offered reads as not installed, so nothing can run it.
+      agy: this.agyOffered() && !!this.locateProvider("agy"),
     };
   }
 
-  private adapterHistory(provider: AcpProvider): {
-    cache: Map<string, SessionListEntry[]>;
-    at: Map<string, number>;
-    refresh: Map<string, Promise<void>>;
-  } | undefined {
-    if (provider === "codex") {
-      return { cache: this.codexSessionCache, at: this.codexSessionCacheAt, refresh: this.codexSessionRefresh };
-    }
-    if (provider === "muse") return {
-      cache: this.museSessionCache ??= new Map(), at: this.museSessionCacheAt ??= new Map(), refresh: this.museSessionRefresh ??= new Map(),
+  /**
+   * Antigravity is experimental and desk-only: off unless
+   * `grok.experimentalAntigravity` is set, and never on a cloud machine. Every
+   * Antigravity surface keys off the host advertising it, so this is the gate.
+   */
+  private agyOffered(): boolean {
+    return this.host?.getConfiguration?.("grok")?.get<boolean>("experimentalAntigravity", false) === true
+      && !isCloudEnvironment();
+  }
+
+  /** The card a session gets when its provider cannot start. Usable, not
+   *  connected: with only a lapsed provider left there is nothing to fall back
+   *  to, so offer the choice rather than this one provider's missing-CLI copy.
+   *  An Antigravity conversation with the experiment switched off gets the
+   *  choice too, without naming `agy`: renderers draw no card for a provider
+   *  the host does not advertise, and a blank page would swallow what the
+   *  person types next. */
+  private refusedStartOnboarding(provider: AcpProvider): {
+    state: "connect-agent" | ReturnType<typeof missingProviderState>;
+    provider?: AcpProvider;
+  } {
+    if (provider === "agy" && !this.agyOffered()) return { state: "connect-agent" };
+    return {
+      state: this.usableProviders().length ? missingProviderState(provider) : "connect-agent",
+      provider,
     };
-    if (provider === "claude") {
-      return { cache: this.claudeSessionCache, at: this.claudeSessionCacheAt, refresh: this.claudeSessionRefresh };
-    }
+  }
+
+  /** A provider's per-project rows. When they were listed, and the listing in
+   *  flight, are per PROVIDER (adapterHistoryStamps / adapterHistoryRuns): one
+   *  listing fills every project's rows at once. */
+  private adapterHistory(provider: AcpProvider): { cache: Map<string, SessionListEntry[]> } | undefined {
+    if (provider === "codex") return { cache: this.codexSessionCache };
+    if (provider === "muse") return { cache: this.museSessionCache ??= new Map() };
+    if (provider === "agy") return { cache: this.agySessionCache ??= new Map() };
+    if (provider === "claude") return { cache: this.claudeSessionCache };
     return undefined;
   }
 
@@ -1852,10 +1931,11 @@ export class GrokSidebar {
     }));
   }
 
-  private createProviderBackend(provider: AcpProvider): CodexBackend | ClaudeBackend | MuseBackend | undefined {
+  private createProviderBackend(provider: AcpProvider): CodexBackend | ClaudeBackend | MuseBackend | AgyBackend | undefined {
     if (provider === "codex") return new CodexBackend();
     if (provider === "claude") return new ClaudeBackend();
     if (provider === "muse") return new MuseBackend(undefined, isCloudEnvironment());
+    if (provider === "agy") return new AgyBackend();
     return undefined;
   }
 
@@ -1891,7 +1971,7 @@ export class GrokSidebar {
    * something available the session's own provider is the specific gap to
    * close, so show that.
    */
-  private onboardingForSession(session: Session): "connect-agent" | "auth-required" | "codex-login" | "claude-login" | "muse-login" {
+  private onboardingForSession(session: Session): "connect-agent" | "auth-required" | "codex-login" | "claude-login" | "muse-login" | "agy-login" {
     if (session.hasHistory) return providerLoginState(session.provider);
     return this.usableProviders().length ? providerLoginState(session.provider) : "connect-agent";
   }
@@ -1924,7 +2004,7 @@ export class GrokSidebar {
       void this.disposeAdapterHistoryClient(provider);
       // A reconnect must re-list immediately. Keeping the old freshness stamp
       // after dropping the rows creates a fresh-but-empty cache for ten seconds.
-      history?.at.clear();
+      this.adapterHistoryStamps?.delete(provider);
     }
     this.postProviderState();
     // Consent is recorded above, so this is now a plain local `--version` read:
@@ -1968,7 +2048,7 @@ export class GrokSidebar {
     if (needsLogin) this.invalidateSubscriptionUsage(provider);
     // A recovered account must be able to re-list at once; the freshness stamp
     // would otherwise hold the empty catalog for its full back-off window.
-    if (!needsLogin && usesAdapterHistory(provider)) this.adapterHistory(provider)?.at.clear();
+    if (!needsLogin && usesAdapterHistory(provider)) this.adapterHistoryStamps?.delete(provider);
     // And it must be able to RECOVER again. `authRecoveryTried` survives a
     // startSession on purpose (#58: an entitlement failure must not pay a
     // restart+resend on every prompt), and only a clean turn re-arms it -- which
@@ -2084,6 +2164,16 @@ export class GrokSidebar {
     const signal = this.providerRunSignal(provider);
     // MSP exposes no credential-status operation. A catalog read cannot prove sign-in.
     if (provider === "muse") return false;
+    // Antigravity's honest cheap answer is its stored sign-in. A probe process
+    // costs a 15-25 s start on Windows, and with a saved method but no token
+    // its session/new opens the browser.
+    if (provider === "agy") {
+      const present = !!(await this.agyCredentialFor());
+      if (signal.aborted) return false;
+      this.setProviderNeedsLogin("agy", !present);
+      void this.refreshAgySaved();
+      return present;
+    }
     if (provider === "codex" || provider === "claude") {
       // These throwaway ACP processes hold the binary too. Don't start one
       // during replacement; the updater explicitly re-observes afterward.
@@ -2200,7 +2290,8 @@ export class GrokSidebar {
 
     const isCloud = isCloudEnvironment();
     const unavailable = deviceLoginUnavailable(provider, { isCloud });
-    const plan = deviceLoginPlan(provider);
+    // Antigravity has no login command: it signs in over ACP (`runAgySignIn`).
+    const plan: DeviceLoginPlan | undefined = provider === "agy" ? { args: [] } : deviceLoginPlan(provider);
     // Before anything is spawned. A person who reads this fixes a setting in
     // fifteen seconds; a person who reads the failure afterwards has already
     // waited for it.
@@ -2290,7 +2381,7 @@ export class GrokSidebar {
     // flow in the map forever, silently blocking every later attempt.
     let settled = false;
     let handle: DeviceLoginHandle | undefined;
-    handle = runDeviceLogin(cliPath, plan.args, {
+    const callbacks: DeviceLoginCallbacks = {
       onPrompt: (prompt) => {
         if (signal.aborted || !this.hasProviderConsent(provider)) return;
         send({
@@ -2343,8 +2434,12 @@ export class GrokSidebar {
           message: deviceLoginFailureText(provider, result.failure, displayName),
         });
       },
-    }, undefined, provider === "muse" ? withMuseCredentialBackend(process.env) : undefined,
-    { needsCode: !!plan.needsCode });
+    };
+    handle = provider === "agy"
+      ? runAgySignIn(this.agySignInClient(cliPath, signal), callbacks)
+      : runDeviceLogin(cliPath, plan.args, callbacks, undefined,
+        provider === "muse" ? withMuseCredentialBackend(process.env) : undefined,
+        { needsCode: !!plan.needsCode });
     if (!settled) {
       if (handle) {
         entry.handle = handle;
@@ -2505,6 +2600,7 @@ export class GrokSidebar {
     if (!this.hasProviderConsent(provider)) return false;
     const signal = this.providerRunSignal(provider);
     if (provider === "muse") return this.providerCredentialFilePresent(provider);
+    if (provider === "agy") return this.reprobeProviderCredentials(provider, requireProof);
     if (provider === "claude") {
       const cliPath = this.locateProvider("claude");
       if (!cliPath) return false;
@@ -2524,6 +2620,7 @@ export class GrokSidebar {
   private providerCredentialFilePresent(provider: AcpProvider): boolean {
     try {
       if (provider === "muse") return fs.existsSync(path.join(os.homedir(), ".config", "muse", "auth.json"));
+      if (provider === "agy") return fs.existsSync(path.join(agyAcpDir(), "acp_token.json"));
       if (provider === "codex") return fs.existsSync(path.join(resolveCodexHome(), "auth.json"));
       // GROK_HOME, not a hardcoded ~/.grok: the CLI honours it and so does the
       // rest of this host, so hardcoding made the fallback miss a credential
@@ -2590,6 +2687,177 @@ export class GrokSidebar {
     void attempt(0);
   }
 
+  /** The server names its version in `initialize`; there is no other probe. */
+  private noteAgyVersion(init: any): void {
+    const version = init?.agentInfo?.version;
+    if (typeof version !== "string" || !version.trim() || this.providerCliVersions.agy === version.trim()) return;
+    this.providerCliVersions.agy = version.trim();
+    this.postProviderState();
+  }
+
+  /** Seam for host tests: the real probe reads the server's own files. */
+  private agyGoogleSignedIn(): Promise<boolean> {
+    return agyGoogleSignInPresent();
+  }
+
+  /** The way the person chose. Absent is Google: the only way there was. */
+  private agyMethod(): AgySignInMethod {
+    const saved = this.state?.get<string>(AGY_SIGN_IN_METHOD_KEY);
+    return isAgySignInMethod(saved) ? saved : "google";
+  }
+
+  private async agySavedKey(): Promise<string | undefined> {
+    try { return (await this.context.secrets.get(AGY_API_KEY_SECRET)) || undefined; }
+    catch { return undefined; }
+  }
+
+  /** Re-read what is stored for each way of signing in, for the choice card
+   *  and Settings. Booleans only; the key itself never leaves secrets. */
+  private async refreshAgySaved(): Promise<void> {
+    const [google, key] = await Promise.all([this.agyGoogleSignedIn().catch(() => false), this.agySavedKey()]);
+    const next = { google, apiKey: !!key };
+    if (next.google === this.agySaved?.google && next.apiKey === this.agySaved?.apiKey) return;
+    this.agySaved = next;
+    this.postProviderState();
+  }
+
+  /**
+   * What a server start signs in with for the chosen way, or undefined when
+   * that way holds nothing. Every start states its method: the server's
+   * settings.json is shared with other ACP clients on the machine.
+   */
+  private async agyCredentialFor(): Promise<{ method: "google" } | { method: "api-key"; key: string } | undefined> {
+    if (this.agyMethod() === "api-key") {
+      const key = await this.agySavedKey();
+      return key ? { method: "api-key", key } : undefined;
+    }
+    return (await this.agyGoogleSignedIn()) ? { method: "google" } : undefined;
+  }
+
+  private agyKeyRelay(): AgyKeyRelay {
+    return this.agyRelay ??= new AgyKeyRelay({
+      log: (line) => this.host.appendLine(line),
+      listings: {
+        get: () => this.state.get<AgyModelListing>(AGY_MODEL_LISTING_KEY),
+        set: (listing) => { void this.state.update(AGY_MODEL_LISTING_KEY, listing); },
+      },
+    });
+  }
+
+  /** The choice of how to sign in, answering a press at the desk. */
+  private async postAgyChoice(reason = this.agySignInError): Promise<void> {
+    await this.refreshAgySaved();
+    this.postLocal({
+      type: "onboarding", state: "agy-login", provider: "agy", platform: process.platform,
+      agyChoice: true, ...(reason ? { reason } : {}),
+    });
+  }
+
+  /**
+   * Connect Antigravity the way the person just chose. Consent is recorded
+   * here, by the choice, not by the Connect press that showed it. A live
+   * Antigravity process holds the credential it started with, so a renewal
+   * restarts them; the next send respawns each with the new one.
+   */
+  private async connectAgy(method: AgySignInMethod, cliPath: string, session: Session): Promise<void> {
+    await this.state.update(AGY_SIGN_IN_METHOD_KEY, method);
+    this.agySignInError = undefined;
+    for (const live of new Set([this.focused, ...this.pool, ...this.remoteClients.detachedActiveValues()])) {
+      if (live?.provider !== "agy" || !live.client) continue;
+      const client = this.detachClient(live);
+      void client?.dispose();
+      live.priming = false;
+      live.status = "idle";
+      this.emit(live, { type: "setBusy", value: false });
+    }
+    // ORDER: needs-login before the first frame that says connected.
+    this.setProviderNeedsLogin("agy", true);
+    await this.setProviderConnected("agy", true);
+    if (!this.hasProviderConsent("agy")) return;
+    const ready = !!(await this.agyCredentialFor());
+    await this.refreshAgySaved();
+    if (ready) {
+      this.setProviderNeedsLogin("agy", false);
+      await this.adoptSessionsForConnectedProvider("agy", session);
+      // Closes the connect dialog the choice was made in.
+      this.postLocal({ type: "onboarding", state: "provider-connected", provider: "agy", platform: process.platform });
+      return;
+    }
+    // Google with nothing stored: the browser sign-in, through the card.
+    await this.startDeviceLogin("agy", cliPath, undefined, { remote: false });
+  }
+
+  /** A refusal counts only when it is live. `session/load` replays the
+   *  conversation's old agent text, so a conversation that once got Google's
+   *  "API key not valid" would otherwise reject every new key on resume. */
+  private onAgyCredentialRejected(session: Session, gen: number): void {
+    if (gen !== session.gen || session.replaying) return;
+    void this.rejectAgyCredential();
+  }
+
+  /** Google refused the credential mid-turn. Back to the choice, saying so. */
+  private async rejectAgyCredential(): Promise<void> {
+    this.agySignInError = this.agyMethod() === "api-key"
+      ? "Google rejected this API key."
+      : "Google rejected the sign-in. Sign in again.";
+    this.setProviderNeedsLogin("agy", true);
+    await this.postAgyChoice();
+  }
+
+  /** The short-lived server a Google sign-in runs in. Born in the home
+   *  directory for the same reason the history process is. */
+  private agySignInClient(cliPath: string, signal: AbortSignal): AcpClient {
+    const consent = this.providerRunSignal("agy");
+    return new AcpClient({
+      signal: AbortSignal.any([consent, signal]),
+      cliPath,
+      cwd: this.projectHomeDir(),
+      env: { ...process.env },
+      backend: new AgyBackend(),
+      log: (message) => this.host.appendLine(message),
+    });
+  }
+
+  /** Download the pinned Antigravity server into extension storage. Desk only:
+   *  the message is host-local, and the gate keeps it off cloud machines. */
+  private async installManagedAgyServer(): Promise<void> {
+    if (this.agyInstallAbort || !this.agyOffered()) return;
+    if (this.locateProvider("agy")) {
+      this.postLocal({ type: "onboarding", state: "agy-login", provider: "agy", platform: process.platform });
+      return;
+    }
+    const controller = new AbortController();
+    this.agyInstallAbort = controller;
+    // One frame per percent: the archive arrives in thousands of chunks.
+    let lastStep = "";
+    try {
+      const binary = await installManagedAgy({
+        storageRoot: this.context.globalStorageUri.fsPath,
+        signal: controller.signal,
+        onProgress: (phase, value) => {
+          const percent = value?.totalBytes ? Math.floor((value.receivedBytes / value.totalBytes) * 100) : -1;
+          const step = `${phase}:${percent}`;
+          if (step === lastStep) return;
+          lastStep = step;
+          this.postLocal({ type: "agyInstallProgress", phase, receivedBytes: value?.receivedBytes, totalBytes: value?.totalBytes });
+        },
+      });
+      this.agyServerPath = binary;
+      this.postProviderState();
+      this.postLocal({ type: "agyInstallProgress", phase: "idle" });
+      this.postLocal({ type: "onboarding", state: "agy-login", provider: "agy", platform: process.platform });
+    } catch (error) {
+      const reason = controller.signal.aborted
+        ? "Antigravity installation was cancelled."
+        : `Antigravity installation failed: ${errorDetail(error)}`;
+      this.host.appendLine(`[agy] managed install failed: ${reason}`);
+      this.postLocal({ type: "agyInstallProgress", phase: "idle", reason });
+      this.postLocal({ type: "onboarding", state: "missing-agy", platform: process.platform, reason, provider: "agy" });
+    } finally {
+      if (this.agyInstallAbort === controller) this.agyInstallAbort = undefined;
+    }
+  }
+
   private async installManagedCodexCli(): Promise<void> {
     if (this.codexInstallAbort) return;
     const alreadyLocated = this.locateProvider("codex");
@@ -2640,6 +2908,7 @@ export class GrokSidebar {
     const codexConnected = connected.codex === true && located.codex === true;
     const claudeConnected = connected.claude === true && located.claude === true;
     const museConnected = connected.muse === true && located.muse === true;
+    const agyConnected = connected.agy === true && located.agy === true;
     this.lastProviderConnected = { grok: grokConnected, codex: codexConnected, claude: claudeConnected };
     // What the account button does on THIS host, so no page labels it
     // Disconnect for a host that would clear the CLI's credentials (`logout`).
@@ -2650,6 +2919,17 @@ export class GrokSidebar {
         { id: "muse", connected: museConnected, ...button,
           ...(museConnected && versions.muse ? { cliVersion: versions.muse } : {}),
           ...(needsLogin.muse ? { needsLogin: true } : {}) },
+        // Advertised only where it is offered; a renderer draws nothing for an
+        // agent its host did not name, so this is the whole on/off switch.
+        ...(this.agyOffered() ? [{ id: "agy" as const, connected: agyConnected, ...button,
+          ...(agyConnected && versions.agy ? { cliVersion: versions.agy } : {}),
+          ...(agyConnected && needsLogin.agy ? { needsLogin: true } : {}),
+          // The way last chosen, also after a Disconnect, so the choice can
+          // say which one Connect used before.
+          ...(agyConnected || this.state?.get(AGY_SIGN_IN_METHOD_KEY) ? { signInMethod: this.agyMethod() } : {}),
+          ...(this.agySaved && (this.agySaved.google || this.agySaved.apiKey) ? {
+            savedSignIns: [...(this.agySaved.google ? ["google" as const] : []), ...(this.agySaved.apiKey ? ["api-key" as const] : [])],
+          } : {}) }] : []),
         {
           id: "grok",
           connected: grokConnected,
@@ -2749,12 +3029,16 @@ export class GrokSidebar {
       this.codexCliPath = undefined;
       this.claudeCliPath = undefined;
       this.museCliPath = undefined;
+      this.agyServerPath = undefined;
+      if (this.agyOffered()) await this.refreshAgySaved();
       // Installation discovery is always local and remains available before Connect.
       const located = this.locatedProviders();
       await Promise.all(INTERNAL_PROVIDERS.map(async provider => {
         if (!located[provider] || !this.hasProviderConsent(provider)) return;
         if (opts.credentials === true) await this.reprobeProviderCredentials(provider).catch(() => false);
-        if (provider !== "grok") await this.reprobeProviderVersion(provider);
+        // Antigravity's version arrives with its handshake: there is no cheap
+        // `--version` for a server that takes 15-25 s to start on Windows.
+        if (provider !== "grok" && provider !== "agy") await this.reprobeProviderVersion(provider);
       }));
     } finally {
       this.providerRefreshInFlight = false;
@@ -2999,7 +3283,7 @@ export class GrokSidebar {
       void this.onMessage(m, "local").catch((e) => {
         const msg = (e as Error)?.message ?? String(e);
         this.host.appendLine(`[webview] ${m.type} failed: ${msg}`);
-        void this.host.showErrorMessage(`Grok: ${m.type} failed — ${msg}`);
+        void this.host.showErrorMessage(`AFK Pilot: ${m.type} failed — ${msg}`);
       });
     });
     this.restorePersistedDraft(this.focused);
@@ -3039,6 +3323,10 @@ export class GrokSidebar {
       }
       if (e.affectsConfiguration("grok.codexCliPath")) {
         this.codexCliPath = undefined;
+        this.postProviderState();
+      }
+      if (e.affectsConfiguration("grok.agyServerPath") || e.affectsConfiguration("grok.experimentalAntigravity")) {
+        this.agyServerPath = undefined;
         this.postProviderState();
       }
       if (e.affectsConfiguration("grok.museCliPath")) {
@@ -3183,7 +3471,7 @@ export class GrokSidebar {
       void this.onProjectsRailMessage(m).catch((e) => {
         const msg = (e as Error)?.message ?? String(e);
         this.host.appendLine(`[projects-rail] ${m.type} failed: ${msg}`);
-        void this.host.showErrorMessage(`Grok Projects: ${m.type} failed — ${msg}`);
+        void this.host.showErrorMessage(`AFK Pilot Projects: ${m.type} failed — ${msg}`);
       });
     });
   }
@@ -3191,218 +3479,6 @@ export class GrokSidebar {
   /** Drop the rail handle when the view is disposed (or re-created). */
   disposeProjectsRailView(): void {
     this.projectsRail = undefined;
-  }
-
-  attachSessionsView(view: HostWebviewView): void {
-    this.sessionsView = view;
-    view.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [
-        Uri.joinPath(this.context.extensionUri, "media"),
-        Uri.joinPath(this.context.extensionUri, "resources"),
-      ],
-    };
-    view.webview.html = this.getSessionsHtml(view.webview);
-    view.webview.onDidReceiveMessage((raw) => {
-      void this.onSessionsMessage(raw as WebviewMsg);
-    });
-    this.postSessionsList();
-  }
-
-  private grokConfig(): { get<T>(key: string, defaultValue: T): T } | undefined {
-    const get = this.host?.getConfiguration;
-    if (typeof get !== "function") return undefined;
-    const cfg = get.call(this.host, "grok") as { get?: unknown } | undefined;
-    if (!cfg || typeof cfg.get !== "function") return undefined;
-    return cfg as { get<T>(key: string, defaultValue: T): T };
-  }
-
-  private usesPanelTabs(): boolean {
-    return this.grokConfig()?.get<"panel" | "sidebar">("preferredLocation", "panel") === "panel";
-  }
-
-  useSessionsSidebar(): boolean {
-    return this.grokConfig()?.get<boolean>("sessionsSidebar", true) ?? true;
-  }
-
-  hideAutoSessions(): boolean {
-    return this.grokConfig()?.get<boolean>("hideAutoSessions", true) ?? false;
-  }
-
-  private webviewFor(session: Session): HostWebview | undefined {
-    if (this.usesPanelTabs()) {
-      return session.panel?.webview
-        ?? (session === this.focused ? this.view?.webview : undefined);
-    }
-    return session === this.focused ? this.view?.webview : undefined;
-  }
-
-  async openPreferred(): Promise<void> {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else await this.host.revealChatView();
-    if (this.useSessionsSidebar()) {
-      try {
-        await this.host.revealChatView();
-      } catch { /* Sessions lives in its own activity-bar view */ }
-    }
-  }
-
-  openPanel(): void {
-    this.ensurePanelForSession(this.focused);
-  }
-
-  async openSidebar(): Promise<void> {
-    await this.host.revealChatView();
-  }
-
-  private postToSessions(message: HostMsg): void {
-    if (message.type !== "sessions" && message.type !== "sessionDot") return;
-    void this.sessionsView?.webview.postMessage(message);
-  }
-
-  private async onSessionsMessage(msg: WebviewMsg): Promise<void> {
-    switch (msg.type) {
-      case "sessionsReady":
-        this.postSessionsList();
-        break;
-      case "listSessions":
-        this.postSessionsList({
-          offset: msg.offset,
-          limit: msg.limit,
-          query: msg.query,
-          providerCursor: msg.providerCursor,
-        });
-        break;
-      case "setHideAutoSessions":
-        void this.host.getConfiguration("grok").update("hideAutoSessions", !!msg.value);
-        this.postSessionsList();
-        break;
-      case "resumeSession":
-        await this.openSession(msg.id);
-        this.revealChat();
-        break;
-      case "renameSession":
-        this.renameSession(msg.id, msg.name, "local");
-        break;
-      case "deleteSession":
-        await this.deleteSession(msg.id, msg.name, "local");
-        break;
-      case "clearAllSessions":
-        await this.clearAllSessions(this.historyCwdFor("local"), "local");
-        break;
-      case "newSession":
-        await this.newFocusedSession("local");
-        this.revealChat();
-        break;
-    }
-  }
-
-  private revealChat(): void {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else void this.host?.revealChatView?.();
-  }
-
-  private panelTitleFor(session: Session): string {
-    const name = this.sessionDisplayName(session).trim();
-    return name || "Grok30m";
-  }
-
-  private updatePanelTitle(session: Session): void {
-    session.panel?.setTitle?.(this.panelTitleFor(session));
-  }
-
-  private ensurePanelForSession(session: Session, title?: string): void {
-    if (!this.usesPanelTabs() || typeof this.host.openEditorWebview !== "function") return;
-    if (!this.context?.extensionUri) return;
-    if (session.panel) {
-      session.panel.reveal();
-      this.updatePanelTitle(session);
-      return;
-    }
-    const panel = this.host.openEditorWebview({
-      viewType: GrokSidebar.panelType,
-      title: title ?? this.panelTitleFor(session),
-      localResourceRoots: this.chatLocalResourceRoots(),
-    });
-    if (!panel) return;
-    this.bindChatPanel(panel, session);
-  }
-
-  private claimPanelSession(session: Session): void {
-    if (this.focused === session) return;
-    // The tab the user is in, not a replay. focusSession() clears the webview
-    // and would wipe the composer they are about to paste into.
-    this.focused = session;
-    this.touch(session);
-    this.markRead(session);
-    this.updatePanelTitle(session);
-  }
-
-  private bindChatPanel(panel: HostEditorWebview, session: Session): void {
-    session.panel = panel;
-    // Subscribe before assigning html: a restored or cached editor webview can
-    // run scripts in the same turn, and a lost `ready` leaves Starting forever.
-    panel.onDidChangeViewState?.((active) => {
-      if (active) this.claimPanelSession(session);
-    });
-    panel.webview.onDidReceiveMessage((raw) => {
-      const m = raw as WebviewMsg;
-      // Blur of the tab being left must not steal focus back. Every other
-      // message is from the tab the user is acting in — including paste and send.
-      if (!(m.type === "composerFocus" && m.focused === false)) {
-        this.claimPanelSession(session);
-      }
-      if (m.type === "ready" && session.client) {
-        this.rehydrateWebviewFromFocused();
-        return;
-      }
-      void this.onMessage(m, "local").catch((e) => {
-        const text = (e as Error)?.message ?? String(e);
-        this.host.appendLine(`[webview] ${m.type} failed: ${text}`);
-        void this.host.showErrorMessage(`Grok: ${m.type} failed — ${text}`);
-      });
-    });
-    panel.webview.html = this.getHtml(panel.webview);
-    panel.onDidDispose(() => {
-      if (session.panel === panel) session.panel = undefined;
-    });
-  }
-
-  private getSessionsHtml(webview: HostWebview): string {
-    const nonce = getNonce();
-    const mediaUri = (file: string) =>
-      webview.asWebviewUri(Uri.joinPath(this.context.extensionUri, "media", file));
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
-<style>html, body { background: var(--vscode-sideBar-background); }</style>
-<link rel="stylesheet" href="${mediaUri("sessions.css")}" />
-</head>
-<body>
-  <div class="sessions-root">
-    <div class="sessions-header">
-      <span class="sessions-title">Sessions</span>
-      <button id="sessions-new-btn" class="sessions-new-btn" title="New session"></button>
-    </div>
-    <div class="sessions-search-wrap">
-      <input id="sessions-search" class="sessions-search" type="text" placeholder="Search sessions…" />
-    </div>
-    <label class="sessions-filter-auto" title="Hide automated sessions">
-      <input id="sessions-hide-auto" type="checkbox" checked />
-      <span>Hide automated</span>
-    </label>
-    <div id="sessions-list" class="sessions-list"></div>
-    <div id="sessions-footer" class="sessions-footer" hidden>
-      <button id="sessions-clear-btn" class="sessions-clear-all" title="Delete all sessions in this workspace's history"></button>
-    </div>
-  </div>
-  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
-  <script nonce="${nonce}" src="${mediaUri("sessions.js")}"></script>
-</body>
-</html>`;
   }
 
   private chatLocalResourceRoots(): Uri[] {
@@ -3488,7 +3564,7 @@ export class GrokSidebar {
         void this.trackAttach(this.pickFileFromComputer());
       } else {
         void this.host.showInformationMessage(
-          "Grok: open a file in the editor first, then run this command.",
+          "AFK Pilot: open a file in the editor first, then run this command.",
         );
       }
       return false;
@@ -3534,7 +3610,9 @@ export class GrokSidebar {
 
   async pickModel(): Promise<void> {
     if (!this.focused.client || !this.focused.client.availableModels.length) {
-      this.host.showInformationMessage("Start a session first.");
+      // A starting session has a client and no catalog yet: the picker stays
+      // shut until it has one, the same as the composer's model chip.
+      this.host.showInformationMessage(this.focused.client ? "Models are still loading." : "Start a session first.");
       return;
     }
     const models = this.modelsForSession(
@@ -3777,15 +3855,53 @@ See design doc for the full state machine diagram.`;
     if (session.provider === "muse") return session.client?.currentModeId ?? session.musePosture?.mode ?? "agent";
     if (session.planActive) return "plan";
     if (session.autoApprove) return "yolo";
+    if (session.nativeAuto) return "auto";
     return "agent";
+  }
+
+  /**
+   * Claude reported its native Auto, or answered an Auto request with its own
+   * fallback. Claude Code's Auto needs a model (and account) that supports it;
+   * without one the adapter switches to Accept edits instead -- which this host
+   * reads as Auto accept, answering every request. Settle once on Agent mode,
+   * the default before Auto, remember the model for this run so new
+   * conversations do not ask again, and never retry on its own.
+   */
+  private onNativeAutoMode(session: Session, client: AcpClient, modeId: "auto" | "acceptEdits"): void {
+    session.autoApprove = false;
+    if (modeId === "auto") {
+      // The Auto request's own reply, arriving after the fallback it caused.
+      if (!session.nativeAutoFellBack) session.nativeAuto = true;
+      this.setPlanActive(session, false);
+      return;
+    }
+    session.nativeAuto = false;
+    session.nativeAutoFellBack = true;
+    if (client.currentModelId) (this.nativeAutoUnavailable ??= new Set()).add(client.currentModelId);
+    this.setPlanActive(session, false);
+    void client.setMode("agent").catch(() => { /* stays in the adapter's fallback; gate is off either way */ });
+  }
+
+  /** A new Claude conversation's first mode: Auto, unless this run already
+   *  saw the model refuse it. */
+  private async startNativeAuto(session: Session, client: AcpClient): Promise<void> {
+    if (client.currentModelId && this.nativeAutoUnavailable?.has(client.currentModelId)) {
+      session.nativeAuto = false;
+      this.postMode(session);
+      return;
+    }
+    session.nativeAuto = true;
+    session.nativeAutoFellBack = false;
+    try { await client.setMode("auto"); }
+    catch {
+      session.nativeAuto = false;
+      this.postMode(session);
+    }
   }
 
   private postMode(session: Session = this.focused): void {
     const message = sessionModeMessage(session, this.displayMode(session));
-    if (session === this.focused) {
-      const webview = this.webviewFor(session);
-      if (webview) webview.postMessage(message);
-    }
+    if (session === this.focused) this.view?.webview.postMessage(message);
     this.sendRemoteSession(session, message);
   }
 
@@ -3955,7 +4071,7 @@ Only continue if you trust this code.`,
     if (!sessionModes(session.provider, session.museCloud).includes(modeId) && modeId !== "plan") return;
     // Muse switches approval without enabling the Plan path.
     if (!supportsModeSwitching(session.provider)) {
-      if (!supportsAutoAccept(session.provider)) return;
+      if (!supportsAutoAccept(session.provider) || modeId === "auto") return;
       if (modeId === "plan") {
         this.reportRequester(
           requester,
@@ -3981,7 +4097,7 @@ Only continue if you trust this code.`,
       }
       if (session.client !== client) return;
       if (remember) void this.rememberGrokConfig("defaultMode", remember);
-      await this.state.update(MUSE_MODE_PREF_KEY, modeId);
+      if (session.provider === "muse") await this.state.update(MUSE_MODE_PREF_KEY, modeId);
       if (session.client !== client) return;
       session.autoApprove = modeId === "yolo";
       if (session.musePosture) {
@@ -4031,6 +4147,27 @@ Only continue if you trust this code.`,
     if (remember) {
       void this.rememberGrokConfig("defaultMode", remember);
     }
+    if (modeId === "auto") {
+      // The agent's own Auto: it decides what is safe and asks about the
+      // rest, so those questions still reach the person (no client auto-accept).
+      const client = session.client;
+      session.autoApprove = false;
+      session.nativeAuto = true;
+      session.nativeAutoFellBack = false;
+      this.setPlanActive(session, false);
+      try { await client.setMode("auto"); }
+      catch (e) {
+        session.nativeAuto = false;
+        this.postMode(session);
+        this.reportRequester(requester, "error", `Couldn't switch mode: ${(e as Error).message}`);
+        return;
+      }
+      if (session.client === client && session.nativeAutoFellBack) {
+        this.reportRequester(requester, "warning", `${providerDisplayName(session.provider)}'s Auto mode isn't available for this model. Staying in Agent mode.`);
+      }
+      return;
+    }
+    session.nativeAuto = false;
     if (modeId === "yolo") {
       session.autoApprove = true;
       this.setPlanActive(session, false); // posts displayMode → "yolo"
@@ -4456,14 +4593,26 @@ Only continue if you trust this code.`,
    * case for archived, which is a client presentation concept and has no
    * business in the activity path.
    */
-  private noteSessionActivity(session: Session): void {
+  /** A conversation the person opened on purpose (`openedAt`), which keeps it
+   *  in Recent for a few days (RECENT_OPENED_MS). Never written by a listing. */
+  private async noteSessionOpened(id: string): Promise<void> {
+    const openedAt = Date.now();
+    await this.updateSessionMeta((current) => ({ ...current, [id]: { ...(current[id] ?? {}), openedAt } }));
+    this.postSessionsList();
+  }
+
+  private noteSessionActivity(session: Session, sent = false): void {
     const sid = session.activeSessionId ?? session.client?.sessionId;
     if (!sid) return;
     const activeAt = Date.now();
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const previous = overrides[sid] ?? {};
+    // `sentAt` is what puts a conversation in Recent (isRecentConversation).
+    // A routine's run is named before it sends, and is not the person.
+    const routineRun = (previous.customName ?? "").trim().startsWith(ROUTINE_SESSION_TAG);
     void this.state.update(SESSION_META_KEY, {
       ...overrides,
-      [sid]: { ...(overrides[sid] ?? {}), activeAt },
+      [sid]: { ...previous, activeAt, ...(sent && !routineRun ? { sentAt: activeAt } : {}) },
     });
     for (const provider of INTERNAL_PROVIDERS.filter(usesAdapterHistory)) {
       const history = this.adapterHistory(provider);
@@ -6290,7 +6439,7 @@ Only continue if you trust this code.`,
     const wt = session.worktree;
     if (!wt) {
       return void this.host.showInformationMessage(
-        "This session is not in a worktree. Start one with Grok: New Worktree Session.",
+        "This session is not in a worktree. Start one with AFK Pilot: New Worktree Session.",
       );
     }
     if (!session.client?.sessionId) {
@@ -6658,6 +6807,237 @@ Only continue if you trust this code.`,
     return raw.filter((c): c is string => typeof c === "string" && !!c && path.isAbsolute(c));
   }
 
+  /** Folders the one-time initialization added — see AUTO_PROJECT_FOLDERS_KEY. */
+  private autoProjectFolders(): string[] {
+    const raw = this.state.get<string[]>(AUTO_PROJECT_FOLDERS_KEY, []);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((c): c is string => typeof c === "string" && !!c && path.isAbsolute(c));
+  }
+
+  /**
+   * The folders that are projects on a VS Code host, by the person's own acts:
+   * the folder(s) VS Code has open, folders created, cloned or added here, the
+   * ones the initialization found they sent messages in, and any folder they
+   * pinned, coloured, gave an icon or archived. Never a folder for merely being
+   * in an agent's history. Tombstones still apply, in repoCatalog. Normalized
+   * key -> cwd.
+   */
+  private chosenProjectFolders(): Map<string, string> {
+    const out = new Map<string, string>();
+    const add = (cwd: unknown) => {
+      if (typeof cwd !== "string" || !cwd || !path.isAbsolute(cwd)) return;
+      const key = normalizeRepoPath(cwd);
+      if (key && !out.has(key)) out.set(key, cwd);
+    };
+    for (const cwd of this.openWorkspaceFolders()) add(cwd);
+    for (const cwd of this.extraProjectFolders()) add(cwd);
+    for (const cwd of this.autoProjectFolders()) add(cwd);
+    const decorations: Array<Record<string, { cwd?: string } | undefined>> = [
+      this.state.get<RepoPins>(REPO_PINS_KEY, {}),
+      this.state.get<RepoColors>(REPO_COLORS_KEY, {}),
+      this.state.get<RepoIcons>(REPO_ICONS_KEY, {}),
+      this.state.get<RepoArchives>(REPO_ARCHIVES_KEY, {}),
+    ];
+    for (const record of decorations) {
+      for (const choice of Object.values(record && typeof record === "object" ? record : {})) add(choice?.cwd);
+    }
+    return out;
+  }
+
+  /** The project rows the rails draw. Desktop: the open folders, which already
+   *  are the person's choice. VS Code: the catalog rows for the folders they
+   *  chose (chosenProjectFolders), plus the one the view is working in so the
+   *  selection always names a row. The full catalog stays the authorization set
+   *  and what conversations resolve against; only the list shrinks. Every chosen
+   *  row except the open folder can be taken back out (`added`). */
+  private displayedRepoEntries(
+    entries: RepoListEntry[],
+    inUse: Array<string | undefined> = [this.selectedRepoCwd, this.sessionCwd(this.focused)],
+  ): RepoListEntry[] {
+    if (this.host.canSwitchWorkspaceFolder) return entries;
+    const chosen = this.chosenProjectFolders();
+    const open = new Set(this.openWorkspaceFolders().map((c) => normalizeRepoPath(c)));
+    const current = inUse
+      .filter((c): c is string => !!c)
+      .map((c) => normalizeRepoPath(c));
+    return entries.flatMap((entry) => {
+      const key = normalizeRepoPath(entry.cwd);
+      if (chosen.has(key)) return [open.has(key) ? entry : { ...entry, added: true }];
+      return current.includes(key) ? [entry] : [];
+    });
+  }
+
+  /** Whether `cwd` is one of the person's projects (chosenProjectFolders). */
+  private isChosenProject(cwd: string): boolean {
+    return this.chosenProjectFolders().has(normalizeRepoPath(cwd));
+  }
+
+  private projectInitRunning?: Promise<void>;
+
+  /**
+   * The one-time Projects initialization, on a VS Code host (desktop and cloud
+   * hosts list only the folders they open, which already are the person's
+   * choice). Adds the folders the person SENT a message in through this host in
+   * the last 30 days (foldersWithRecentSends), once, and records that it ran;
+   * after it nothing from an agent's history adds a project. Folders the person
+   * removed are not brought back.
+   */
+  private initializeProjects(): Promise<void> {
+    if (this.host.canSwitchWorkspaceFolder) return Promise.resolve();
+    if (this.state.get(PROJECTS_INIT_KEY)) return Promise.resolve();
+    return this.projectInitRunning ??= this.runProjectInit("initialized")
+      .then(() => undefined)
+      .finally(() => { this.projectInitRunning = undefined; });
+  }
+
+  /** Never projects: smoke and scratch runs in the temp dir, and Grok's managed
+   *  worktrees (their conversations count for the project they came from). */
+  private projectInitExcludeRoots(): string[] {
+    return [os.tmpdir(), path.join(resolveGrokHome(process.env), "worktrees")];
+  }
+
+  private async runProjectInit(verb: "initialized" | "rebuilt"): Promise<{ kept: number; added: string[] }> {
+    const now = Date.now();
+    const found = foldersWithRecentSends(this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {}), now, {
+      excludeRoots: this.projectInitExcludeRoots(),
+    });
+    const removed = this.removedProjectFolderKeys();
+    const auto = new Set(this.autoProjectFolders().map((c) => normalizeRepoPath(c)));
+    const chosen = [...this.chosenProjectFolders().keys()].filter((key) => !auto.has(key));
+    const added = found.filter((cwd) => {
+      const key = normalizeRepoPath(cwd);
+      if (removed.has(key) || chosen.includes(key)) return false;
+      try { return fs.statSync(cwd).isDirectory(); } catch { return false; }
+    });
+    await this.state.update(AUTO_PROJECT_FOLDERS_KEY, added);
+    await this.state.update(PROJECTS_INIT_KEY, { at: now, added: added.length });
+    this.host.appendLine(
+      `[projects] ${verb} from recent activity: kept ${chosen.length} chosen project(s), ` +
+      `added ${added.length} folder(s) you sent messages in during the last 30 days` +
+      (added.length ? `: ${added.map((cwd) => path.basename(cwd) || cwd).join(", ")}` : ""),
+    );
+    this.postRepoCatalog();
+    this.postSessionsList();
+    return { kept: chosen.length, added };
+  }
+
+  /**
+   * "AFK Pilot: Rebuild Projects from recent activity". Forgets what the
+   * initialization added and runs it again with the 30-day rule. It leaves alone
+   * every folder the person created, cloned or added, their pins, colours, icons
+   * and archives, their "Never for this folder" answers, and everything on disk;
+   * running it twice gives the same list. A desktop or cloud host has nothing
+   * from history to rebuild: its list is the folders it opens.
+   */
+  async rebuildProjects(): Promise<void> {
+    if (this.host.canSwitchWorkspaceFolder) {
+      const open = this.openWorkspaceFolders().length;
+      this.host.appendLine(`[projects] rebuild: this app lists only the ${open} folder(s) you opened; nothing from history to rebuild, nothing changed`);
+      void this.host.showInformationMessage("Projects here are the folders you opened, so there is nothing to rebuild.");
+      return;
+    }
+    await this.projectInitRunning;
+    await this.state.update(AUTO_PROJECT_FOLDERS_KEY, []);
+    await this.state.update(PROJECTS_INIT_KEY, undefined);
+    const { kept, added } = await this.runProjectInit("rebuilt");
+    void this.host.showInformationMessage(
+      `Projects rebuilt: kept ${kept} you chose, added ${added.length} from the last 30 days.`,
+    );
+  }
+
+  /** Conversations already asked about this run ("Not now" lasts for the
+   *  conversation), and the folders a prompt is out for. */
+  private projectPromptAsked?: Set<string>;
+  private projectPromptOpen?: Map<string, { cwd: string; sessions: Set<Session> }>;
+
+  /** The project folder a conversation belongs to: its catalog row (a worktree
+   *  conversation resolves to the project it was made from), else its cwd. */
+  private projectFolderFor(cwd: string): string {
+    return this.resolveLocalRepoTarget(cwd)?.cwd ?? cwd;
+  }
+
+  /**
+   * The first time the person sends a message in a conversation whose folder is
+   * not a project, ask once, inline: "Add <folder> to Projects?" -- on whichever
+   * views show the conversation, the phone included. VS Code hosts only (a
+   * desktop or cloud host only runs conversations in folders it opened), never
+   * for a folder answered "Never", and not at all with `grok.askToAddProjects`
+   * off.
+   */
+  private maybeAskToAddProject(session: Session): void {
+    // A question beside the send, so it must never be what breaks one.
+    try { this.askToAddProject(session); }
+    catch (error) { this.host.appendLine?.(`[projects] add-to-projects prompt skipped: ${(error as Error).message}`); }
+  }
+
+  private askToAddProject(session: Session): void {
+    if (this.host.canSwitchWorkspaceFolder) return;
+    if (this.host.getConfiguration?.("grok")?.get<boolean>("askToAddProjects", true) === false) return;
+    const id = session.activeSessionId ?? session.client?.sessionId;
+    if (!id) return;
+    const asked = this.projectPromptAsked ??= new Set();
+    if (asked.has(id)) return;
+    const name = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.customName ?? "";
+    if (name.trim().startsWith(ROUTINE_SESSION_TAG)) return;
+    const sessionCwd = this.sessionCwd(session);
+    if (!sessionCwd) return;
+    const cwd = this.projectFolderFor(sessionCwd);
+    const key = normalizeRepoPath(cwd);
+    asked.add(id);
+    if (this.isChosenProject(cwd)) return;
+    if (this.state.get<Record<string, unknown>>(PROJECT_PROMPT_NEVER_KEY, {})[key]) return;
+    const open = this.projectPromptOpen ??= new Map();
+    const entry = open.get(key) ?? { cwd, sessions: new Set<Session>() };
+    entry.sessions.add(session);
+    open.set(key, entry);
+    this.emit(session, { type: "projectPrompt", sessionId: id, cwd, label: path.basename(cwd) || cwd });
+  }
+
+  /** Take every open prompt for `cwd` down, on every view showing it. */
+  private settleProjectPrompt(cwd: string): void {
+    const key = normalizeRepoPath(cwd);
+    const entry = this.projectPromptOpen?.get(key);
+    if (!entry) return;
+    this.projectPromptOpen!.delete(key);
+    for (const session of entry.sessions) {
+      const id = session.activeSessionId ?? session.client?.sessionId ?? "";
+      this.emit(session, { type: "projectPrompt", sessionId: id, cwd: entry.cwd, label: path.basename(entry.cwd) || entry.cwd, done: true });
+    }
+  }
+
+  /**
+   * Add a folder to Projects from the prompt or from Recent's menu, desk or
+   * phone. Only a folder this host offered may be named: one a prompt is out
+   * for, one Recent offered, or (from the desk) a folder it already lists
+   * conversations for. It is an ordinary added project afterwards.
+   */
+  private async addToProjects(cwd: string, origin: MsgOrigin): Promise<void> {
+    if (this.host.canSwitchWorkspaceFolder || !cwd) return;
+    const key = normalizeRepoPath(cwd);
+    const offered = !!this.projectPromptOpen?.has(key) || !!this.recentAddable?.has(key);
+    if (!offered && (origin === "remote" || !this.resolveLocalRepoTarget(cwd))) {
+      this.host.appendLine(`[projects] refused add-to-projects for a folder this host did not offer`);
+      return;
+    }
+    await this.rememberExtraProjectFolder(path.resolve(cwd), { select: false });
+    this.settleProjectPrompt(cwd);
+    this.postSessionsList();
+  }
+
+  private async answerProjectPrompt(cwd: string, choice: "notNow" | "never"): Promise<void> {
+    const key = normalizeRepoPath(cwd || "");
+    const entry = this.projectPromptOpen?.get(key);
+    if (!entry) return;
+    if (choice === "never") {
+      const never = this.state.get<Record<string, { cwd: string; at: number }>>(PROJECT_PROMPT_NEVER_KEY, {});
+      await this.state.update(PROJECT_PROMPT_NEVER_KEY, { ...never, [key]: { cwd: entry.cwd, at: Date.now() } });
+    }
+    this.settleProjectPrompt(entry.cwd);
+  }
+
+  /** Folders the last Recent offered to add (buildRecentSessions). */
+  private recentAddable?: Set<string>;
+
   /** Normalised keys of folders the user removed — see REMOVED_PROJECT_FOLDERS_KEY. */
   private removedProjectFolderKeys(): Set<string> {
     const raw = this.state.get<string[]>(REMOVED_PROJECT_FOLDERS_KEY, []);
@@ -6716,7 +7096,10 @@ Only continue if you trust this code.`,
       // Hand-added folders join them: on VS Code that is the only thing keeping
       // a never-used project in the rail, since it has no session history to be
       // discovered from.
-      trustedCwds: [...this.openWorkspaceFolders(), ...this.extraProjectFolders()],
+      // Folders the person chose by other means join them: the initialization's
+      // folders, and any folder they pinned, coloured, marked or archived --
+      // those are rows even when no Grok session ever ran there.
+      trustedCwds: [...this.openWorkspaceFolders(), ...this.extraProjectFolders(), ...this.chosenProjectFolders().values()],
       worktreeLabels,
       log: (m) => this.host.appendLine(m),
     });
@@ -6818,6 +7201,28 @@ Only continue if you trust this code.`,
    *  rows (a worktree is not a checkout you choose between, and `discoverRepos`
    *  excludes `<grokHome>/worktrees` by path), so their sessions have to surface
    *  under the parent — otherwise leaving a worktree session strands it. */
+  /**
+   * The worktrees session metadata records, read once per version of it. Every
+   * authorization check asks this for every project (localTrustedSessionCwds),
+   * and every rail preview makes several checks: on a desk with 7,221 records
+   * and sixty projects that scan was ~0.75 s per preview, serially, so the rail
+   * filled one project per second (profiled 2026-10-16). Keyed by identity:
+   * the state layer hands out a new object whenever the metadata changes.
+   */
+  private metaWorktreeRefCache?: WeakMap<SessionMetaOverrides, WorktreeParentRef[]>;
+
+  private metaWorktreeRefs(overrides: SessionMetaOverrides): WorktreeParentRef[] {
+    const cache = this.metaWorktreeRefCache ??= new WeakMap();
+    let refs = cache.get(overrides);
+    if (!refs) {
+      refs = Object.values(overrides)
+        .filter((o) => o.worktreePath)
+        .map((o) => ({ path: o.worktreePath!, sourceGitRoot: o.sourceGitRoot }));
+      cache.set(overrides, refs);
+    }
+    return refs;
+  }
+
   private sessionCwdsForRepo(repoCwd: string, overrides: SessionMetaOverrides): string[] {
     const cwds: string[] = [];
     const seen = new Set<string>();
@@ -6830,14 +7235,15 @@ Only continue if you trust this code.`,
     };
     add(repoCwd);
     const known: WorktreeParentRef[] = [
-      ...Object.values(overrides)
-        .filter((o) => o.worktreePath)
-        .map((o) => ({ path: o.worktreePath!, sourceGitRoot: o.sourceGitRoot })),
+      ...this.metaWorktreeRefs(overrides),
       ...this.worktreeCache.map((wt) => ({ path: wt.path, sourceGitRoot: wt.sourceRepo })),
       ...[...this.pool]
         .filter((s) => s.worktree)
         .map((s) => ({ path: s.worktree!.path, sourceGitRoot: s.worktree!.sourceGitRoot })),
     ];
+    // Nothing to match, so no git root to look up: that is a walk up the
+    // folder tree per project, on every authorization check.
+    if (!known.length) return cwds;
     for (const p of worktreeCwdsForRepo({
       repoCwd,
       repoGitRoot: gitRootForPath(repoCwd, defaultFs) ?? repoCwd,
@@ -6914,10 +7320,11 @@ Only continue if you trust this code.`,
     // Both local and remote attached clients see the host's catalog: curated
     // open folders on desktop, full discovery on VS Code. Archive fields only
     // when canArchiveRepos (already applied inside localRepoCatalogEntries).
-    const localEntries = this.localRepoCatalogEntries().map((entry) => ({
+    const catalogEntries = this.localRepoCatalogEntries().map((entry) => ({
       ...entry,
       defaultProvider: this.defaultProviderForProject(entry.cwd),
     }));
+    const localEntries = this.displayedRepoEntries(catalogEntries);
     const activeCwd = this.sessionCwd(this.focused);
     const selectedKey = normalizeRepoPath(this.selectedHistoryCwd());
     const selected = localEntries.find((r) => normalizeRepoPath(r.cwd) === selectedKey);
@@ -6967,7 +7374,7 @@ Only continue if you trust this code.`,
       workspaceCwd: this.workspaceRoot() || "",
     });
     for (const clientId of this.remoteClients.clients()) {
-      this.sendRemoteClient(clientId, this.buildRemoteReposMsg(clientId, localEntries));
+      this.sendRemoteClient(clientId, this.buildRemoteReposMsg(clientId, catalogEntries));
     }
   }
 
@@ -6978,7 +7385,7 @@ Only continue if you trust this code.`,
    */
   private buildRemoteReposMsg(
     clientId: string,
-    entries: RepoListEntry[] = this.localRepoCatalogEntries().map((entry) => ({
+    catalog: RepoListEntry[] = this.localRepoCatalogEntries().map((entry) => ({
       ...entry,
       defaultProvider: this.defaultProviderForProject(entry.cwd),
     })),
@@ -6992,6 +7399,9 @@ Only continue if you trust this code.`,
       const sc = this.sessionCwd(active);
       if (authorizedListCwd(sc, authorized, pathsEqual)) activeCwd = sc;
     }
+    // The tab's own list: the person's projects plus whatever folder THIS tab is
+    // in (displayedRepoEntries), so its selection names a row too.
+    const entries = this.displayedRepoEntries(catalog, [selectedCwd, activeCwd]);
     // Per-tab fields and rows must still exclude projects actually removed.
     const reachable = entries.filter((r) => cwdIsAuthorized(r.cwd, authorized, pathsEqual));
     return {
@@ -7906,7 +8316,8 @@ Only continue if you trust this code.`,
    * — so the rail lands on the project you just added, expanded and ready, while
    * VS Code itself has not moved.
    */
-  private async rememberExtraProjectFolder(resolved: string): Promise<void> {
+  private async rememberExtraProjectFolder(resolved: string, opts: { select?: boolean } = {}): Promise<void> {
+    const select = opts.select !== false;
     let ok = false;
     try {
       ok = fs.statSync(resolved).isDirectory();
@@ -7918,23 +8329,11 @@ Only continue if you trust this code.`,
       return;
     }
     const key = normalizeRepoPath(resolved);
-    // Already here on its own — the open workspace folder, or a project Grok has
-    // run in. Recording it as hand-added would be a lie with consequences: the
-    // row would gain a Remove action, and removing it tombstones a project that
-    // has other reasons to exist. Worst of all for the OPEN folder, whose access
-    // cannot be revoked at all (`localTrustedSessionCwds` adds `workspaceRoot()`
-    // unconditionally, and every remote gate reads that set) — the row would
-    // vanish while the phone carried on reading and writing it. Just go there.
-    const alreadyListed =
-      !!this.resolveLocalRepoTarget(resolved) ||
-      pathsEqual(resolved, this.workspaceRoot() || "");
-    if (alreadyListed) {
-      await this.selectRepo(resolved);
-      return;
-    }
     // Adding a folder is the undo for having removed it. Without this the
     // tombstone would outlive the decision and the picker would appear to do
-    // nothing at all.
+    // nothing at all. First, before "already listed": a hidden folder can still
+    // count as chosen through a colour, a mark or an archive answer, and
+    // returning early for it left the tombstone in place -- Add did nothing.
     const tombstones = this.state.get<string[]>(REMOVED_PROJECT_FOLDERS_KEY, []);
     if (Array.isArray(tombstones) && tombstones.some((c) => normalizeRepoPath(c) === key)) {
       await this.state.update(
@@ -7942,13 +8341,31 @@ Only continue if you trust this code.`,
         tombstones.filter((c) => normalizeRepoPath(c) !== key),
       );
     }
+    // Already here on its own — the open workspace folder, or a project Grok has
+    // run in. Recording it as hand-added would be a lie with consequences: the
+    // row would gain a Remove action, and removing it tombstones a project that
+    // has other reasons to exist. Worst of all for the OPEN folder, whose access
+    // cannot be revoked at all (`localTrustedSessionCwds` adds `workspaceRoot()`
+    // unconditionally, and every remote gate reads that set) — the row would
+    // vanish while the phone carried on reading and writing it. Just go there.
+    // A folder Grok has merely run in is not a project any more (it is in the
+    // catalog, not the list), so "already listed" means already CHOSEN.
+    const alreadyListed =
+      this.isChosenProject(resolved) ||
+      pathsEqual(resolved, this.workspaceRoot() || "");
+    if (alreadyListed) {
+      if (select) await this.selectRepo(resolved);
+      else this.postRepoCatalog();
+      return;
+    }
     const stored = this.extraProjectFolders();
     if (!stored.some((c) => normalizeRepoPath(c) === key)) {
       await this.state.update(EXTRA_PROJECT_FOLDERS_KEY, [...stored, resolved]);
     }
     // Already in the catalog by other means (open folder, or Grok has run there)
     // is not a failure — the user still gets taken to it.
-    await this.selectRepo(resolved);
+    if (select) await this.selectRepo(resolved);
+    else this.postRepoCatalog();
   }
 
   /**
@@ -7992,10 +8409,15 @@ Only continue if you trust this code.`,
       return;
     }
     const key = normalizeRepoPath(cwd);
+    // Any chosen row can be taken back out, not only a hand-added one: the
+    // initialization's folders and the decorated ones are projects too now.
+    if (!this.isChosenProject(cwd)) return;
     const stored = this.extraProjectFolders();
     const next = stored.filter((c) => normalizeRepoPath(c) !== key);
-    if (next.length === stored.length) return;
-    await this.state.update(EXTRA_PROJECT_FOLDERS_KEY, next);
+    if (next.length !== stored.length) await this.state.update(EXTRA_PROJECT_FOLDERS_KEY, next);
+    const auto = this.autoProjectFolders();
+    const nextAuto = auto.filter((c) => normalizeRepoPath(c) !== key);
+    if (nextAuto.length !== auto.length) await this.state.update(AUTO_PROJECT_FOLDERS_KEY, nextAuto);
     // …and the PIN, or this removes nothing.
     //
     // `discoverRepos` keeps a pinned cwd in the catalog on its own — "a pin is
@@ -8636,6 +9058,116 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return { entries: filtered, dots };
   }
 
+  /** Whether a conversation was started by automation (automated-sessions.ts),
+   *  per id: the marker is in a file the CLI wrote once, so it never changes. */
+  private automatedSessionCache?: Map<string, boolean>;
+
+  /**
+   * Recent: the conversations the person sent something in through this host,
+   * or opened here in the last few days (isRecentConversation) -- across every
+   * folder this host may list, including folders that are not projects -- minus
+   * anything automation started, newest first, inside the history horizon.
+   *
+   * Built from our own record (`grok.sessionMeta`), so a CLI history full of
+   * benchmark or `codex exec` runs adds nothing to it. Each candidate's folder
+   * is listed through `buildSessionsList`, so the rows are the same rows a
+   * project's list shows (titles, providers, live conversations, the horizon).
+   * Before `providerCwd` (stamped at every session start since 2026-08-13) a
+   * conversation names no folder; those predate the horizon anyway.
+   */
+  private buildRecentSessions(): { entries: SessionListEntry[]; dots: Record<string, Dot> } {
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const now = Date.now();
+    const authorized = this.authorizedSessionCwds();
+    const wanted = new Set<string>();
+    const folders = new Map<string, string>();
+    for (const [id, meta] of Object.entries(overrides)) {
+      if (!isRecentConversation(meta, now)) continue;
+      // Our own last word on it must be inside the horizon too, before any
+      // folder is listed: this runs with every history refresh, and most
+      // conversations ever sent in are months old. (One with no time of ours
+      // predates these stamps, 2026-08, so it is older than the horizon.)
+      const ours = Math.max(meta.sentAt ?? 0, meta.activeAt ?? 0, meta.openedAt ?? 0);
+      if (!(ours > 0) || ours < now - HISTORY_HORIZON_MS) continue;
+      const where = meta.providerCwd;
+      if (!where || !authorizedListCwd(where, authorized, pathsEqual)) continue;
+      wanted.add(id);
+      folders.set(normalizeFsPath(where), where);
+    }
+    for (const session of this.pool ?? []) {
+      const id = session.activeSessionId;
+      if (id && isRecentConversation(overrides[id], now)) {
+        const where = this.sessionCwd(session);
+        if (where && authorizedListCwd(where, authorized, pathsEqual)) {
+          wanted.add(id);
+          folders.set(normalizeFsPath(where), where);
+        }
+      }
+    }
+    const byId = new Map<string, SessionListEntry>();
+    for (const cwd of folders.values()) {
+      for (const entry of this.buildSessionsList(cwd, { offset: 0, limit: SESSION_PAGE_SIZE }, null).entries) {
+        if (wanted.has(entry.id) && !byId.has(entry.id)) byId.set(entry.id, entry);
+      }
+    }
+    const ordered = [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+    const entries: SessionListEntry[] = [];
+    for (const entry of ordered) {
+      if (entries.length >= GrokSidebar.RECENT_LIMIT) break;
+      if (!this.isAutomatedSession(entry, now)) entries.push(entry);
+    }
+    // A conversation in a folder that is not a project offers to add it
+    // (Recent's "Add to Projects"). VS Code only: elsewhere every folder a
+    // conversation can run in is already one.
+    const addable = new Set<string>();
+    if (this.host && !this.host.canSwitchWorkspaceFolder) {
+      const chosen = this.chosenProjectFolders();
+      const rows = this.localRepoCatalogEntries();
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const meta = overrides[entry.id];
+        const home = meta?.worktreePath && meta.sourceGitRoot ? meta.sourceGitRoot : entry.cwd;
+        const row = rows.find((r) => pathsEqual(r.cwd, home));
+        if (!row || chosen.has(normalizeRepoPath(row.cwd))) continue;
+        addable.add(normalizeRepoPath(row.cwd));
+        entries[i] = { ...entry, addableCwd: row.cwd };
+      }
+    }
+    this.recentAddable = addable;
+    const dots: Record<string, Dot> = {};
+    for (const entry of entries) dots[entry.id] = this.dotForId(entry.id);
+    return { entries, dots };
+  }
+
+  /** Rows Recent sends; the renderers show up to this many. */
+  private static readonly RECENT_LIMIT = 10;
+
+  private isAutomatedSession(entry: SessionListEntry, now: number): boolean {
+    if (entry.automated) return true;
+    const cache = this.automatedSessionCache ??= new Map();
+    const known = cache.get(entry.id);
+    if (known !== undefined) return known;
+    let automated = false;
+    if (entry.provider === "codex") {
+      const days = Math.ceil(HISTORY_HORIZON_MS / (24 * 60 * 60 * 1000));
+      const originator = codexOriginators(resolveCodexHome(process.env), new Set([entry.id]), now, days).get(entry.id);
+      automated = originator === AUTOMATED_CODEX_ORIGINATOR;
+    } else if (entry.provider === "claude") {
+      automated = claudeEntrypoint(claudeConfigDir(process.env), entry.cwd, entry.id) === AUTOMATED_CLAUDE_ENTRYPOINT;
+    }
+    cache.set(entry.id, automated);
+    return automated;
+  }
+
+  private postRecentSessions(): void {
+    const hasRemote = this.remoteClients.clients().length > 0;
+    const hasLocalRail = this.host.canSwitchWorkspaceFolder || !!this.projectsRail;
+    if (!hasRemote && !hasLocalRail) return;
+    const message: HostMsg = { type: "recentSessions", ...this.buildRecentSessions() };
+    if (hasLocalRail) this.postLocal(message);
+    for (const id of this.remoteClients.clients()) this.sendRemoteClient(id, message);
+  }
+
   private postPinnedSessions(clientId?: string, requestId?: string): void {
     const hasRemote = this.remoteClients.clients().length > 0;
     // Desktop multi-folder rail OR the VS Code primary-side-bar projects view.
@@ -8715,7 +9247,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const mime = m.mimeType || guessMediaMime(m.path);
       // Trusted session media: stream from disk when the webview can.
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) {
         const src = webview.asWebviewUri(Uri.file(m.path));
         // Copy image needs PIXELS, and a webview cannot read them back out of an
@@ -8873,6 +9405,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (opts.report) opts.report(text);
       else void this.host.showErrorMessage(text);
     };
+    if (provider === "agy") {
+      await this.signOutAgy(opts, fail);
+      return;
+    }
     if (usesAdapterHistory(provider)) {
       const cliPath = this.locateProvider(provider);
       const name = providerDisplayName(provider);
@@ -8954,6 +9490,60 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       return;
     }
     await this.finishProviderLogout("grok", opts.report);
+  }
+
+  /**
+   * Antigravity has no CLI to run `logout` with: the server clears its own
+   * stored Google sign-in through ACP `logout`, in a server started for it.
+   */
+  private async signOutAgy(
+    opts: { fromRemote?: boolean; report?: (text: string) => void },
+    fail: (text: string) => void,
+  ): Promise<void> {
+    if (this.agyMethod() === "api-key") {
+      if (!opts.fromRemote) {
+        const choice = await this.host.showWarningMessage(
+          "Sign out of Antigravity? This deletes the Gemini API key saved in this app.",
+          { modal: true },
+          "Sign Out",
+        );
+        if (choice !== "Sign Out") return;
+      }
+      try { await this.context.secrets.delete(AGY_API_KEY_SECRET); }
+      catch (error) {
+        fail(`Antigravity sign-out failed: ${errorDetail(error)}. The account remains connected.`);
+        return;
+      }
+      await this.refreshAgySaved();
+      await this.finishProviderLogout("agy", opts.report);
+      return;
+    }
+    const cliPath = this.locateProvider("agy");
+    if (!cliPath) {
+      fail("Antigravity sign-out could not run because the Antigravity server is not installed. The account remains connected.");
+      return;
+    }
+    if (!opts.fromRemote) {
+      const choice = await this.host.showWarningMessage(
+        "Sign out of Antigravity? This clears the Google sign-in Antigravity stored on this machine.",
+        { modal: true },
+        "Sign Out",
+      );
+      if (choice !== "Sign Out") return;
+    }
+    const client = this.agySignInClient(cliPath, new AbortController().signal);
+    try {
+      await client.start();
+      await client.logout();
+    } catch (error) {
+      fail(`Antigravity sign-out failed: ${errorDetail(error)}. The account remains connected.`);
+      this.postProviderState();
+      return;
+    } finally {
+      await client.dispose();
+    }
+    await this.refreshAgySaved();
+    await this.finishProviderLogout("agy", opts.report);
   }
 
   /**
@@ -9380,6 +9970,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.uplink = undefined;
     this.codexInstallAbort?.abort(new Error("Installation cancelled."));
     this.codexInstallAbort = undefined;
+    this.agyInstallAbort?.abort(new Error("Installation cancelled."));
+    this.agyInstallAbort = undefined;
+    void this.agyRelay?.close();
     try { this.keepAwake.stop(); } catch { /* the pid watcher reaps it anyway */ }
     try { this.settingsEditor?.dispose(); } catch { /* tab already gone */ }
     this.settingsEditor = undefined;
@@ -9460,6 +10053,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private probeProviderVersion(provider: AcpProvider): Promise<string> {
     if (!this.hasProviderConsent(provider)) return Promise.resolve("");
+    if (provider === "agy") return Promise.resolve(this.providerCliVersions.agy ?? "");
     if (provider === "codex") return this.probeCodexVersion();
     if (provider === "claude") return this.probeClaudeVersion();
     if (provider === "muse") return this.probeMuseVersion();
@@ -10044,7 +10638,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await Promise.all(affected().map((s) => this.waitForSessionStart(s)));
       await (provider === "codex" ? this.codexVersionProbe : this.claudeVersionProbe);
       await Promise.all(this.providerModelProbes?.get(provider) ?? []);
-      await Promise.all(this.adapterHistory(provider)?.refresh?.values() ?? []);
+      await this.adapterHistoryRuns?.get(provider);
       // The history listener is a LONG-LIVED process now, one per provider
       // rather than one per listing, so it outlives the drain above and holds
       // the binary exactly as those throwaways did. Await its real exit.
@@ -10427,12 +11021,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.postProviderState();
       this.emit(target, {
         type: "onboarding",
-        // Usable, not connected — with only a lapsed provider left there is
-        // nothing to fall back to, so offer the choice rather than this one
-        // provider's missing-CLI copy.
-        state: this.usableProviders().length ? missingProviderState(target.provider) : "connect-agent",
+        ...this.refusedStartOnboarding(target.provider),
         platform: process.platform,
-        provider: target.provider,
       });
       return undefined;
     }
@@ -10554,6 +11144,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // it so the button shows "Auto accept" instead of a misleading "Agent" (#31).
     // Applies to resumed sessions too (the config is global, not per-session).
     const configAutoApprove = session.provider === "grok" && this.configForcesAutoApprove(this.sessionCwd(session));
+    // A provider with its own Auto starts in it when nothing else was chosen
+    // (#25 still wins: an explicit Agent or Auto accept is kept). Set before the
+    // first paint so the badge does not flash Agent; the agent may still refuse.
+    const nativeAutoStart = !rememberedYolo && startsInNativeAuto(
+      session.provider,
+      this.host.getConfiguration("grok").get<string>("defaultMode", ""),
+      !!resumeId,
+    );
+    session.nativeAuto = nativeAutoStart;
+    session.nativeAutoFellBack = false;
     session.museCloud = session.provider === "muse" && isCloudEnvironment();
     session.musePosture = session.provider === "muse" ? musePosture(
       this.state.get<string>(MUSE_MODE_PREF_KEY) ?? (rememberedYolo ? "yolo" : "agent"), !!resumeId,
@@ -10605,7 +11205,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // calls startSession as its own retry, and a reset would let an entitlement
     // failure (#58) pay a full restart+resend cycle on every prompt. Only a clean
     // turn re-arms it.
-    this.emit(session, sessionModeMessage(session, session.musePosture?.mode ?? (session.autoApprove ? "yolo" : "agent")));
+    this.emit(session, sessionModeMessage(session, session.musePosture?.mode ?? (session.autoApprove ? "yolo" : session.nativeAuto ? "auto" : "agent")));
     if (configAutoApprove) this.noticeAlwaysApproveOnce(this.sessionCwd(session));
     if (resumeId) this.emit(session, { type: "clearMessages" });
 
@@ -10627,6 +11227,21 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         platform: process.platform,
         provider: session.provider,
       });
+      return undefined;
+    }
+    // Antigravity authenticates every start with the way the person chose, and
+    // only when that way holds a credential: with none, `authenticate` and the
+    // server's own session/new start Google's browser sign-in, which on a
+    // phone-driven start opens at an empty desk. Signing in stays a press at
+    // the computer.
+    const agyCredential = session.provider === "agy" ? await this.agyCredentialFor() : undefined;
+    if (session.provider === "agy" && !agyCredential) {
+      if (gen !== session.gen) return undefined;
+      this.pool.delete(session);
+      session.priming = false;
+      this.emit(session, { type: "setBusy", value: false });
+      this.setProviderNeedsLogin("agy", true);
+      this.emit(session, { type: "onboarding", state: this.onboardingForSession(session), provider: "agy", platform: process.platform });
       return undefined;
     }
 
@@ -10689,21 +11304,28 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const startSpawnAttempts = 3;
     const startSpawnBackoffMs = [300, 900] as const;
     const runSignal = this.providerRunSignal(session.provider);
-    const createBoundClient = (): AcpClient => {
-    runSignal.throwIfAborted();
+    // A key's server reaches Google only through the relay, so each spawn
+    // holds a lease on it until that process exits. The server logs its
+    // gateway address, so its output is redacted for the relay's prefix.
+    const createBoundClient = (relay?: AgyRelayLease): AcpClient => {
+    try { runSignal.throwIfAborted(); } catch (error) { relay?.release(); throw error; }
+    const redact = (text: string) => relay ? this.agyKeyRelay().redact(text) : text;
     const client = new AcpClient({
       signal: runSignal,
       cliPath,
       cwd,
-      env,
+      env: relay ? agyGatewayEnv(env) : env,
       effort,
-      log: (msg) => this.host.appendLine(msg),
+      log: (msg) => this.host.appendLine(redact(msg)),
       timeouts: this.acpClientTimeouts(),
       mcpServers: (onDispose) => supportsClientMcpServers(session.provider) ? this.hostMcpServersFor(session, onDispose) : [],
+      ...(relay ? { startupAuth: agyGatewayAuth(relay.baseUrl) } : agyCredential ? { startupAuth: agyGoogleAuth() } : {}),
       ...(session.provider === "grok"
         ? { grokVersion: grokHandshakeVersion, grokVersionVerified }
-        : { backend: session.provider === "muse" ? new MuseBackend(session.musePosture, session.museCloud) : this.createProviderBackend(session.provider) }),
+        : { backend: session.provider === "muse" ? new MuseBackend(session.musePosture, session.museCloud)
+          : session.provider === "agy" ? new AgyBackend({ keyMode: !!relay }) : this.createProviderBackend(session.provider) }),
     });
+    if (relay) client.once("exit", () => relay.release());
     session.client = client;
     this.syncHumanWait(session);
     // A replacement process may have gained the capability after a CLI update.
@@ -10738,6 +11360,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     client.terminal = this.terminalManager.ownedBy(client);
 
     this.trackCloudAgentActivity(session, client, gen);
+    if (session.provider === "agy") client.on("credentialRejected", () => this.onAgyCredentialRejected(session, gen));
     client.on("initialized", (init) => {
       if (gen !== session.gen) return;
       this.warnOAuthShadowOnce(init?._meta?.defaultAuthMethodId, env);
@@ -10746,6 +11369,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.providerCliVersions.grok = handshakeVersion.trim().replace(/^v/i, "");
         this.postProviderState();
       }
+      if (session.provider === "agy") this.noteAgyVersion(init);
       this.emit(session, {
         type: "initialized",
         info: {
@@ -10837,6 +11461,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // sessionId, so defer the unavailable-mode set_mode RPC to the existing
         // post-load restore block without ever leaving the gate down.
         session.autoApprove = false;
+        session.nativeAuto = false;
         this.setPlanActive(session, true);
         if (!session.planModeAvailable) {
           if (session.replaying) return;
@@ -10845,10 +11470,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         // CLI entered plan mode (covers the agent self-initiating it from a
         // natural-language request). Raise our gate so the exit is enforced.
+      } else if (session.provider === "claude" && (id === "auto" || (id === "acceptEdits" && session.nativeAuto))) {
+        this.onNativeAutoMode(session, client, id === "auto" ? "auto" : "acceptEdits");
       } else if (!client.usesClientPlanGate) {
         // Claude ExitPlanMode / Codex plan approval switch to a writable mode
         // and then edit. Follow that mode so the button and permission filter
         // stop saying Plan. Grok's descriptive update must not do this.
+        session.nativeAuto = false;
         const next = applyAgentModeToHostPlan(id, false);
         if (next) {
           session.autoApprove = next.autoApprove;
@@ -11298,14 +11926,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.detachClient(session);
       void client.dispose();
     });
-    client.on("stderr", (text: string) => this.host.append(text));
+    client.on("stderr", (text: string) => this.host.append(redact(text)));
     return client;
     };
 
     for (let attempt = 1; attempt <= startSpawnAttempts; attempt++) {
       if (gen !== session.gen) return undefined;
       this.setStartupStage(session, "starting");
-      const client = createBoundClient();
+      const client = createBoundClient(agyCredential?.method === "api-key"
+        ? await this.agyKeyRelay().acquire(agyCredential.key)
+        : undefined);
       // Version probe done to the first spawn attempt: resolving the
       // environment (which on Windows can shell out to locate a shell) AND
       // building the ACP client with its handlers. Recorded after
@@ -11456,6 +12086,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // line started accounting for its own total; `new` says which call.
         const newAt = clock.now();
         await client.newSession(defaultModel || undefined);
+        if (nativeAutoStart && gen === session.gen) await this.startNativeAuto(session, client);
         clock.record("new", clock.elapsed(newAt));
         clock.record("load", 0);
         clock.record("replay(post)", 0);
@@ -12377,6 +13008,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "installCodex":
         await this.installManagedCodexCli();
         break;
+      case "installAgy":
+        if (origin !== "local") break;
+        await this.installManagedAgyServer();
+        break;
+      case "cancelAgyInstall":
+        this.agyInstallAbort?.abort(new Error("Installation cancelled."));
+        break;
       case "cancelCodexInstall":
         this.codexInstallAbort?.abort(new Error("Installation cancelled."));
         break;
@@ -12385,6 +13023,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       case "addProjectFolder":
         await this.addProjectFolder();
+        break;
+      case "addToProjects":
+        await this.addToProjects(msg.cwd, origin);
+        break;
+      case "answerProjectPrompt":
+        await this.answerProjectPrompt(msg.cwd, msg.choice === "never" ? "never" : "notNow");
         break;
       case "removeProjectFolder":
         // NO LONGER always local: CLOUD_DISPOSITION admits this from a remote on
@@ -12508,6 +13152,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         );
         break;
       }
+      case "setExperimentalAntigravity":
+        // The config watcher re-posts providerState, which is what the
+        // toggle reads back.
+        await this.host.getConfiguration("grok")
+          .update("experimentalAntigravity", !!msg.value, "global");
+        break;
       case "setShowThinking":
         // Persist globally (like the other display prefs); the config watcher
         // re-posts the value, keeping every open webview in sync.
@@ -12644,7 +13294,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         term.show();
         // Windows ships a native CLI installed via PowerShell; the default VS Code
         // terminal there is PowerShell, so use its syntax. Everything else is POSIX.
-        const done = "Done. Click 'Re-check connection' in the Grok sidebar.";
+        const done = "Done. Click 'Re-check connection' in the AFK Pilot sidebar.";
         term.sendText(
           process.platform === "win32"
             ? `irm https://x.ai/cli/install.ps1 | iex; Write-Host "\`n${done}"`
@@ -12654,6 +13304,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       case "runGrokLogin": {
         const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : "grok";
+        if (provider === "agy" && (origin === "remote" || !this.agyOffered())) {
+          // Google's sign-in opens a browser on THIS machine, which from a
+          // phone would be a desk nobody is sitting at. Refused before any
+          // consent is recorded; chatting with a connected desk still works.
+          if (clientId) this.sendRemoteClient(clientId, {
+            type: "onboarding", state: "agy-login", platform: process.platform, provider,
+            device: { status: "unavailable", message: "Connect Antigravity on the computer first." },
+          });
+          break;
+        }
         const cliPath = this.locateProvider(provider);
         if (!cliPath) {
           const message: HostMsg = {
@@ -12661,11 +13321,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             state: missingProviderState(provider),
             platform: process.platform,
             provider,
-            ...(provider === "muse" ? { device: { status: "failed" as const, message: "Muse Code is not installed on this machine." } } : {}),
+            ...(provider === "muse" || provider === "agy" ? { device: { status: "failed" as const, message: `${providerDisplayName(provider)} is not installed on this machine.` } } : {}),
           };
           if (clientId) this.sendRemoteClient(clientId, message);
-          else if (provider === "muse") this.postLocal(message);
+          else if (provider === "muse" || provider === "agy") this.postLocal(message);
           else this.post(message);
+          break;
+        }
+        // Antigravity signs in with Google or with a pasted Gemini API key, so
+        // Connect offers that choice rather than adopting whatever is stored;
+        // otherwise a Disconnect and Connect could never switch. The choice
+        // itself (`agySignIn`) records consent.
+        if (provider === "agy") {
+          await this.postAgyChoice();
           break;
         }
         // A press that lands while a first Connect is still checking is the
@@ -12731,6 +13399,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           // leave the agent masked as not connected.
           if (checkingConnect && this.providerConnectChecks?.delete(provider)) this.postProviderState();
         }
+        // Muse's CLI prints a link instead of opening a browser, so its desk
+        // sign-in reports through the device-login card too.
         if (provider === "muse") {
           await this.startDeviceLogin(provider, cliPath, clientId, { remote: false });
           break;
@@ -12802,6 +13472,34 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         });
         break;
       }
+      case "agySignIn": {
+        // Desk only: the key never crosses the relay, and Google's page would
+        // open at the desk. Host-local in remote-policy.ts as well.
+        if (origin !== "local" || !this.agyOffered()) break;
+        const cliPath = this.locateProvider("agy");
+        if (!cliPath) {
+          this.postLocal({ type: "onboarding", state: "missing-agy", platform: process.platform, provider: "agy",
+            device: { status: "failed", message: "Antigravity is not installed on this machine." } });
+          break;
+        }
+        if (msg.method === "api-key") {
+          if (msg.key !== undefined) {
+            const parsed = normalizeAgyApiKey(msg.key);
+            if ("error" in parsed) { await this.postAgyChoice(parsed.error); break; }
+            try { await this.context.secrets.store(AGY_API_KEY_SECRET, parsed.key); }
+            catch (error) {
+              this.host.appendLine(`[agy] saving the API key failed: ${errorDetail(error)}`);
+              await this.postAgyChoice("The key could not be saved on this machine.");
+              break;
+            }
+          } else if (!(await this.agySavedKey())) {
+            await this.postAgyChoice("Paste a Gemini API key.");
+            break;
+          }
+        }
+        await this.connectAgy(msg.method === "api-key" ? "api-key" : "google", cliPath, session);
+        break;
+      }
       case "submitDeviceLoginCode": {
         const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : "grok";
         const running = this.deviceLogins.get(provider);
@@ -12848,22 +13546,23 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       case "recheckConnection": {
         const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : session.provider;
+        if (provider === "agy" && !this.agyOffered()) break;
         if (!this.locateProvider(provider)) {
           const message: HostMsg = {
             type: "onboarding",
             state: missingProviderState(provider),
             platform: process.platform,
             provider,
-            ...(provider === "muse" ? { device: { status: "failed" as const, message: "Muse Code is not installed on this machine." } } : {}),
+            ...(provider === "muse" || provider === "agy" ? { device: { status: "failed" as const, message: `${providerDisplayName(provider)} is not installed on this machine.` } } : {}),
           };
           if (clientId) this.sendRemoteClient(clientId, message);
-          else if (provider === "muse") this.postLocal(message);
+          else if (provider === "muse" || provider === "agy") this.postLocal(message);
           else this.post(message);
           break;
         }
         if (!this.hasProviderConsent(provider)) {
-          if (provider === "muse") {
-            const message: HostMsg = { type: "onboarding", state: "muse-login", provider, platform: process.platform };
+          if (provider === "muse" || provider === "agy") {
+            const message: HostMsg = { type: "onboarding", state: providerLoginState(provider), provider, platform: process.platform };
             if (clientId) this.sendRemoteClient(clientId, message);
             else this.postLocal(message);
           }
@@ -12998,8 +13697,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "resumeSession":
         if (origin === "remote" && clientId) {
           await this.openRemoteSession(clientId, msg.id, msg.cwd, true, msg.claim === true);
+          // A tap is the person choosing it; a reconnect restore is not.
+          if (msg.claim === true && this.remoteClients.active(clientId)?.activeSessionId === msg.id) {
+            void this.noteSessionOpened(msg.id);
+          }
+        } else {
+          await this.openSession(msg.id, msg.cwd);
+          if (this.focused.activeSessionId === msg.id) void this.noteSessionOpened(msg.id);
         }
-        else await this.openSession(msg.id, msg.cwd);
         break;
        case "renameSession":
           this.renameSession(msg.id, msg.name, origin, clientId, msg.cwd);
@@ -13751,7 +14456,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private reservedMcpIdentityFor(session: Session): ReservedMcpIdentity {
     const cwd = this.sessionCwd(session);
     const parts: ReservedMcpIdentity[] = [];
-    if (session.provider === "muse") return { names: [], urls: [] };
+    if (session.provider === "muse" || session.provider === "agy") return { names: [], urls: [] };
     for (const filePath of mcpConfigPaths({
       cwd,
       provider: session.provider,
@@ -14253,6 +14958,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // think of. Cheap when nothing is pinned — the scan is over an in-memory map
     // and reads no disk until a pin actually exists.
     this.postPinnedSessions();
+    // Recent spans every folder, so it rides the same funnel as the pins.
+    this.postRecentSessions();
     for (const clientId of this.remoteClients.clients()) {
       // Per-tab cwd may still name a closed project after revoke leaves it for
       // selectRepo — buildSessionsList enforces the live authorized set.
@@ -14307,10 +15014,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           ? { offset: 0, limit: Number.MAX_SAFE_INTEGER, query }
           : { offset: providerCursor.grokOffset, limit, query }, activeId);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
-    const adapter: SessionListEntry[] = [];
-    if (providers.includes("codex")) adapter.push(...(this.codexSessionCache.get(projectProviderKey(cwd)) ?? []));
-    if (providers.includes("muse")) adapter.push(...(this.museSessionCache?.get(projectProviderKey(cwd)) ?? []));
-    if (providers.includes("claude")) adapter.push(...(this.claudeSessionCache.get(projectProviderKey(cwd)) ?? []));
+    const cached: SessionListEntry[] = [];
+    if (providers.includes("codex")) cached.push(...(this.codexSessionCache.get(projectProviderKey(cwd)) ?? []));
+    if (providers.includes("muse")) cached.push(...(this.museSessionCache?.get(projectProviderKey(cwd)) ?? []));
+    if (providers.includes("agy")) cached.push(...(this.agySessionCache?.get(projectProviderKey(cwd)) ?? []));
+    if (providers.includes("claude")) cached.push(...(this.claudeSessionCache.get(projectProviderKey(cwd)) ?? []));
+    // The adapters list everything, so the horizon (HISTORY_HORIZON_MS) is
+    // applied to their rows here. The caches keep every row: a pinned old
+    // conversation is still looked up in them.
+    const now = Date.now();
+    const adapter = cached.filter((entry) => withinHistoryHorizon(entry.updatedAt, now));
     for (const session of this.pool) {
       if (!usesAdapterHistory(session.provider) || !session.activeSessionId || !pathsEqual(this.sessionCwd(session), cwd)) continue;
       if (adapter.some((entry) => entry.id === session.activeSessionId)) continue;
@@ -14335,24 +15048,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? offset + entries.length
       : Math.max(offset + entries.length, combinedPage?.providerCursor.grokOffset ?? 0);
     const total = query ? (merged?.length ?? 0) : (grok?.total ?? 0) + adapter.length;
-    const hideAuto = this.hideAutoSessions();
-    const visible = hideAuto
-      ? entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined))
-      : entries;
-    const visibleDots: Record<string, Dot> = {};
-    for (const entry of visible) visibleDots[entry.id] = this.dotForId(entry.id);
     return {
       type: "sessions",
-      entries: visible,
+      entries,
       activeId,
-      dots: visibleDots,
+      dots,
       offset,
-      total: hideAuto ? visible.length : total,
+      total,
       hasMore: query ? nextOffset < total : combinedPage?.hasMore ?? false,
       nextOffset,
       ...(!query && combinedPage ? { providerCursor: combinedPage.providerCursor } : {}),
       query,
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -14360,30 +15066,64 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.scheduleAdapterHistoryRefresh("codex", cwd);
   }
 
+  /**
+   * Ask for a provider's history to be fresh for `cwd`, at most once per ten
+   * seconds per PROVIDER: a listing reads every folder this host has asked
+   * about (listAdapterHistory), so a rail of sixty projects, a Recent spanning
+   * sixty folders and every remote tab cost one listing between them, not one
+   * each. Per-folder timers were the old shape, and with codex reading its
+   * whole catalog for every folder they turned the rail's opening burst into a
+   * minute of listings -- each of which rebuilt Recent, which asked again.
+   *
+   * A folder never listed is the one exception to the ten seconds: a project
+   * opened right after a listing must not wait for the next one to show its
+   * conversations. A folder that arrives while a listing runs is in it when
+   * the listing reads, or is listed straight after if it came too late.
+   */
   private scheduleAdapterHistoryRefresh(provider: AcpProvider, cwd: string): void {
     if (this.providerCliUpdate?.provider === provider) return;
     if (!usesAdapterHistory(provider) || !this.connectedProviders().includes(provider)) return;
     const history = this.adapterHistory(provider);
-    if (!history) return;
+    if (!history || !authorizedListCwd(cwd, this.authorizedSessionCwds(), pathsEqual)) return;
     const key = projectProviderKey(cwd);
-    if (history.refresh.has(key)) return;
-    if (Date.now() - (history.at.get(key) ?? 0) < 10_000) return;
-    const refresh = (provider === "codex"
-      ? this.refreshCodexHistory(cwd, key)
-      : this.refreshAdapterHistory(provider, cwd, key))
+    this.adapterHistoryFolderMap(provider).set(key, cwd);
+    const running = this.adapterHistoryRuns?.get(provider);
+    if (running) {
+      if (!history.cache.has(key)) {
+        void running.then(() => { if (!history.cache.has(key)) this.scheduleAdapterHistoryRefresh(provider, cwd); });
+      }
+      return;
+    }
+    const stamp = this.adapterHistoryStamps?.get(provider);
+    if (stamp && Date.now() - stamp.at < 10_000 && (stamp.refused || history.cache.has(key))) return;
+    this.trackAdapterHistoryRun(provider, (provider === "codex"
+      ? this.refreshCodexHistory(cwd)
+      : this.refreshAdapterHistory(provider, cwd))
       .catch((error) => {
         this.host.appendLine(`[${provider}] session listing failed: ${(error as Error).message}`);
         const credential = this.createProviderBackend(provider)?.isCredentialError(error);
         if (!credential) return;
-        history.at.set(key, Date.now());
+        (this.adapterHistoryStamps ??= new Map()).set(provider, { at: Date.now(), refused: true });
         this.setProviderNeedsLogin(provider, true);
-      })
-      .finally(() => history.refresh.delete(key));
-    history.refresh.set(key, refresh);
+      }));
   }
 
-  private async refreshCodexHistory(cwd: string, key = projectProviderKey(cwd)): Promise<void> {
-    return this.refreshAdapterHistory("codex", cwd, key);
+  /** `run` is the provider's running listing until it settles; it must not reject. */
+  private trackAdapterHistoryRun(provider: AcpProvider, run: Promise<void>): void {
+    const runs = this.adapterHistoryRuns ??= new Map();
+    runs.set(provider, run);
+    void run.then(() => { if (runs.get(provider) === run) runs.delete(provider); });
+  }
+
+  private adapterHistoryFolderMap(provider: AcpProvider): Map<string, string> {
+    const all = this.adapterHistoryFolders ??= new Map();
+    let folders = all.get(provider);
+    if (!folders) all.set(provider, folders = new Map());
+    return folders;
+  }
+
+  private async refreshCodexHistory(cwd: string): Promise<void> {
+    return this.refreshAdapterHistory("codex", cwd);
   }
 
   /**
@@ -14508,24 +15248,45 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return forUpdate ? entry.client.disposeForUpdate() : entry.client.dispose();
   }
 
-  private async refreshAdapterHistory(provider: AcpProvider, cwd: string, key = projectProviderKey(cwd)): Promise<void> {
+  /**
+   * List `cwd`'s history -- and every other folder's, in the same listing --
+   * and resolve once it is in the cache. One listing at a time per provider,
+   * on its one shared process; a caller that needs a listing taken after its
+   * own request (clearing a project) queues behind a running one rather than
+   * reading its answer. A previous listing's failure belongs to its own caller.
+   */
+  private async refreshAdapterHistory(provider: AcpProvider, cwd: string): Promise<void> {
     if (this.providerCliUpdate?.provider === provider) return;
     if (!usesAdapterHistory(provider)) return;
     if (!this.adapterHistory(provider) || !this.locateProvider(provider)) return;
     if (!this.connectedProviders().includes(provider)) return;
-    // Queued rather than concurrent: the rail asks for every repo at once and
-    // they now share one process, so the opening burst becomes N cheap round
-    // trips instead of N spawns. A previous listing's failure belongs to its
-    // own caller and must not break the chain for the next one.
+    this.adapterHistoryFolderMap(provider).set(projectProviderKey(cwd), cwd);
     const signal = this.providerRunSignal(provider);
-    const run = (this.adapterHistoryQueue.get(provider) ?? Promise.resolve())
-      .catch(() => { /* handled by whoever awaited it */ })
-      .then(() => { if (!signal.aborted) return this.listAdapterHistory(provider, cwd, key); });
-    this.adapterHistoryQueue.set(provider, run.catch(() => { /* keep the chain alive */ }));
+    const run = (this.adapterHistoryRuns?.get(provider) ?? Promise.resolve())
+      .then(() => { if (!signal.aborted) return this.listAdapterHistory(provider); });
+    this.trackAdapterHistoryRun(provider, run.catch(() => { /* handled by whoever awaited it */ }));
     return run;
   }
 
-  private async listAdapterHistory(provider: AcpProvider, cwd: string, key: string): Promise<void> {
+  /**
+   * One listing of a provider's history, for every folder asked about
+   * (adapterHistoryFolders), filling each folder's rows in the cache.
+   *
+   * Codex and Antigravity have a catalog that is not scoped by folder: codex
+   * takes no cwd on the wire at all, and Antigravity's is one directory. They
+   * are read ONCE and split by the same exact-path match each folder's own
+   * listing applies, so every folder's rows are what its own listing gave.
+   * Measured on a desk with sixty projects: sixty codex catalog reads of ~1.2 s
+   * each, back to back, became one.
+   *
+   * Claude and Muse take the folder on the wire and are still asked per
+   * folder, inside this one listing. Not by choice for Claude: its unscoped
+   * listing was measured leaving out conversations its scoped one returns for
+   * the same folder. Muse matches folders itself, by a rule this host cannot
+   * see. Both answer in milliseconds, so the per-folder calls cost little; what
+   * mattered is that they end in one update below rather than one per folder.
+   */
+  private async listAdapterHistory(provider: AcpProvider): Promise<void> {
     const history = this.adapterHistory(provider);
     // Re-checked here, not only at queue time: a provider can be disconnected
     // or its CLI replaced while this call was waiting its turn.
@@ -14533,10 +15294,41 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (!history || !cliPath || !this.connectedProviders().includes(provider)) return;
     if (this.providerCliUpdate?.provider === provider) return;
     const signal = this.providerRunSignal(provider);
-    const client = await this.adapterHistoryClient(provider, cliPath);
-    if (!client || signal.aborted) return;
-    const result = await client.listSessions(cwd, process.platform);
+    const folders = this.adapterHistoryFolderMap(provider);
+    const authorized = this.authorizedSessionCwds();
+    // Live: a folder asked about while this listing runs is read by it too.
+    const listable = function* () {
+      for (const [key, cwd] of folders) {
+        if (authorizedListCwd(cwd, authorized, pathsEqual)) yield [key, cwd] as const;
+        else folders.delete(key);
+      }
+    };
+    const listed = new Map<string, BackendSessionListEntry[]>();
+    if (provider === "agy") {
+      // A directory read; starting a server for it would cost more than the
+      // listing is worth (see listAgySessions).
+      // Old conversations are skipped on their transcript's mtime, before the
+      // metadata file that names their folder is read (HISTORY_HORIZON_MS).
+      // Pinned ones are still read: Pinned looks them up in this cache.
+      const pinned = new Set(Object.entries(this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {}))
+        .filter(([, o]) => typeof o?.pinnedAt === "number").map(([id]) => id));
+      const catalog = listAgyCatalog(process.platform, { since: Date.now() - HISTORY_HORIZON_MS, keepIds: pinned });
+      for (const [key, cwd] of listable()) listed.set(key, agySessionsFor(catalog, cwd, process.platform));
+    } else {
+      const client = await this.adapterHistoryClient(provider, cliPath);
+      if (!client || signal.aborted) return;
+      const catalog = await client.listSessionCatalog(process.platform);
+      if (catalog) {
+        for (const [key, cwd] of listable()) listed.set(key, catalog.sessionsFor(cwd));
+      } else {
+        for (const [key, cwd] of listable()) {
+          listed.set(key, (await client.listSessions(cwd, process.platform)).sessions);
+          if (signal.aborted) return;
+        }
+      }
+    }
     if (signal.aborted) return;
+    const result = { sessions: [...listed.values()].flat() };
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const stableOverrides: SessionMetaOverrides = { ...overrides };
     // First-seen adapter listing time is a baseline only. Claude restamps
@@ -14544,15 +15336,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // pinning is still what we want: an open must not promote the row.
     // Trade-off: work done outside this extension stops promoting the row.
     // Unlike grok, neither adapter has a load-stable on-disk file to rank by.
+    // A row older than the history horizon is listed nowhere, so it gets no
+    // metadata of its own from being listed (one it already has is kept).
+    const listedAt = Date.now();
+    const stampable = (entry: BackendSessionListEntry) => !!overrides[entry.sessionId]
+      || withinHistoryHorizon(adapterListEntry(entry, {}, provider, listedAt).updatedAt, listedAt);
     for (const entry of result.sessions) {
       const previous = stableOverrides[entry.sessionId] ?? {};
-      if (typeof previous.activeAt === "number") continue;
+      if (typeof previous.activeAt === "number" || !stampable(entry)) continue;
       stableOverrides[entry.sessionId] = {
         ...previous,
         activeAt: adapterListEntry(entry, {}, provider, Date.now()).updatedAt,
       };
     }
-    const entries = result.sessions.map((entry) => adapterListEntry(entry, stableOverrides, provider));
     // Same reasoning as startSession's: listing sessions reads this machine's
     // own files and succeeds with any token at all. On the owner's host a
     // phone reconnect swept four project folders at 10:05:40, spawning an
@@ -14562,12 +15358,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // evidence -- but a listing that succeeds is evidence of nothing.
     // (Kept on the grok/probe paths, which make a call the account must
     // authorize; this one does not.)
-    history.cache.set(key, entries);
-    history.at.set(key, Date.now());
+    const moved: string[] = [];
+    for (const [key, sessions] of listed) {
+      const rows = sessions.map((entry) => adapterListEntry(entry, stableOverrides, provider));
+      const before = history.cache.get(key);
+      if (!before || JSON.stringify(before) !== JSON.stringify(rows)) moved.push(key);
+      history.cache.set(key, rows);
+    }
+    (this.adapterHistoryStamps ??= new Map()).set(provider, { at: Date.now() });
     await this.updateSessionMeta((current) => {
       let changed = false;
       const next = { ...current };
       for (const entry of result.sessions) {
+        if (!next[entry.sessionId] && !stampable(entry)) continue;
         const previous = next[entry.sessionId] ?? {};
         const title = typeof entry.title === "string" ? entry.title.trim() : "";
         const autoName = capAutoName(title);
@@ -14587,8 +15390,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       return changed ? next : null;
     });
+    // Once per listing, whatever it covered: each of these rebuilds Recent,
+    // which asks for its folders again -- an ask this listing has just
+    // answered, so it ends here instead of re-arming another. A project's own
+    // rail preview is re-sent only where its rows moved.
     this.postSessionsList();
-    this.sendLocalRepoSessionsPreview(cwd);
+    for (const key of moved) {
+      const cwd = folders.get(key);
+      if (cwd) this.sendLocalRepoSessionsPreview(cwd);
+    }
   }
 
   private buildGrokSessionsList(
@@ -14599,7 +15409,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
-    const hideAuto = this.hideAutoSessions();
     // Stale per-tab / selected cwds must not scan a closed project's catalog.
     const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
@@ -14630,12 +15439,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // own), so a worktree session stays reachable after you leave it.
     const repoCwds = this.sessionCwdsForRepo(cwd, overrides);
     const repoCwdKeys = new Set(repoCwds.map(normalizeFsPath));
+    // The 30-day horizon is applied here, on stat mtimes, so an old conversation
+    // costs one stat and is never parsed, paged or searched.
+    const now = Date.now();
     const index = mergeSessionIndexes(
       repoCwds.map((c) => ({
         cwd: c,
         entries: indexSessions({ fs: defaultFs, grokHome, cwd: c, log }),
       })),
-    );
+    ).filter((e) => withinHistoryHorizon(e.mtimeMs, now));
     const mtimeById = new Map(index.map((e) => [e.id, e.mtimeMs]));
     const cwdById = new Map(index.map((e) => [e.id, e.cwd]));
 
@@ -14648,22 +15460,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     let pageEntries: SessionListEntry[];
     let total: number;
     let nextOffset: number;
-    const filterAuto = (entries: SessionListEntry[]) => {
-      if (!hideAuto) return entries;
-      return entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined));
-    };
-    if (query || hideAuto) {
-      // Search and hide-auto need names, so read (cache-backed) the whole list once, then filter.
+    if (query) {
+      // Search needs names for everything, so read (cache-backed) the whole list once, then filter.
       const all = this.readEntriesCachedMulti(index.map((e) => e.id), mtimeById, cwdById, overrides, grokHome, log)
         .filter((e) => e.kind !== "subagent");
       all.sort((a, b) => b.updatedAt - a.updatedAt);
-      const matched = filterAuto(query
-        ? all.filter(
-            (e) =>
-              e.displayName.toLowerCase().includes(query) ||
-              (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
-          )
-        : all);
+      const matched = all.filter(
+        (e) =>
+          e.displayName.toLowerCase().includes(query) ||
+          (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
+      );
       total = matched.length;
       pageEntries = matched.slice(offset, offset + limit);
       nextOffset = offset + pageEntries.length;
@@ -14751,7 +15557,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       hasMore,
       nextOffset,
       query: opts?.query ?? "",
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -15737,7 +16542,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       } catch (e) {
         // Per-file: one unreadable pick must not abort the rest of a multi-select.
         this.host.appendLine(`[image] could not attach ${filePath}: ${(e as Error).message}`);
-        void this.host.showErrorMessage(`Grok: could not attach ${path.basename(filePath)} — ${(e as Error).message}`);
+        void this.host.showErrorMessage(`AFK Pilot: could not attach ${path.basename(filePath)} — ${(e as Error).message}`);
       }
     }
     this.revealAndFocusComposer();
@@ -15842,6 +16647,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       codex: pickSttBackend({ ...state, provider: "codex" }) ?? null,
       claude: pickSttBackend({ ...state, provider: "claude" }) ?? null,
       muse: pickSttBackend({ ...state, provider: "muse" }) ?? null,
+      agy: pickSttBackend({ ...state, provider: "agy" }) ?? null,
     } };
   }
 
@@ -16813,7 +17619,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       sites,
     });
     await this.openDiffTexts(session, filePath, sides.oldText, sides.newText,
-      `Grok proposed: ${path.basename(filePath)}`, sides.firstChangedLine, requestId);
+      `${providerDisplayName(session.provider)} proposed: ${path.basename(filePath)}`, sides.firstChangedLine, requestId);
   }
 
   // Both callers own complete sides at this point. Turn diffs must bypass
@@ -17346,20 +18152,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ): Promise<void> {
     try {
       if (!isVisionMime(mimeType)) {
-        this.reportRequester(requester, "error", `Grok: unsupported image type ${mimeType} — use PNG, JPEG, GIF, or WebP.`);
+        this.reportRequester(requester, "error", `AFK Pilot: unsupported image type ${mimeType} — use PNG, JPEG, GIF, or WebP.`);
         return;
       }
       const bytes = Buffer.from(base64, "base64");
       if (bytes.length === 0) return;
       if (bytes.length > MAX_VISION_IMAGE_BYTES) {
-        this.reportRequester(requester, "error", "Grok: pasted image exceeds the 20 MiB vision limit.");
+        this.reportRequester(requester, "error", "AFK Pilot: pasted image exceeds the 20 MiB vision limit.");
         return;
       }
       const session = await this.stageImageAttachment(bytes, mimeType, undefined, owner, previewId);
       if (session === this.focused) this.revealAndFocusComposer();
     } catch (e) {
       this.host.appendLine(`[image] paste failed: ${(e as Error).message}`);
-      this.reportRequester(requester, "error", `Grok: could not attach the pasted image — ${(e as Error).message}`);
+      this.reportRequester(requester, "error", `AFK Pilot: could not attach the pasted image — ${(e as Error).message}`);
     }
   }
 
@@ -17533,7 +18339,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (bare) {
       this.emit(session, {
         type: "error",
-        text: "Grok is mid-turn — that command was not run. Try again when the turn finishes.",
+        text: `${providerDisplayName(session.provider)} is mid-turn — that command was not run. Try again when the turn finishes.`,
       });
       return;
     }
@@ -17787,7 +18593,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.setStatus(session, "working");
     // The send IS the activity — the rail should not wait ~2s for the CLI to
     // write a transcript before admitting you are working in this conversation.
-    this.noteSessionActivity(session);
+    this.noteSessionActivity(session, true);
+    this.maybeAskToAddProject(session);
 
     try {
       session.adapterCompactThisTurn = false;
@@ -18217,6 +19024,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private postInitialState(): void {
+    // Once per host, and a no-op on every later boot (PROJECTS_INIT_KEY).
+    void this.initializeProjects();
     // `ready` means the local renderer just booted (including Electron
     // document reload, which does not re-enter resolveWebviewView). Drop the
     // cache so postVoiceConfigured below is not swallowed against the old view.
@@ -18293,7 +19102,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    */
   private rehydrateWebviewFromFocused(): void {
     const session = this.focused;
-    const wv = this.webviewFor(session);
+    const wv = this.view?.webview;
     if (!wv) return;
     this.touch(session);
     this.markRead(session);
@@ -18356,8 +19165,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postChips(session: Session = this.focused): void {
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
-    const webview = session === this.focused ? this.webviewFor(session) : undefined;
-    if (webview) {
+    if (session === this.focused && this.view) {
+      const webview = this.view.webview;
       const localMessage: HostMsg = { type: "chips", chips: this.localPreviewChips(session, webview) };
       void webview.postMessage(localMessage);
     }
@@ -18435,8 +19244,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     "repos",
     "sessions",
     "sessionRemoved",
+    "sessionOpening",
     "repoSessions",
     "pinnedSessions",
+    "recentSessions",
     "sessionDot",
     "session",
     "sessionName",
@@ -18451,6 +19262,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Webview→host actions the rail may post. Closed set — never send/cancel/etc. */
   private static readonly PROJECTS_RAIL_WEBVIEW_TYPES = new Set<WebviewMsg["type"]>([
     "createProject",
+    // Recent's "Add to Projects".
+    "addToProjects",
     "cloneProject",
     "setupGithubCli",
     "refreshProviders",
@@ -18485,9 +19298,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
@@ -18505,11 +19316,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Post to the VS Code webview only (plus catalog mirror to the projects rail). */
   private postLocal(message: HostMsg): void {
     this.postTap?.("local", message);
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /**
@@ -19140,11 +19948,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session === this.focused) {
       this.postTap?.("local", message);
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
       // Active-session identity for the projects rail (highlight + pin home).
       this.mirrorToProjectsRail(message);
-      this.postToSessions(message);
     }
     if (!session.replaying || message.type === "startupStatus") this.sendRemoteSession(session, message);
   }
@@ -19190,10 +19997,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /** Desk-targeted, non-replayable delivery for one-shot notices. */
@@ -19201,10 +20007,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   private async replayLoadedHistory(session: Session, load: () => Promise<void>): Promise<void> {
@@ -19353,6 +20158,38 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return { reservation, joined: false };
   }
 
+  /**
+   * A user's click on a conversation another view is cold-loading. Refusing it
+   * snapped the click back (the renderer gives up on an unanswered click) while
+   * the web tab's load ran on for up to a minute, and the desk could not open
+   * the conversation it was looking at. Loading it alongside is not an option
+   * either: that is the race the reservation exists for -- two CLI processes
+   * `session/load`ing one session directory, each replaying into its own view.
+   *
+   * So the click waits for that load to finish and then takes the reservation
+   * itself. By then the conversation is live in the pool, so the open is the
+   * instant focus path; if that load failed, this click loads it. `onQueued`
+   * runs once, before the first wait. A newer click makes this one give up
+   * (`stillWanted`), and so does a view that keeps re-taking the id.
+   */
+  private async reserveBehindInFlightLoad(
+    id: string,
+    ownerTabToken: string | undefined,
+    stillWanted: () => boolean,
+    onQueued: () => void,
+  ): Promise<{ reservation: SessionLoadReservation; joined: boolean } | undefined> {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const claim = this.reserveSessionLoad(id, ownerTabToken);
+      if (claim) return claim;
+      const held = this.sessionLoadReservations.get(id);
+      if (!held) continue;
+      if (attempt === 0) onQueued();
+      await held.completion.catch(() => undefined);
+      if (!stillWanted()) return undefined;
+    }
+    return undefined;
+  }
+
   private bindSessionLoad(id: string, reservation: SessionLoadReservation, session: Session): void {
     const current = this.sessionLoadReservations.get(id);
     if (current?.token === reservation.token) current.session = session;
@@ -19423,7 +20260,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.touch(session);
     this.markRead(session); // opening it clears any unread (green/red) badge
     this.refreshWorkflowCompletions(session);
-    const wv = this.webviewFor(session);
+    const wv = this.view?.webview;
     // Both surfaces need it, and the desk has the same gap the browser does —
     // re-focusing a live conversation never said which agent it belongs to.
     const identity = this.sessionIdentityFrame(session);
@@ -20121,9 +20958,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = session.activeSessionId;
     if (!id) return;
     const message: HostMsg = { type: "sessionDot", id, dot: this.dotForId(id) };
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
@@ -20614,7 +21449,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // After the sweep, not before: the sweep can retire the empty session this
     // one replaced, and a list built ahead of it would show a row that is gone.
     this.postSessionsList();
-    this.revealChat();
   }
 
   private focusRemoteSession(clientId: string, session: Session, notifyCatalog = true): void {
@@ -20856,7 +21690,30 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // before `startSession` is reached, and a clock made down there reports
     // `resolve 0ms` however long that took.
     const clock = new OpenClock();
-    const load = this.reserveSessionLoad(id, this.remoteClients.tabToken(clientId));
+    const tabToken = this.remoteClients.tabToken(clientId);
+    // A tap on a conversation waits behind another view's load like a desk
+    // click does (reserveBehindInFlightLoad). A reconnect restore (no claim)
+    // still refuses: it is not a person choosing this conversation, and the
+    // tab's own last word may already be another one.
+    let load = this.reserveSessionLoad(id, tabToken);
+    if (explicitClaim) {
+      const seqs = this.remoteOpenSeq ??= new Map();
+      const seq = (seqs.get(clientId) ?? 0) + 1;
+      seqs.set(clientId, seq);
+      if (!load) {
+        load = await this.reserveBehindInFlightLoad(
+          id,
+          tabToken,
+          () => seqs.get(clientId) === seq && this.remoteClients.clients().includes(clientId),
+          () => {
+            this.host.appendLine(`[remote] resumeSession waits for the load another view started`);
+            this.sendRemoteClient(clientId, { type: "sessionOpening", sessionId: id, queued: true });
+          },
+        );
+        // A newer tap from this tab, or the tab is gone: nothing to answer.
+        if (!load && seqs.get(clientId) !== seq) return;
+      }
+    }
     if (!load) {
       const selectedCwd = this.remoteClients.cwdIfPresent(clientId) ?? "";
       this.host.appendLine(`[remote] dropped resumeSession (session load is reserved by another view)`);
@@ -21057,9 +21914,24 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private async openSession(id: string, sessionCwd?: string): Promise<void> {
     // The user's open starts HERE, not in startSession. See the note there.
     const clock = new OpenClock();
-    const claim = this.reserveSessionLoad(id);
+    const seq = this.localOpenSeq = (this.localOpenSeq ?? 0) + 1;
+    // The renderer gives up on a click the host never answers. This answers it:
+    // the open is under way, and it ends in the conversation or in `failed`.
+    this.postLocal({ type: "sessionOpening", sessionId: id });
+    const claim = await this.reserveBehindInFlightLoad(
+      id,
+      undefined,
+      () => seq === this.localOpenSeq,
+      () => {
+        this.host.appendLine(`[sessions] local resume waits for the load another view started`);
+        this.postLocal({ type: "sessionOpening", sessionId: id, queued: true });
+      },
+    );
     if (!claim) {
+      // A newer click owns the view now; it says what happens next.
+      if (seq !== this.localOpenSeq) return;
       this.host.appendLine(`[sessions] refused local resume (session load is reserved by another view)`);
+      this.postLocal({ type: "sessionOpening", sessionId: id, failed: true });
       void this.host.showInformationMessage(
         "This conversation is already being opened in another tab or view.",
       );
@@ -21080,9 +21952,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
     } catch (error) {
       failure = error;
+      if (seq === this.localOpenSeq) this.postLocal({ type: "sessionOpening", sessionId: id, failed: true });
       throw error;
     } finally {
       this.releaseSessionLoad(id, claim.reservation, failure);
+    }
+    // A load that failed inside startSession reports its error in the view and
+    // leaves the view on something else; the click it answered is over.
+    if (seq === this.localOpenSeq && this.focused.activeSessionId !== id) {
+      this.postLocal({ type: "sessionOpening", sessionId: id, failed: true });
     }
     // Opening a conversation is the other moment the user is looking straight at
     // this repo's history — and the moment the session they just left became
@@ -21101,7 +21979,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // a conversation is not a request to change which project you are in.
     // Desktop's own selectRepo does the whole switch; this is the half VS Code
     // needs because it has no folder to switch.
-    this.revealChat();
     if (this.host.canSwitchWorkspaceFolder) return;
     const openedIn = this.resolveLocalRepoTarget(this.sessionCwd(this.focused));
     if (openedIn && !pathsEqual(openedIn.cwd, this.selectedRepoCwd || "")) {
@@ -21725,7 +22602,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.host.appendLine(`[remote] ${m.type} failed: ${detail}`);
         this.sendRemoteRequester(requester, {
           type: "error",
-          text: `Grok: ${m.type} failed — ${detail}`,
+          text: `AFK Pilot: ${m.type} failed — ${detail}`,
         });
       });
     } catch (e) {
@@ -22312,6 +23189,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // pushed from there would simply never arrive on a fresh tab or a reconnect.
     // buildPinnedSessions filters to the live authorized set.
     snap.push({ type: "pinnedSessions", ...this.buildPinnedSessions(), pinRequests: true });
+    snap.push({ type: "recentSessions", ...this.buildRecentSessions() });
     const out: HostMsg[] = [];
     for (const m of snap) {
       const t = transformHostMsgForRemote(m, this.remoteMediaDeps);
@@ -22377,12 +23255,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (category) {
         void this.settingsEditor.webview.postMessage({ type: "settingsCategory", category });
       }
-      void this.refreshCommunityLagOnSettings();
       return;
     }
     const panel = this.host.openEditorWebview({
       viewType: "grok.settings",
-      title: "Grok30m Settings",
+      title: "AFK Pilot Settings",
       localResourceRoots: [
         Uri.joinPath(this.context.extensionUri, "media"),
         Uri.joinPath(this.context.extensionUri, "resources"),
@@ -22405,21 +23282,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const text = (e as Error)?.message ?? String(e);
         this.host.appendLine(`[settings] ${msg.type} failed: ${text}`);
       });
-    });
-    void this.refreshCommunityLagOnSettings();
-  }
-
-  private async refreshCommunityLagOnSettings(): Promise<void> {
-    const panel = this.settingsEditor;
-    if (!panel) return;
-    const lag = await peekCommunityLag(this.context.extensionVersion);
-    if (this.settingsEditor !== panel) return;
-    void panel.webview.postMessage({
-      type: "communityLagStatus",
-      base: lag.base,
-      latest: lag.latest || "",
-      behind: lag.behind,
-      error: lag.error || "",
     });
   }
 
@@ -22478,11 +23340,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         providersChecking: this.providerRefreshInFlight,
         githubState: this.githubStatePayload(),
         extVersion: this.context.extensionVersion,
-        communityBase: COMMUNITY_BASE_VERSION,
-        communityLatest: "",
-        communityBehind: false,
-        communityError: "",
-        communityReleasesUrl: COMMUNITY_RELEASES_PAGE,
         cliVersion: this.providerCliVersions.grok || "",
         hostKind: "extension" as const,
         hostName: deviceDisplayName(os.hostname(), process.platform, os.release()),
@@ -22530,7 +23387,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   html, body { background: var(--vscode-editor-background, var(--vscode-sideBar-background)); }
 </style>
 <link rel="stylesheet" href="${mediaUri("settings.css")}" />
-<title>Grok30m Settings</title>
+<title>Grok Settings</title>
 </head>
 <body class="settings-page">
   <div id="settings-root"></div>
@@ -22571,14 +23428,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           } };
           if (msg.current) next.cliVersion = msg.current;
           surface.update(next);
-        }
-        if (msg.type === "communityLagStatus") {
-          surface.update({
-            communityBase: msg.base || "",
-            communityLatest: msg.latest || "",
-            communityBehind: !!msg.behind,
-            communityError: msg.error || "",
-          });
         }
         if (msg.type === "providerState" && Array.isArray(msg.providers)) {
           surface.update({ providers: msg.providers, providersChecking: msg.checking === true });
@@ -22644,9 +23493,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? `
   <aside id="projects-rail" class="projects-rail" aria-label="Projects">
     <div class="rail-top">
-      <span class="rail-brand" title="Grok30m">
+      <span class="rail-brand" title="Grok Build Desktop">
         <span class="mark" style="--rail-mark:url('${railMark}')" aria-hidden="true"></span>
-        <span class="wordmark"><b>Grok</b><span class="dim">30m</span></span>
+        <span class="wordmark"><b>Grok</b> <span class="dim">Build</span></span>
       </span>
       <button id="desk-rail-toggle" class="rail-icon-btn" type="button" title="Hide projects" aria-label="Hide projects" aria-expanded="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>
@@ -22740,7 +23589,7 @@ ${openMain}
     </div>
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>
     <button id="remote-btn" class="icon-btn remote-btn" title="Remote control" hidden></button>
-    ${this.useSessionsSidebar() ? "" : `<button id="history-btn" class="icon-btn" title="Session history"></button>`}
+    <button id="history-btn" class="icon-btn" title="Session history"></button>
     <button id="new-btn" class="icon-btn" title="New session"></button>
     ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}
     ${this.host.canSwitchWorkspaceFolder ? "" : `<div id="vscode-session-actions"></div>`}
@@ -22750,9 +23599,9 @@ ${openMain}
 ${fileShellOpen}
   <main id="messages" class="messages">
     <div class="welcome" id="welcome">
-      <span class="welcome-mark" role="img" aria-label="Grok" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
-      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok30m"}</h2>
-      <p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>
+      <span class="welcome-mark" role="img" aria-label="AFK Pilot" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
+      <h2>${isCloudEnvironment() ? "AFK Pilot Cloud" : "AFK Pilot"}</h2>
+      ${isCloudEnvironment() ? "" : `<p class="welcome-byline muted">previously Grok Build (Community)</p>`}
       <p id="welcome-version" class="muted welcome-status-busy"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Starting</span></p>
       <div id="welcome-onboarding"></div>
     </div>

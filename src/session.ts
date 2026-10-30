@@ -78,6 +78,7 @@ type AutoAcceptOption = {
  * The allow Auto accept may send. Grok, Codex and Claude prefer `allow_always`.
  * Muse must not: `allow_always` is a permanent config grant, and a session-scoped
  * choice is advertised as `allow_once`, so kind alone would outlive Agent.
+ * Antigravity's `allow_always` is likewise saved with the conversation.
  */
 export function pickAutoAcceptOption<T extends AutoAcceptOption>(
   options: readonly T[],
@@ -90,6 +91,7 @@ export function pickAutoAcceptOption<T extends AutoAcceptOption>(
   if (provider === "muse") {
     return usable.find((option) => option.kind === "allow_once" && option._meta?.scope === "once");
   }
+  if (provider === "agy") return usable.find((option) => option.kind === "allow_once");
   return usable.find((option) => option.kind === "allow_always")
     ?? usable.find((option) => option.kind === "allow_once");
 }
@@ -130,6 +132,10 @@ export class Session {
 
   /** YOLO: auto-approve every permission request for this session. */
   autoApprove = false;
+  /** In the provider's native Auto mode (Claude): the agent decides, and asks. */
+  nativeAuto = false;
+  /** The agent answered an Auto request with its fallback; see onNativeAutoMode. */
+  nativeAutoFellBack = false;
   musePosture?: import("./mode-prefs").MusePosture;
   /** Launch fact, never changed by a live approval-mode switch. */
   museShellSandbox?: boolean;

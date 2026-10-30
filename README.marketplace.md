@@ -1,10 +1,10 @@
-# GUI for Grok Build & Muse Code
+# AFK Pilot: Grok Build, Muse Code, Claude, Codex & more in one place
 
-[![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](https://github.com/phuryn/grok-build-vscode/blob/main/LICENSE) ![Agents](https://img.shields.io/badge/Agents-Grok%20Build%20%C2%B7%20Codex%20%C2%B7%20Claude%20Code%20%C2%B7%20Muse%20Code-000000) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
+[![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-blue.svg)](https://github.com/phuryn/grok-build-vscode/blob/main/LICENSE) ![Agents](https://img.shields.io/badge/Agents-Grok%20Build%20%C2%B7%20Codex%20%C2%B7%20Claude%20Code%20%C2%B7%20Muse%20Code%20%C2%B7%20Antigravity-000000) [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com) [![Cursor](https://badgen.net/badge/Cursor/Extension/007ACC)](https://cursor.com) [![The Product Compass](https://img.shields.io/badge/The%20Product%20Compass-productcompass.pm-FF6B35)](https://www.productcompass.pm)
 
-> **GUI for Grok Build (incl. Grok 4.7) & Muse Code** — and for Codex and Claude Code in the same window. Not affiliated with or endorsed by SpaceXAI (formerly xAI), Meta, OpenAI or Anthropic. *Grok*, *Grok Build* and *xAI* are trademarks of xAI; *Muse Code* of Meta; *Codex* of OpenAI; *Claude Code* of Anthropic. This project uses those names only to describe what it is compatible with.
+> **One place for Grok Build (Grok 4.7) & Muse Code (Muse Wonder)** — plus Codex (GPT-6 Astra), Claude Code (Opus 5.5) and Google Antigravity (Gemini 4 Argon, experimental). Not affiliated with or endorsed by SpaceXAI (formerly xAI), Meta, OpenAI, Anthropic or Google. *Grok*, *Grok Build* and *xAI* are trademarks of xAI; *Muse Code* of Meta; *Codex* of OpenAI; *Claude* and *Claude Code* of Anthropic. *Antigravity* and *Gemini* are trademarks of Google. This project uses those names only to describe what it is compatible with.
 
-The GUI for **Grok Build CLI** (incl. **Grok 4.7**) and **Meta's Muse Code**, right in your editor. It drives **OpenAI's Codex** and **Anthropic's Claude Code** too: one window, one model picker, and every conversation keeps the agent it started with. And it comes with **Remote Control**: pair **[AFK Pilot](https://afkpilot.com)** once and watch, approve, and steer your agent from your phone or any browser while away from your desk. Drop open files in as `@`-context, run **multiple sessions** at once, keep **resumable chat history**, generate **images & video inline**, and dictate by **voice**. If you'd rather stay in VS Code than a terminal, this brings Grok Build's agent into your sidebar.
+The GUI for **Grok Build CLI** (incl. **Grok 4.7**) and **Meta's Muse Code**, right in your editor. It drives **OpenAI's Codex** and **Anthropic's Claude Code** too — and, experimentally, **Google's Antigravity** on your own computer: one window, one model picker, and every conversation keeps the agent it started with. **Remote Control** is built in: pair your phone at **[afkpilot.com](https://afkpilot.com)** once and watch, approve, and steer your agent from your phone or any browser while away from your desk. Drop open files in as `@`-context, run **multiple sessions** at once, keep **resumable chat history**, generate **images & video inline**, and dictate by **voice**. If you'd rather stay in VS Code than a terminal, this brings Grok Build's agent into your sidebar.
 
 No manual setup: the extension **walks you through installing the `grok` CLI and signing in** — with a **SuperGrok or X Premium+ subscription**, or an **xAI API key** — right from the sidebar, one click per step.
 
@@ -36,7 +36,7 @@ For Grok, Codex and Claude, a card for a **command** offers a third answer: **Ye
 <details>
 <summary><strong>Modes — Agent, Plan & Auto accept</strong></summary>
 
-Switch from the bottom toolbar — even mid-turn, so you can flip to **Auto accept** to stop approving cards without stopping Grok. **Grok Plan** combines the CLI's own edit refusal with the extension's gate on delegated writes and non-read-only commands until you approve the plan (see [How it works](#how-it-works)). Codex and Claude enforce planning in their adapter/CLI. Muse offers its native approval modes: **Allow all**, **Prompt unmatched**, and **On request** (desktop only), with no Plan. Cloud machines use the isolated VM instead of Muse's shell sandbox and omit On request. **Auto accept** approves actions automatically; approving a plan returns you to whichever mode you were in before planning.
+Switch from the bottom toolbar — even mid-turn, so you can flip to **Auto accept** to stop approving cards without stopping Grok. **Grok Plan** combines the CLI's own edit refusal with the extension's gate on delegated writes and non-read-only commands until you approve the plan (see [How it works](#how-it-works)). Codex and Claude enforce planning in their adapter/CLI. Claude also offers its own **Auto mode**, where Claude decides which actions are safe and asks you about the rest; a new Claude conversation starts in it unless you have picked another mode (a model without Auto keeps the conversation in Agent mode). Muse offers its native approval modes: **Allow all**, **Prompt unmatched**, and **On request** (desktop only), with no Plan. Cloud machines use the isolated VM instead of Muse's shell sandbox and omit On request. **Auto accept** approves actions automatically; approving a plan returns you to whichever mode you were in before planning.
 
 ![The mode picker — Agent, Plan, and Auto accept](https://raw.githubusercontent.com/phuryn/grok-build-vscode/main/docs/screenshots/agent_modes.png)
 
@@ -81,7 +81,7 @@ The active editor rides along automatically; add more by **typing `@` in the com
 <details>
 <summary><strong>Session history</strong> — parallel sessions with status dots; resume, rename, search & clear</summary>
 
-The clock icon lists this project's sessions, newest first. Click a row to resume — images, plans, and reasoning intact — or hover to rename it or, where supported, delete it. The **search box** filters your whole history, older sessions load as you scroll, and **Clear all history** clears this project's supported provider histories while keeping open conversations. Muse history cannot be deleted here and is kept.
+The clock icon lists this project's sessions from the last 30 days, newest first (older ones stay on disk, unlisted). Click a row to resume — images, plans, and reasoning intact — or hover to rename it or, where supported, delete it. The **search box** filters that whole list, older sessions load as you scroll, and **Clear all history** clears this project's supported provider histories while keeping open conversations. Muse history cannot be deleted here and is kept.
 
 Sessions run in **parallel**: start a new one with **+** while another is mid-turn and switch between them from this list — the one you leave keeps working in the background, and switching back is instant, with no reload. Each row's **status dot** tells you what it's doing:
 
@@ -122,7 +122,7 @@ The conversation's ⋯ menu → *Continue in a new chat* → **Use this workspac
 <details>
 <summary><strong>Worktree session</strong> — isolate code edits in a git worktree</summary>
 
-**Grok: New Worktree Session** (the conversation's ⋯ menu → *Continue in a new chat* → **Use a new worktree**, or the Command Palette) creates an isolated git worktree under `~/.grok/worktrees/` and opens a fresh session whose cwd is that checkout — so agent edits don't touch your main tree until you **Apply worktree**. **Remove worktree** deletes the isolated checkout. History rows for worktree sessions show a `WT <label>` badge and reopen with the correct cwd.
+**AFK Pilot: New Worktree Session** (the conversation's ⋯ menu → *Continue in a new chat* → **Use a new worktree**, or the Command Palette) creates an isolated git worktree under `~/.grok/worktrees/` and opens a fresh session whose cwd is that checkout — so agent edits don't touch your main tree until you **Apply worktree**. **Remove worktree** deletes the isolated checkout. History rows for worktree sessions show a `WT <label>` badge and reopen with the correct cwd.
 
 </details>
 
@@ -136,7 +136,7 @@ The project panel's branch button carries a badge of uncommitted files and opens
 <details>
 <summary><strong>Rewind</strong> — roll the conversation (and files) back to an earlier point</summary>
 
-Hover a message you sent → **Rewind** (or **Grok: Rewind Conversation**), confirm, and Grok rolls back to that point — truncating the chat and, optionally, restoring the files it changed since then from its own snapshots. A safety prompt shows first, because rewinding can revert code on disk. Both work from a browser as well as at the desk.
+Hover a message you sent → **Rewind** (or **AFK Pilot: Rewind Conversation**), confirm, and Grok rolls back to that point — truncating the chat and, optionally, restoring the files it changed since then from its own snapshots. A safety prompt shows first, because rewinding can revert code on disk. Both work from a browser as well as at the desk.
 
 </details>
 
@@ -152,7 +152,7 @@ Every workflow card has one quiet header: an icon, "Workflow", the run's name, a
 <details>
 <summary><strong>Context & cost</strong> — what's in the window, and what the turns actually bill</summary>
 
-Click the **context donut** for `used / window (%)` — said in thousands, with the exact count still on the donut's own tooltip — plus what the conversation has **billed** — input, cache read, output, and the CLI-reported **USD cost** — as a session total and a per-turn split with its model calls. **Compact conversation** lives here too, right next to the number that tells you when you need it. For Grok, a **Context window** dropdown picks among the sizes the CLI offers (256K or 500K for Grok 4.7), as does `/context-window 500k`; switching to a smaller size the conversation already fills past 70% asks first, because Grok will (or may) auto-compact on your next message. The same popover answers the other usage question — **how much of your plan's window is left**, as labelled windows with a meter, a reset time, and when the reading was taken. Grok asks the account, Codex reads what Codex itself records, and Claude's arrives with your next reply.
+Click the **context donut** for `used / window (%)` — said in thousands (millions for a million-token window), with the exact count still on the donut's own tooltip — plus what the conversation has **billed** — input, cache read, output, and the CLI-reported **USD cost** — as a session total and a per-turn split with its model calls. **Compact conversation** lives here too, right next to the number that tells you when you need it. For Grok, a **Context window** dropdown picks among the sizes the CLI offers (256K or 500K for Grok 4.7), as does `/context-window 500k`; switching to a smaller size the conversation already fills past 70% asks first, because Grok will (or may) auto-compact on your next message. The same popover answers the other usage question — **how much of your plan's window is left**, as labelled windows with a meter, a reset time, and when the reading was taken. Grok asks the account, Codex reads what Codex itself records, and Claude's arrives with your next reply.
 
 ![The context popover — window usage, billed totals, and Compact](https://raw.githubusercontent.com/phuryn/grok-build-vscode/main/docs/screenshots/context.png)
 
@@ -161,7 +161,7 @@ Click the **context donut** for `used / window (%)` — said in thousands, with 
 <details>
 <summary><strong>Subagents</strong> — delegated tasks render as cards with their result</summary>
 
-When Grok, Claude Code or Codex delegates work to a subagent, the chat shows a card with the same quiet header as a workflow: an icon, "Subagent", the task, its status and a timer. Open it for the subagent's activity where the agent streams it (Grok, Codex), its result — which reads like a reply and has a copy button — and the tokens it used where the agent reports them. Background subagents included: their result folds back into the card when it lands. Muse Code delegates through workflows instead.
+When Grok, Claude Code, Codex or Antigravity delegates work to a subagent, the chat shows a card with the same quiet header as a workflow: an icon, "Subagent", the task, its status and a timer. Open it for the subagent's activity where the agent streams it (Grok, Codex, and Antigravity's tool calls), its result — which reads like a reply and has a copy button — and the tokens it used where the agent reports them. Background subagents included: their result folds back into the card when it lands. Antigravity reports no result of its own, so its card settles when the turn ends. Muse Code delegates through workflows instead.
 
 ![A subagent call rendered as a card in the chat](https://raw.githubusercontent.com/phuryn/grok-build-vscode/main/docs/screenshots/subagents.png)
 
@@ -170,7 +170,7 @@ When Grok, Claude Code or Codex delegates work to a subagent, the chat shows a c
 <details>
 <summary><strong>Tool calls</strong> — every read, edit & command inline; expand for full details</summary>
 
-Every action appears as a category-iconed row, batched and summarized ("Explored 5 items", "Edited 2 files"); a failed tool turns red with the reason. Edits show a `+N −M` change count and expand to an inline diff at the file's real line numbers; shell commands expand to an **IN/OUT block** with the full command and its complete output — exactly what Grok received, exit code included. In Coding purpose, a turn that changed files ends with a **Changed N files** card rolling up every path and its `+N −M`; tap a row for **one diff covering everything the turn did to that file** — taken against what the file looked like before the agent touched it, not before its last edit — and on a desk **open diff** puts that in its own editor tab. Where a diff cannot be taken honestly (a folder that is not a git repository, a repository busy with another command, a project you switched away from between sending and tapping) the row falls back to the tool call that made the edit; a turn from a conversation you have reloaded says so at the foot of the card instead, because the before-state is kept only while the session stays open. The card starts collapsed; click its header to reveal the file list and, where available, the Open Changes button. **Expand diff card** (`grok.expandDiffCard`) sets its own default independently of tool details, and applies live to existing cards. On a phone or browser the choice is stored on that device. To audit an Auto-accept run, pre-expand everything with `grok.expandCommandOutputs`, or **Grok: Expand All Tool Details** from the Command Palette.
+Every action appears as a category-iconed row, batched and summarized ("Explored 5 items", "Edited 2 files"); a failed tool turns red with the reason. Edits show a `+N −M` change count and expand to an inline diff at the file's real line numbers; shell commands expand to an **IN/OUT block** with the full command and its complete output — exactly what Grok received, exit code included. In Coding purpose, a turn that changed files ends with a **Changed N files** card rolling up every path and its `+N −M`; tap a row for **one diff covering everything the turn did to that file** — taken against what the file looked like before the agent touched it, not before its last edit — and on a desk **open diff** puts that in its own editor tab. Where a diff cannot be taken honestly (a folder that is not a git repository, a repository busy with another command, a project you switched away from between sending and tapping) the row falls back to the tool call that made the edit; a turn from a conversation you have reloaded says so at the foot of the card instead, because the before-state is kept only while the session stays open. The card starts collapsed; click its header to reveal the file list and, where available, the Open Changes button. **Expand diff card** (`grok.expandDiffCard`) sets its own default independently of tool details, and applies live to existing cards. On a phone or browser the choice is stored on that device. To audit an Auto-accept run, pre-expand everything with `grok.expandCommandOutputs`, or **AFK Pilot: Expand All Tool Details** from the Command Palette.
 
 ![A tool batch with a command expanded to its IN/OUT block](https://raw.githubusercontent.com/phuryn/grok-build-vscode/main/docs/screenshots/tool_calls.png)
 
@@ -197,18 +197,25 @@ A ` ```mermaid ` block renders as a real diagram via [Mermaid](https://mermaid.j
 <details>
 <summary><strong>Model picker</strong> — switch models live, no restart</summary>
 
-Click the model chip in the composer to open the model picker. The list comes from your CLI; switching is live in most cases. (A few models belong to a different agent and need a quick restart — the extension detects that and carries your context forward.)
+Click the model chip in the composer to open the model picker (it opens once the conversation's models have loaded). The list comes from your CLI; switching is live in most cases. (A few models belong to a different agent and need a quick restart — the extension detects that and carries your context forward.)
 
 </details>
 
 <details>
-<summary><strong>Multi-provider</strong> — built for Grok Build, works with Codex, Claude Code and Muse Code</summary>
+<summary><strong>Multi-provider</strong> — built for Grok Build, works with Codex, Claude Code, Muse Code and (experimental) Antigravity</summary>
 
-The host talks **ACP** (JSON-RPC over stdio), not a Grok-specific protocol, with packaged adapters for **OpenAI Codex** and **Claude Code**. **Muse Code** speaks Meta's own protocol instead, and reaches the same UI through a small adapter this extension ships. Connect them in **Settings → Providers**; each signs in through its own CLI. Grok Build is the default and the one everything is tuned against, but every connected agent shares one model picker, and each conversation keeps its agent once it has history, so all four can run side by side with shared chat, tool and permission cards, and history. Muse's picker uses its own names: **Allow all** (no prompts), **Prompt unmatched** (prompt when no rule matches), and **On request** (sandboxed tools, prompts only for explicit permission requests). Allow all starts with the shell sandbox off and the workspace trusted. On desktop, the other modes use the sandbox/network/trust settings under Providers, with On request always forcing the sandbox on at process start. On request is disabled with an explanation in an already running desktop process without a sandbox. On cloud machines, the isolated VM is the sandbox: Muse's shell sandbox is off for every available mode, Prompt unmatched retains its approval rules, and On request is omitted. Existing On request conversations cannot open on cloud; new cloud conversations use Prompt unmatched if On request was the remembered default. Approval switches apply from the next action; sandbox and trust change on reopen or a new conversation. Muse remembers its last selected mode separately from the other providers; reopening follows Muse's replayed mode. Deny unmatched is temporarily hidden because it delays every turn in Muse; saved conversations and remembered defaults in that mode use Prompt unmatched. Older hosts retain their two-entry picker. Steering, compaction, history deletion and host-managed connectors are unavailable for it. Providers also offers to **update the Grok, Codex and Claude CLIs in place** when yours is older than the version this app is built against — installed the way you installed it (npm, Homebrew, or the vendor's own installer), never switching you to a different one — and the conversations you had open reopen when it finishes.
+The host talks **ACP** (JSON-RPC over stdio), not a Grok-specific protocol, with packaged adapters for **OpenAI Codex** and **Claude Code**. **Muse Code** speaks Meta's own protocol instead, and reaches the same UI through a small adapter this extension ships. Connect them in **Settings → Providers**; each signs in through its own CLI. Grok Build is the default and the one everything is tuned against, but every connected agent shares one model picker, and each conversation keeps its agent once it has history, so all four can run side by side with shared chat, tool and permission cards, and history. Muse's picker uses its own names: **Allow all** (no prompts), **Prompt unmatched** (prompt when no rule matches), and **On request** (sandboxed tools, prompts only for explicit permission requests). Allow all starts with the shell sandbox off and the workspace trusted. On desktop, the other modes use the sandbox/network/trust settings in **Settings → Providers → Muse Code (Meta) settings** (collapsed under the Muse row), with On request always forcing the sandbox on at process start. On request is disabled with an explanation in an already running desktop process without a sandbox. On cloud machines, the isolated VM is the sandbox: Muse's shell sandbox is off for every available mode, Prompt unmatched retains its approval rules, and On request is omitted. Existing On request conversations cannot open on cloud; new cloud conversations use Prompt unmatched if On request was the remembered default. Approval switches apply from the next action; sandbox and trust change on reopen or a new conversation. Muse remembers its last selected mode separately from the other providers; reopening follows Muse's replayed mode. Deny unmatched is temporarily hidden because it delays every turn in Muse; saved conversations and remembered defaults in that mode use Prompt unmatched. Older hosts retain their two-entry picker. Steering, compaction, history deletion and host-managed connectors are unavailable for it. Providers also offers to **update the Grok, Codex and Claude CLIs in place** when yours is older than the version this app is built against — installed the way you installed it (npm, Homebrew, or the vendor's own installer), never switching you to a different one — and the conversations you had open reopen when it finishes. **Antigravity** is the experimental fifth: see below.
 
 **Settings → Connectors** has three sections: apps you connect here (Connect / Disconnect — available to Grok, Codex, and Claude), grok.com connectors that follow your Grok account, and local Grok connectors declared in this machine's config files. Connecting an app is not desk-only: it works from a phone, and on a cloud machine where there is no desk at all. Project-file servers stay off this page. grok.com connectors are edited at [grok.com/connectors](https://grok.com/connectors).
 
 Settings → Providers → **Provider config files** opens the file each CLI actually reads — `~/.grok/config.toml`, `~/.codex/config.toml`, `~/.claude/settings.json` — and edits it in place, from a phone as readily as at the desk. Those three are the whole list: the credentials that live beside them are not reachable from here. A CLI reads its config once at startup, so the panel offers to **restart the conversation you have open** after you save, and states the limit rather than hiding it — other sessions already running keep the settings they started with.
+
+</details>
+
+<details>
+<summary><strong>Antigravity (experimental)</strong> — Google's agent, on your own computer</summary>
+
+Turn on **Settings → Advanced → Experimental: Antigravity** to add Google's Antigravity as an agent. It runs on the computer in front of you, not on cloud machines, and is signed in there, not from a phone. Install it and connect it in **Settings → Providers**: **Sign in with Google**, or paste a **Gemini API key**. The key stays in the app's secure storage and reaches Google only through a small relay on this computer — never the agent's own environment — and a key also offers **Gemini 4 Argon**. Antigravity has Agent and Auto accept, but no Plan mode and no connectors yet. How it works, and the choices behind it: [research/antigravity-acp.md](https://github.com/phuryn/grok-build-vscode/blob/main/research/antigravity-acp.md).
 
 </details>
 
@@ -220,16 +227,16 @@ Click the composer model chip, then choose a stop on the effort strip. The avail
 </details>
 
 <details>
-<summary><strong>Remote Control (AFK Pilot)</strong> — watch and steer your sessions from a phone or any browser</summary>
+<summary><strong>Remote Control</strong> — watch and steer your sessions from a phone or any browser</summary>
 
-The **Remote control** phone button in the chat’s top bar is always available on the desk. Choose **Sign in and link this machine** to pair it with **[AFK Pilot](https://afkpilot.com)**, a companion web client that mirrors this chat in the browser: follow a running turn, approve permissions, answer questions, and send or steer messages from your phone while away from your desk. **Connecting an agent** works from there too — the CLI's headless sign-in runs on the linked computer and the page shows you the link (and, for Grok, Codex and Muse, the short code) to confirm, from the onboarding card or from Settings → Providers. So does **connecting an app** under Settings → Connectors: its sign-in runs on the linked computer too, and the browser lands back on the page instead of a localhost address you would have to copy across. **Grok**, **OpenAI Codex**, **Claude Code**, and **Muse Code** all sign in this way. Codex needs device-code login enabled on your OpenAI account first, and the flow walks you through it. Claude Code is paste-code: you open the link, sign in, and paste the code Anthropic shows you back into the page. The extension dials **out** to the service — no inbound port, no port forwarding — and **Unlink this device** in desktop Settings (with confirmation), or **AFK Pilot: Unlink this device** in the VS Code Command Palette, unlinks it again. The mobile view renders the retained chat window in full fidelity (diffs, images, equations, diagrams) with touch-sized controls; on reconnect, the remote snapshot is capped at the last 10 user messages while the VS Code view keeps the complete buffer. Its own **+** picker attaches a photo or a document (`.md`/`.txt`/`.pdf`/`.csv`/`.xlsx`/`.docx`) straight from your phone. You can **dictate** there too — say *"grok send"* to submit hands-free — **rewind or edit a message** you already sent, **connect GitHub** — from Settings or while cloning — and pick a private repository from a list rather than typing its URL, give each browser tab its **own conversation and repository**, and pick up the very conversation VS Code has open, live in both. A conversation follows the tab you are using: asking for it from a second tab moves it there and tells the first, which can take it back with one tap.
+The **Remote control** phone button in the chat’s top bar is always available on the desk. Choose **Sign in and link this machine** to pair your phone at **[afkpilot.com](https://afkpilot.com)**; the built-in remote view mirrors this chat in the browser: follow a running turn, approve permissions, answer questions, and send or steer messages from your phone while away from your desk. **Connecting an agent** works from there too — the CLI's headless sign-in runs on the linked computer and the page shows you the link (and, for Grok, Codex and Muse, the short code) to confirm, from the onboarding card or from Settings → Providers. So does **connecting an app** under Settings → Connectors: its sign-in runs on the linked computer too, and the browser lands back on the page instead of a localhost address you would have to copy across. **Grok**, **OpenAI Codex**, **Claude Code**, and **Muse Code** all sign in this way. Codex needs device-code login enabled on your OpenAI account first, and the flow walks you through it. Claude Code is paste-code: you open the link, sign in, and paste the code Anthropic shows you back into the page. The extension dials **out** to the service — no inbound port, no port forwarding — and **Unlink this device** in desktop Settings (with confirmation), or **AFK Pilot: Unlink this device** in the VS Code Command Palette, unlinks it again. The mobile view renders the retained chat window in full fidelity (diffs, images, equations, diagrams) with touch-sized controls; on reconnect, the remote snapshot is capped at the last 10 user messages while the VS Code view keeps the complete buffer. Its own **+** picker attaches a photo or a document (`.md`/`.txt`/`.pdf`/`.csv`/`.xlsx`/`.docx`) straight from your phone. You can **dictate** there too — say *"grok send"* to submit hands-free — **rewind or edit a message** you already sent, **connect GitHub** — from Settings or while cloning — and pick a private repository from a list rather than typing its URL, give each browser tab its **own conversation and repository**, and pick up the very conversation VS Code has open, live in both. A conversation follows the tab you are using: asking for it from a second tab moves it there and tells the first, which can take it back with one tap.
 
 Once linked, click **Remote control** and scan the QR code to continue **this conversation** on your phone. **Copy link** and **Open in browser** use the same conversation link, including its project and worktree directory. The code is generated on this machine; session coordinates stay in the URL fragment. A green dot means a phone or browser is connected. Keep this app open while you are away; it stays awake, and AFK Pilot never stores prompts or code. Until the relay has supplied this machine's identity, the popover shows "Generating QR code…"; **Open in browser** then opens AFK Pilot itself (one linked machine goes straight to its chat, more than one stops on the device picker). If another window of the app holds the link, the popover says so.
 
-**Continue on phone…** in a desktop or VS Code Projects session menu opens the code for that row, even when another chat is focused. Settings → Remote control shows **This machine** live and **Continue on phone → Show code** for the focused conversation; the Command Palette also has **Grok: Continue on Phone**. Account management and the existing sign-in explainer remain available there. Remotes do not offer the desk’s handoff button.
+**Continue on phone…** in a desktop or VS Code Projects session menu opens the code for that row, even when another chat is focused. Settings → Remote control shows **This machine** live and **Continue on phone → Show code** for the focused conversation; the Command Palette also has **AFK Pilot: Continue on Phone**. Account management and the existing sign-in explainer remain available there. Remotes do not offer the desk’s handoff button.
 
 
-A **projects rail** lists every repository with Grok history and its newest conversations, with pinned conversations lifted above them across all projects and a search over both. You can start a session in any project without switching to it first, and rename, delete or clear history from the row — from the ⋯ button or by right-clicking it. Give a project a **colour** and an **icon** and it carries them everywhere it is named — its row in the rail, the chip above the message box, the project switcher, the file panel — on VS Code, desktop, cloud, or your phone. Projects you put away — and any left untouched for 30 days — fold into **Archived**, and come back on their own the moment you work in one again. Expand Archive to open a conversation or move a project back to Projects on VS Code, desktop, cloud, or your phone. Archiving keeps every project reachable. On a phone the rail is a drawer behind the handle in the header.
+A **projects rail** lists your projects — the folders you open, create, clone or add, never just any folder an agent once ran in ([docs/projects.md](https://github.com/phuryn/grok-build-vscode/blob/main/docs/projects.md)) — and each one's newest conversations, with **Recent** (what you sent in or recently opened, across every folder) and pinned conversations lifted above them and a search over both. With VS Code as the host, the first time you send in a conversation whose folder is not a project — at the desk or from your phone — AFK Pilot offers to add it (`grok.askToAddProjects`); "Never for this folder" stops the question for that folder. You can start a session in any project without switching to it first, and rename, delete or clear history from the row — from the ⋯ button or by right-clicking it. Give a project a **colour** and an **icon** and it carries them everywhere it is named — its row in the rail, the chip above the message box, the project switcher, the file panel — on VS Code, desktop, cloud, or your phone. Projects you put away — and any left untouched for 30 days — fold into **Archived**, and come back on their own the moment you work in one again. Expand Archive to open a conversation or move a project back to Projects on VS Code, desktop, cloud, or your phone. Archiving keeps every project reachable. On a phone the rail is a drawer behind the handle in the header.
 
 While a device is linked or a local agent turn is in flight, the extension also **keeps the machine awake** (`caffeinate` on macOS, `SetThreadExecutionState` on Windows, `systemd-inhibit` on Linux) so a turn you kicked off from your phone isn't cut short by idle sleep. The display still sleeps — only system sleep is blocked — and the lock is released when neither a linked device nor an active local turn needs it. Turn it off with `grok.remote.keepAwake`. A **closed laptop lid can still suspend** the machine; these wake locks do not change the operating system's lid-close policy.
 
@@ -250,11 +257,11 @@ While a device is linked or a local agent turn is in flight, the extension also 
 
 ## Install
 
-**1. Install the extension.** In VS Code or Cursor, open **Extensions** (`Ctrl/Cmd+Shift+X`) and search **"GUI for Grok Build & Muse Code"**.
+**1. Install the extension.** In VS Code or Cursor, open **Extensions** (`Ctrl/Cmd+Shift+X`) and search **"AFK Pilot"**.
 
-**2. Open Grok and sign in.** Press `Ctrl/Cmd+;`. The sidebar **walks you through installing the `grok` CLI and signing in** — one click per step, with your SuperGrok / X Premium+ subscription or an xAI API key. That's the whole setup.
+**2. Open AFK Pilot and sign in.** Press `Ctrl/Cmd+;`. The sidebar **walks you through installing the `grok` CLI and signing in** — one click per step, with your SuperGrok / X Premium+ subscription or an xAI API key. That's the whole setup.
 
-Grok defaults to the **Secondary Side Bar** (right side, next to other AI tools). Cursor refuses that container, so a first installation moves the view to the Primary Side Bar. Use the editor's own Move View controls to relocate it; where the secondary container is unavailable, Settings → Advanced → **Move view…** opens that picker.
+AFK Pilot defaults to the **Secondary Side Bar** (right side, next to other AI tools). Cursor refuses that container, so a first installation moves the view to the Primary Side Bar. Use the editor's own Move View controls to relocate it; where the secondary container is unavailable, Settings → Advanced → **Move view…** opens that picker.
 
 > Prefer the terminal, building from source, or installing into several IDEs at once? See the project [INSTALL docs](https://github.com/phuryn/grok-build-vscode/blob/main/docs/INSTALL.md).
 
@@ -262,7 +269,7 @@ Grok defaults to the **Secondary Side Bar** (right side, next to other AI tools)
 
 ## Quick start
 
-1. **Open** the Grok view (`Ctrl/Cmd+;`, or **Grok: Open** from the command palette) — it lives in the Secondary Side Bar by default.
+1. **Open** the AFK Pilot view (`Ctrl/Cmd+;`, or **AFK Pilot: Open** from the command palette) — it lives in the Secondary Side Bar by default.
 2. **Type a prompt** and press **Enter**. Grok streams its answer, showing a *Thinking…* line while it reasons. Want the full reasoning inline? Turn on **Show thinking traces** in Settings.
 3. **Approve actions.** When Grok wants to write a file or run a command it may raise a permission card — preview an edit in the native **diff editor**, with full-file context focused on the first changed line, then *Allow once / always / Reject*.
 4. **Pick your mode** (Agent / Plan / Auto accept), **model**, and **reasoning effort** from the bottom toolbar and model chip.
@@ -278,9 +285,12 @@ Grok defaults to the **Secondary Side Bar** (right side, next to other AI tools)
 | Setting | Default | Notes |
 |---|---|---|
 | `grok.cliPath` | `""` | Path to the `grok` binary. Empty = auto-discover (`~/.grok/bin/grok` → PATH). |
+| `grok.experimentalAntigravity` | `false` | Offer Google's Antigravity as an agent on this computer (not on cloud machines). Also the switch in Settings → Advanced. |
+| `grok.agyServerPath` | `""` | Path to Google's Antigravity ACP server (`agy_acp_server`). Empty = the copy this app installs. |
+| `grok.askToAddProjects` | `true` | The first time you send in a conversation whose folder is not one of your projects, offer to add it to Projects. Another conversation in that folder asks again; "Never for this folder" stops it for that folder. |
 | `grok.defaultModel` | `""` | Model ID for new sessions. Empty = CLI default. |
 | `grok.defaultEffort` | `""` | Reasoning effort forwarded as `--reasoning-effort` (`none` / `minimal` / `low` / `medium` / `high` / `xhigh`). Empty = CLI default. Applies live on recent CLIs; older CLIs (and resetting to the model default) restart the session. |
-| `grok.defaultMode` | `""` | Mode for new sessions, remembered automatically from your last Agent / Auto accept switch (Plan is never remembered). Empty = Agent. |
+| `grok.defaultMode` | `""` | Mode for new sessions, remembered automatically from your last Agent / Auto / Auto accept switch (Plan is never remembered). Empty = Auto mode where the agent has one (Claude), Agent mode elsewhere. |
 | `grok.includeActiveFileByDefault` | `true` | Auto-add the active editor as a context chip. Sends the file **path** (not its contents) unless you have text selected, in which case the selected lines are included. Click the chip to toggle it off — that choice is remembered across file switches and restarts. |
 | `grok.mentionIndexLimit` | `5000` | How many workspace files the composer's **@** autocomplete indexes. Raise it (no upper limit) if files are missing from the `@` list in a large repo; applies on the next `@`. Files you have open as tabs are always mentionable regardless of this cap. |
 | `grok.acp.promptIdleTimeoutMs` | `1800000` | Silence before a live turn is treated as hung (`ACP request timed out: session/prompt`). Any ACP traffic resets the idle clock. `0` disables. Applies to new sessions. |
@@ -313,28 +323,29 @@ Grok defaults to the **Secondary Side Bar** (right side, next to other AI tools)
 ## Commands & keybindings
 
 <details>
-<summary><strong>VS Code commands & keys</strong> (Ctrl/Cmd+Shift+P → "Grok")</summary>
+<summary><strong>VS Code commands & keys</strong> (Ctrl/Cmd+Shift+P → "AFK Pilot")</summary>
 
 VS Code commands (not Grok slash commands):
 
 | Command | What it does |
 |---|---|
-| `Grok: Open` | Open the Grok sidebar |
-| `Grok: New Session` | Start a fresh session |
-| `Grok: Compact Conversation` | Compact the current session to reclaim context |
-| `Grok: Pick Model` | Open the model picker |
-| `Grok: Toggle Plan / Agent Mode` | Open the mode picker (Agent / Plan / Auto accept) |
-| `Add to Grok chat` | Add files to the composer (the Explorer selection, the active editor, or a file picker) |
-| `Add Selection to Grok` | Attach the selected lines as a snippet chip in the composer |
-| `Grok: Insert @-Mention` | Insert an `@`-mention for the active file into the composer |
-| `Grok: Expand All Tool Details (This Session)` | Open every tool group, command IN/OUT box, and edit inline diff, and keep new ones open — this session only |
-| `Grok: Collapse All Tool Details (This Session)` | Collapse them all, and keep new ones collapsed — this session only |
-| `Grok: Show Logs` | Open the Grok output channel (ACP messages, errors) |
-| `Grok: Log Out` | Sign an agent's CLI out on this machine (`grok logout`, `codex logout`, `claude auth logout`) — the way to switch accounts. **Settings → Providers → Disconnect** only turns an agent off here and leaves its CLI signed in |
+| `AFK Pilot: Open` | Open the AFK Pilot sidebar |
+| `AFK Pilot: New Session` | Start a fresh session |
+| `AFK Pilot: Compact Conversation` | Compact the current session to reclaim context |
+| `AFK Pilot: Pick Model` | Open the model picker |
+| `AFK Pilot: Toggle Plan / Agent Mode` | Open the mode picker (Agent / Plan / Auto accept) |
+| `Add to AFK Pilot chat` | Add files to the composer (the Explorer selection, the active editor, or a file picker) |
+| `Add Selection to AFK Pilot` | Attach the selected lines as a snippet chip in the composer |
+| `AFK Pilot: Insert @-Mention` | Insert an `@`-mention for the active file into the composer |
+| `AFK Pilot: Expand All Tool Details (This Session)` | Open every tool group, command IN/OUT box, and edit inline diff, and keep new ones open — this session only |
+| `AFK Pilot: Collapse All Tool Details (This Session)` | Collapse them all, and keep new ones collapsed — this session only |
+| `AFK Pilot: Rebuild Projects from recent activity` | Redo the one-time pass that added the folders you sent messages in during the last 30 days. Keeps every project you added, created or cloned, and every pin, colour, icon and archive |
+| `AFK Pilot: Show Logs` | Open the AFK Pilot output channel (ACP messages, errors) |
+| `AFK Pilot: Log Out` | Sign an agent's CLI out on this machine (`grok logout`, `codex logout`, `claude auth logout`; for Antigravity, its Google sign-in or saved Gemini API key) — the way to switch accounts. **Settings → Providers → Disconnect** only turns an agent off here and leaves its CLI signed in |
 
 | Key | Action |
 |---|---|
-| `Ctrl+;` / `Cmd+;` | Open Grok sidebar |
+| `Ctrl+;` / `Cmd+;` | Open the AFK Pilot sidebar |
 | `Alt+G` | Insert `@`-mention for the active file (when the editor is focused) |
 
 Grok's own **slash commands** (`/imagine`, `/compact`, …) autocomplete in the composer when you type `/`, sourced live from your installed CLI version. Reference snapshot: [docs/SLASH-COMMANDS.md](https://github.com/phuryn/grok-build-vscode/blob/main/docs/SLASH-COMMANDS.md).
@@ -362,17 +373,15 @@ Full diagram, message flow, module map, and design notes: **[docs/architecture.m
 
 ## Companion apps
 
-This extension is complete on its own. Two optional companions share the same
-chat UI and the same Grok Build CLI:
+This extension is complete on its own, Remote Control included: pair your phone
+at **[afkpilot.com](https://afkpilot.com)** from **Remote control** in the **+**
+menu. One optional companion shares the same chat UI and the same Grok Build CLI:
 
-- **[AFK Pilot](https://afkpilot.com)** — watch, approve, and steer this
-  extension's agent from your phone or any browser. Pair once from **Remote
-  control** in the **+** menu.
 - **[Grok Build Desktop (Community)](https://afkpilot.com/desktop)** — the same
   agent as a standalone app for Windows, macOS and Linux, for machines where you
   would rather not install an editor. Free.
 
-Neither is required, and nothing here depends on them.
+It is not required, and nothing here depends on it.
 
 ---
 

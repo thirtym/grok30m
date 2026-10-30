@@ -42,6 +42,12 @@ export interface SessionListEntry {
   pinnedAt?: number;
   /** Agent that owns this immutable session. Absent means Grok for compatibility. */
   provider?: AcpProvider;
+  /** Started by automation, not a person (a headless Grok run; see
+   *  automated-sessions.ts for the others). Recent leaves it out. */
+  automated?: boolean;
+  /** On a Recent row whose folder is not a project: that folder, which the
+   *  row's menu offers to add ("Add to Projects"). */
+  addableCwd?: string;
 }
 
 export interface SessionMetaOverride {
@@ -68,6 +74,15 @@ export interface SessionMetaOverride {
    * the time anything reads it again the real file has overtaken it.
    */
   activeAt?: number;
+  /** When the person last SENT a message in this conversation through this host
+   *  (desk, desktop or phone). Written at send time only, never by a listing or
+   *  an open, and not for a routine's run: it is what makes a conversation
+   *  Recent (`isRecentConversation`). */
+  sentAt?: number;
+  /** When the person last opened this conversation through this host on purpose
+   *  (a click, a phone tap), never a listing or a reconnect restore. Keeps it in
+   *  Recent for `RECENT_OPENED_MS`. */
+  openedAt?: number;
   customName?: string;
   /** The extension's own title, taken from the first user message when a session's
    *  first turn completes. Deliberately NOT stored as `customName`: a name the
@@ -1017,6 +1032,7 @@ function buildEntry(
     kind,
     pinnedAt,
     ...(override?.provider ? { provider: override.provider } : {}),
+    ...(raw?.session_kind === "headless" ? { automated: true } : {}),
   };
 }
 
@@ -1170,6 +1186,59 @@ export function statSessionActivity(
   } catch {
     return undefined;
   }
+}
+
+/** How long opening a conversation keeps it in Recent without a message sent. */
+export const RECENT_OPENED_MS = 3 * 24 * 60 * 60 * 1000;
+
+/** `[Routine]`: the tag a routine run's conversation is named with (routines.ts). */
+const ROUTINE_TAG = "[Routine]";
+
+/**
+ * Whether a conversation belongs in Recent, from our own record of it alone:
+ * the person sent something in it through this host, or opened it here in the
+ * last {@link RECENT_OPENED_MS}. Merely being listed from a CLI's history says
+ * nothing, and is never enough.
+ *
+ * "Sent" is `sentAt`, and for conversations from before it existed the marks a
+ * send already left: a `usageLog` (written only after one of our turns) or a
+ * Grok `activeAt` (Grok's is written only at send and turn end -- an adapter
+ * row's is stamped by its listing, so it does not count). A routine's run is
+ * the host's own automation, not the person, and never counts.
+ */
+export function isRecentConversation(meta: SessionMetaOverride | undefined, now: number = Date.now()): boolean {
+  if (!meta || isRoutineRun(meta)) return false;
+  if (hasSentSignal(meta)) return true;
+  return typeof meta.openedAt === "number" && meta.openedAt >= now - RECENT_OPENED_MS;
+}
+
+function isRoutineRun(meta: SessionMetaOverride): boolean {
+  return typeof meta.customName === "string" && meta.customName.trim().startsWith(ROUTINE_TAG);
+}
+
+/** The person sent a message in this conversation through this host, by our
+ *  own record (see isRecentConversation). Never true for a routine's run. */
+export function hasSentSignal(meta: SessionMetaOverride): boolean {
+  if (isRoutineRun(meta)) return false;
+  if (typeof meta.sentAt === "number") return true;
+  if (Array.isArray(meta.usageLog) && meta.usageLog.length > 0) return true;
+  return typeof meta.activeAt === "number" && (meta.provider === undefined || meta.provider === "grok");
+}
+
+/**
+ * How far back history is LISTED: Recent, a project's conversations and history
+ * search show nothing whose last activity is older (the owner, 2026-10-15).
+ * Older conversations stay on disk, untouched, and still open from a pin.
+ * Lists apply it before reading anything per conversation -- the Grok index by
+ * its stat mtime, an adapter's rows by the `updatedAt` its listing reports.
+ */
+export const HISTORY_HORIZON_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Inside {@link HISTORY_HORIZON_MS}. An unknown time (0, missing) stays in:
+ *  there is nothing to judge it by, and dropping it would hide a live row. */
+export function withinHistoryHorizon(at: number | undefined, now: number = Date.now()): boolean {
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return true;
+  return at >= now - HISTORY_HORIZON_MS;
 }
 
 /** Cheap ordering pass: every session id newest-first by {@link statSessionActivity}

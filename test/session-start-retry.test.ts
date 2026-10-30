@@ -25,6 +25,10 @@ const startControl = {
   museFailsAfterReplay: false,
   catalogs: {} as Record<string, { modelId: string; name: string }[]>,
   startWait: undefined as Promise<void> | undefined,
+  startupAuths: [] as unknown[],
+  startEnvs: [] as Array<NodeJS.ProcessEnv | undefined>,
+  setModes: [] as string[],
+  claudeAutoUnsupported: false,
 };
 
 vi.mock("../src/acp", async (importOriginal) => {
@@ -41,8 +45,10 @@ vi.mock("../src/acp", async (importOriginal) => {
     fsRead?: unknown;
     fsWrite?: unknown;
     terminal?: unknown;
-    constructor(opts: { log: (msg: string) => void; effort?: string; backend?: any }) {
+    constructor(opts: { log: (msg: string) => void; effort?: string; backend?: any; startupAuth?: unknown; env?: NodeJS.ProcessEnv }) {
       super();
+      startControl.startupAuths.push(opts.startupAuth);
+      startControl.startEnvs.push(opts.env);
       this.provider = opts.backend?.provider ?? "grok";
       this.availableModels = startControl.catalogs[this.provider] ?? [];
       this.currentModelId = this.availableModels[0]?.modelId ?? "fake-model";
@@ -93,10 +99,20 @@ vi.mock("../src/acp", async (importOriginal) => {
     }
     async deleteSession(): Promise<void> {}
     async setMode(mode: string): Promise<void> {
+      startControl.setModes.push(`${this.provider}:${mode}`);
       if (this.provider === "muse" && mode === "yolo" && startControl.museRefusesFullAccess) {
         throw new Error("approval mode allowAll was not accepted");
       }
       if (this.provider === "muse") { this.currentModeId = mode; this.emit("modeChanged", mode); }
+      if (this.provider === "claude" && mode === "auto") {
+        // claude-agent-acp 0.76.0, a model without Auto: it switches to Accept
+        // edits and says so, then the RPC resolves and AcpClient reports the
+        // mode it asked for.
+        if (startControl.claudeAutoUnsupported) this.emit("modeChanged", "acceptEdits");
+        this.emit("modeChanged", "auto");
+      } else if (this.provider === "claude") {
+        this.emit("modeChanged", mode);
+      }
     }
     supportsInterject(): boolean { return this.provider === "grok"; }
     isCredentialError(): boolean {
@@ -802,6 +818,133 @@ describe("startSession bounded spawn retry", () => {
     expect(session.historyEventCount).toBe(countBefore + (child ? 0 : 1));
     expect(sidebar.posted.at(-1)).toMatchObject({
       type: child ? "childStream" : "toolCall", call: { toolCallId: "real-1" },
+    });
+  });
+
+  // Every Antigravity start authenticates with the way the person chose, and
+  // with nothing stored for it starts no server: `authenticate` and the
+  // server's own session/new would open Google's sign-in at an empty desk.
+  it.each([true, false])("starts an Antigravity server only with its chosen credential (stored=%s)", async stored => {
+    const sidebar = makeSidebar("/repo");
+    sidebar.providerConnectionState = { agy: true };
+    sidebar.connectedProviders = vi.fn(() => ["agy"]);
+    sidebar.usableProviders = vi.fn(() => ["agy"]);
+    sidebar.focused.provider = "agy";
+    sidebar.agyCredentialFor = vi.fn(async () => stored ? { method: "google" } : undefined);
+    sidebar.rejectAgyCredential = vi.fn(async () => {});
+    startControl.startupAuths = [];
+    startControl.startEnvs = [];
+    const client = await sidebar.startSession(undefined, sidebar.focused);
+    if (stored) {
+      expect(client?.provider).toBe("agy");
+      expect(startControl.starts).toBe(1);
+      expect(startControl.startupAuths).toEqual([{ methodId: "oauth-personal" }]);
+      expect(startControl.startEnvs[0]?.AGY_ACP_ENABLE_GATEWAY_AUTH).toBeUndefined();
+      // A refusal reported mid-turn goes back to the choice of how to sign in.
+      sidebar.focused.client.emit("credentialRejected");
+      expect(sidebar.rejectAgyCredential).toHaveBeenCalledTimes(1);
+      return;
+    }
+    expect(client).toBeUndefined();
+    expect(startControl.starts).toBe(0);
+    expect(sidebar.setProviderNeedsLogin).toHaveBeenCalledWith("agy", true);
+    expect(onboardings(sidebar)).toEqual([expect.objectContaining({ state: "agy-login", provider: "agy" })]);
+    expect(startErrors(sidebar)).toEqual([]);
+  });
+
+  // A key's server gets the relay's address and the rollout flag -- never the
+  // key -- and holds a lease on the relay until it exits.
+  it("starts a key's Antigravity server in gateway mode at the relay", async () => {
+    const sidebar = makeSidebar("/repo");
+    sidebar.providerConnectionState = { agy: true };
+    sidebar.connectedProviders = vi.fn(() => ["agy"]);
+    sidebar.usableProviders = vi.fn(() => ["agy"]);
+    sidebar.focused.provider = "agy";
+    sidebar.agyCredentialFor = vi.fn(async () => ({ method: "api-key", key: "AIza-session-key" }));
+    const release = vi.fn();
+    sidebar.agyRelay = {
+      acquire: vi.fn(async () => ({ baseUrl: "http://127.0.0.1:4321/prefix", release })),
+      redact: (text: string) => text,
+    };
+    startControl.startupAuths = [];
+    startControl.startEnvs = [];
+    const client = await sidebar.startSession(undefined, sidebar.focused);
+    expect(client?.provider).toBe("agy");
+    expect(sidebar.agyRelay.acquire).toHaveBeenCalledWith("AIza-session-key");
+    expect(startControl.startupAuths).toEqual([{ methodId: "gateway", meta: { gateway: { baseUrl: "http://127.0.0.1:4321/prefix" } } }]);
+    expect(startControl.startEnvs[0]?.AGY_ACP_ENABLE_GATEWAY_AUTH).toBe("1");
+    expect(JSON.stringify(startControl.startupAuths)).not.toContain("AIza-session-key");
+    expect(Object.values(startControl.startEnvs[0] ?? {})).not.toContain("AIza-session-key");
+    expect(release).not.toHaveBeenCalled();
+    sidebar.focused.client.emit("exit", 0);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  // Claude Code's native Auto is the default for a new conversation where no
+  // mode was chosen; it still asks about what it judges risky, so the host
+  // does not answer for the person.
+  describe("Claude's native Auto at the start of a conversation", () => {
+    function claudeSidebar(defaultMode?: string): any {
+      const sidebar = makeSidebar("/repo");
+      sidebar.providerConnectionState = { claude: true };
+      sidebar.connectedProviders = vi.fn(() => ["claude"]);
+      sidebar.usableProviders = vi.fn(() => ["claude"]);
+      sidebar.focused.provider = "claude";
+      sidebar.host.getConfiguration = vi.fn(() => ({
+        get: (key: string, fallback: unknown) => key === "defaultMode" && defaultMode !== undefined ? defaultMode : fallback,
+        inspect: () => undefined,
+        update: vi.fn(async () => {}),
+      }));
+      startControl.setModes = [];
+      startControl.claudeAutoUnsupported = false;
+      return sidebar;
+    }
+    const modes = (sidebar: any) => sidebar.posted.filter((message: HostMsg) => message.type === "modeChanged");
+
+    it("starts in Auto when no mode was chosen, from the first frame", async () => {
+      const sidebar = claudeSidebar();
+      await sidebar.startSession(undefined, sidebar.focused);
+      expect(startControl.setModes).toEqual(["claude:auto"]);
+      expect(modes(sidebar).map((message: any) => message.modeId)).not.toContain("agent");
+      expect(modes(sidebar).at(-1)).toMatchObject({ modeId: "auto", modes: ["agent", "auto", "plan", "yolo"] });
+      expect(sidebar.focused.autoApprove).toBe(false);
+    });
+
+    it.each(["agent", "yolo"])("keeps an explicit %s", async (mode) => {
+      const sidebar = claudeSidebar(mode);
+      await sidebar.startSession(undefined, sidebar.focused);
+      expect(startControl.setModes).toEqual([]);
+      expect(modes(sidebar).at(-1)).toMatchObject({ modeId: mode });
+    });
+
+    it("settles once on Agent mode when the model has no Auto, and does not ask again this run", async () => {
+      startControl.claudeAutoUnsupported = true;
+      const sidebar = claudeSidebar();
+      startControl.claudeAutoUnsupported = true;
+      await sidebar.startSession(undefined, sidebar.focused);
+      expect(startControl.setModes).toEqual(["claude:auto", "claude:agent"]);
+      expect(modes(sidebar).at(-1)).toMatchObject({ modeId: "agent" });
+      // Never the adapter's Accept edits, which this host would answer for.
+      expect(sidebar.focused.autoApprove).toBe(false);
+      startControl.setModes = [];
+      const next = new Session();
+      next.provider = "claude";
+      next.cwd = "/repo";
+      sidebar.focused = next;
+      await sidebar.startSession(undefined, next);
+      expect(startControl.setModes).toEqual([]);
+      expect(modes(sidebar).at(-1)).toMatchObject({ modeId: "agent" });
+    });
+
+    it("picking Auto by hand on a model without it says so and stays in Agent mode", async () => {
+      const sidebar = claudeSidebar("agent");
+      await sidebar.startSession(undefined, sidebar.focused);
+      startControl.claudeAutoUnsupported = true;
+      sidebar.reportRequester = vi.fn();
+      await sidebar.setMode("auto", sidebar.focused);
+      expect(startControl.setModes).toEqual(["claude:auto", "claude:agent"]);
+      expect(modes(sidebar).at(-1)).toMatchObject({ modeId: "agent" });
+      expect(sidebar.reportRequester).toHaveBeenCalledWith(undefined, "warning", expect.stringContaining("Auto mode isn't available for this model"));
     });
   });
 

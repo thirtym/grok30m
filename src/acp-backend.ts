@@ -2,7 +2,7 @@ import type { EffortLevel, PromptContentBlock } from "./acp";
 
 export const ACP_PROVIDERS = ["grok", "codex", "claude"] as const;
 // The legacy wire vocabulary above stays frozen for older receivers.
-export const INTERNAL_PROVIDERS = [...ACP_PROVIDERS, "muse"] as const;
+export const INTERNAL_PROVIDERS = [...ACP_PROVIDERS, "muse", "agy"] as const;
 export type LegacyAcpProvider = (typeof ACP_PROVIDERS)[number];
 export type AcpProvider = (typeof INTERNAL_PROVIDERS)[number];
 
@@ -26,6 +26,7 @@ const PROVIDER_ACTIONS: Record<AcpProvider, {
   codex: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true },
   claude: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true },
   muse: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: true, autoAccept: true, perCallContext: false, clientMcp: false },
+  agy: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false },
 };
 
 /**
@@ -128,6 +129,19 @@ export interface BackendUpdate {
    * for occupancyFromAdapterTurn, not occupancy by themselves.
    */
   usageUpdateUsed?: number;
+  /** The agent reported mid-turn that its credential was refused -- in-band,
+   *  as text, with no RPC error for the host to classify. */
+  credentialRejected?: true;
+  /**
+   * This update belongs to a subagent's own stream: it is routed exactly as a
+   * child session's updates are (`childStream`), into the card whose
+   * `child_session_id` names it. For an agent whose child calls arrive on the
+   * parent session.
+   */
+  childSessionId?: string;
+  /** Already-normalized updates to route before this one (a backend closing
+   *  cards at a turn boundary it only sees in the stream). */
+  precede?: any[];
 }
 
 export interface BackendSessionListEntry {
@@ -182,5 +196,37 @@ export interface AcpBackend<Provider extends string = AcpProvider> {
     cwd: string,
     platform: NodeJS.Platform,
   ): Promise<BackendSessionListResult>;
+  /**
+   * The whole catalog in one listing, for an agent whose `session/list` is not
+   * scoped by folder in the first place (codex returns every folder whatever
+   * it is asked). Present only together with {@link catalogSessionsFor}, which
+   * must give each folder exactly what `listSessions(cwd)` would have.
+   */
+  listSessionCatalog?(
+    request: (method: string, params: any) => Promise<any>,
+    platform: NodeJS.Platform,
+  ): Promise<BackendSessionListEntry[]>;
+  catalogSessionsFor?(
+    catalog: readonly BackendSessionListEntry[],
+    cwd: string,
+    platform: NodeJS.Platform,
+  ): BackendSessionListEntry[];
   isCredentialError(error: unknown): boolean;
+  /** Extra `session/new` and `session/load` params beyond cwd and mcpServers. */
+  sessionParams?(cwd: string): Record<string, unknown>;
+  /**
+   * The model a new session moves to when the host remembers none, or
+   * undefined to keep the agent's own default.
+   */
+  defaultModelId?(modelIds: readonly string[]): string | undefined;
+  /**
+   * A turn (or a `session/load` replay) ended. Returns already-normalized
+   * updates to route, e.g. settling subagent cards the agent never closes.
+   */
+  turnEnded?(outcome: "completed" | "cancelled" | "failed"): any[];
+  /**
+   * Ask the spawned process to exit cleanly, in place of waiting for it to
+   * notice stdin closing. Dispose still kills it if it has not exited in time.
+   */
+  stopProcess?(pid: number, command: string): Promise<void>;
 }

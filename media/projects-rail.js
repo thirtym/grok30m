@@ -36,6 +36,8 @@
   // Cross-project RECENT is a shorter shortcut list than RAIL_EXPANDED.
   // Keep in lockstep with RAIL_RECENT_CAP in src/projects-rail.ts.
   const RECENT_CAP = 10;
+  /** Projects are folders you chose, so an empty list says how they get there. */
+  const NO_PROJECTS = "Your projects appear here. Open a folder, create one, or add one from Recent.";
   const RAIL_RECENT_KEY = "__recent__";
   // The same age rule the desktop/browser rail applies (media/chat.js). Without
   // it VS Code showed every project Grok has ever run in, forever — which for
@@ -45,6 +47,11 @@
   // things have been, the newest few stay in view. Coming back from a month away
   // would otherwise archive everything at once and read as broken.
   const RAIL_ALWAYS_VISIBLE = 3;
+  // How long the first draw of Projects waits for the projects' own rows. Until
+  // they arrive the age rule cannot run, so a quiet project sat in Projects and
+  // then jumped to the Archive a moment later. The rows now arrive in a second
+  // or two; past this, Projects is drawn with what is known, as before.
+  const RAIL_PLACEMENT_HOLD_MS = 4000;
 
   /** Palette the host accepts — ids match REPO_COLOR_IDS in sessions.ts. */
   const REPO_COLOR_SWATCHES = [
@@ -83,6 +90,9 @@
     pinnedKnown: false,
     showProviderGlyphs: false,
     dots: {},
+    // The host's own Recent (`recentSessions`); null until a host that builds one
+    // sends it. See recentRows.
+    recentSessions: null,
     filter: "",
     /** cwd-key → true when collapsed. Repositories start expanded. */
     collapsed: savedRailShape.collapsed,
@@ -461,13 +471,16 @@
     // this is the mark that actually needs the evenodd rule; Lobe ships all
     // four with it and the other three render the same either way.
     muse: "M6.897 4c1.915 0 3.516.932 5.43 3.376l.282-.373c.19-.246.383-.484.58-.71l.313-.35C14.588 4.788 15.792 4 17.225 4c1.273 0 2.469.557 3.491 1.516l.218.213c1.73 1.765 2.917 4.71 3.053 8.026l.011.392.002.25c0 1.501-.28 2.759-.818 3.7l-.14.23-.108.153c-.301.42-.664.758-1.086 1.009l-.265.142-.087.04a3.493 3.493 0 01-.302.118 4.117 4.117 0 01-1.33.208c-.524 0-.996-.067-1.438-.215-.614-.204-1.163-.56-1.726-1.116l-.227-.235c-.753-.812-1.534-1.976-2.493-3.586l-1.43-2.41-.544-.895-1.766 3.13-.343.592C7.597 19.156 6.227 20 4.356 20c-1.21 0-2.205-.42-2.936-1.182l-.168-.184c-.484-.573-.837-1.311-1.043-2.189l-.067-.32a8.69 8.69 0 01-.136-1.288L0 14.468c.002-.745.06-1.49.174-2.23l.1-.573c.298-1.53.828-2.958 1.536-4.157l.209-.34c1.177-1.83 2.789-3.053 4.615-3.16L6.897 4zm-.033 2.615l-.201.01c-.83.083-1.606.673-2.252 1.577l-.138.199-.01.018c-.67 1.017-1.185 2.378-1.456 3.845l-.004.022a12.591 12.591 0 00-.207 2.254l.002.188c.004.18.017.36.04.54l.043.291c.092.503.257.908.486 1.208l.117.137c.303.323.698.492 1.17.492 1.1 0 1.796-.676 3.696-3.641l2.175-3.4.454-.701-.139-.198C9.11 7.3 8.084 6.616 6.864 6.616zm10.196-.552l-.176.007c-.635.048-1.223.359-1.82.933l-.196.198c-.439.462-.887 1.064-1.367 1.807l.266.398c.18.274.362.56.55.858l.293.475 1.396 2.335.695 1.114c.583.926 1.03 1.6 1.408 2.082l.213.262c.282.326.529.54.777.673l.102.05c.227.1.457.138.718.138.176.002.35-.023.518-.073.338-.104.61-.32.813-.637l.095-.163.077-.162c.194-.459.29-1.06.29-1.785l-.006-.449c-.08-2.871-.938-5.372-2.2-6.798l-.176-.189c-.67-.683-1.444-1.074-2.27-1.074z",
+    // Google Antigravity's mark, from the same Lobe set (1.95.1).
+    agy: "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z",
   };
 
   function makeProviderGlyph(provider, dot, sessionId) {
-    const id = provider === "codex" || provider === "claude" || provider === "muse" && state.museAdvertised ? provider : "grok";
+    const id = provider === "codex" || provider === "claude" || provider === "muse" && state.museAdvertised
+      || provider === "agy" && state.agyAdvertised ? provider : "grok";
     const glyph = document.createElement("span");
     glyph.className = "provider-glyph provider-" + id;
-    glyph.title = id === "codex" ? "Codex" : id === "claude" ? "Claude" : id === "muse" ? "Muse Code" : "Grok";
+    glyph.title = id === "codex" ? "Codex" : id === "claude" ? "Claude" : id === "muse" ? "Muse Code" : id === "agy" ? "Antigravity" : "Grok";
     glyph.setAttribute("aria-label", glyph.title);
     glyph.innerHTML = `<svg class="provider-logo" viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><path d="${PROVIDER_LOGO_PATHS[id]}"></path></svg>`;
     const badge = document.createElement("span");
@@ -874,6 +887,9 @@
    * Duplication with PINNED / project lists is intentional — a shortcut.
    */
   function recentRows() {
+    // A host that builds Recent itself (`recentSessions`) is the whole answer;
+    // the union below is only for one that does not.
+    if (Array.isArray(state.recentSessions)) return state.recentSessions.slice(0, RECENT_CAP);
     const byId = new Map();
     if (state.currentSessionsKnown) {
       for (const s of state.currentSessions) {
@@ -1021,15 +1037,21 @@
     const ordered = current && active.indexOf(current) > 0
       ? [current, ...active.filter((r) => r !== current)]
       : active;
-    const projectRepos = ordered.filter((r) => !q || repoHasMatch(r));
+    const holding = placementHeld(active);
+    // While held, the IDE's own folder still shows: its place never depends on age.
+    const projectRepos = (holding ? ordered.filter((r) => sameCwd(r.cwd, state.workspaceCwd)) : ordered)
+      .filter((r) => !q || repoHasMatch(r));
     // Archiving every project must not take the screen's controls with it. The
     // header, the "+" and the wide add target all live inside this block, so
     // the last archived row used to leave a rail with no way to add anything --
     // and the `!shown` fallback below could not step in, because the archive
     // section had already set `shown`. The archive is a grouping, not a
     // different screen, so Projects stays with an empty state of its own.
-    const emptyProjects = !projectRepos.length && !q && archived.length > 0;
-    if (projectRepos.length || emptyProjects) {
+    const emptyProjects = !holding && !projectRepos.length && !q && archived.length > 0;
+    // No project at all yet while Recent or Pinned are showing: Projects still
+    // says where they come from. (With nothing showing, the note below does.)
+    const noProjects = !holding && !projectRepos.length && !archived.length && !q && shown;
+    if (projectRepos.length || emptyProjects || noProjects || holding) {
       const forcedOpen = !!q;
       const open = forcedOpen || !state.groupCollapsed.projects;
       root.appendChild(collapsibleGroupHead({
@@ -1052,10 +1074,22 @@
           }));
         }
         root.appendChild(list);
+        if (holding) {
+          const note = document.createElement("div");
+          note.className = "rail-note";
+          note.textContent = "Loading…";
+          root.appendChild(note);
+        }
         if (emptyProjects) {
           const note = document.createElement("div");
           note.className = "rail-note";
           note.textContent = "Every project is archived.";
+          root.appendChild(note);
+        }
+        if (noProjects) {
+          const note = document.createElement("div");
+          note.className = "rail-note";
+          note.textContent = NO_PROJECTS;
           root.appendChild(note);
         }
         // A full-width target under the list, not only the small "+" beside the
@@ -1068,7 +1102,7 @@
       shown = true;
     }
 
-    const visibleArchived = archived.filter((r) => !q || repoHasMatch(r));
+    const visibleArchived = holding ? [] : archived.filter((r) => !q || repoHasMatch(r));
     if (visibleArchived.length) {
       const forcedOpen = !!q;
       const open = forcedOpen || !state.groupCollapsed.archived;
@@ -1095,7 +1129,7 @@
     if (!shown) {
       const note = document.createElement("div");
       note.className = "rail-note";
-      note.textContent = q ? "No matches." : "No projects yet";
+      note.textContent = q ? "No matches." : NO_PROJECTS;
       // An empty rail that only says "No projects yet" is a dead end on the one
       // screen where the user has nothing else to click — and with no group
       // heads rendered, the "+" above has nowhere to be.
@@ -1410,6 +1444,29 @@
     if (!known) return !!repo.archived;
     if (floorKeys.has(cwdKey(repo.cwd))) return false;
     return at > 0 ? now - at > RAIL_ARCHIVE_AFTER_MS : true;
+  }
+
+  /**
+   * Whether the first draw of Projects is still waiting: some project in it has
+   * no rows yet and no stored choice, so the age rule may yet move it to the
+   * Archive. Only the first few seconds of the view (RAIL_PLACEMENT_HOLD_MS);
+   * a project added later is drawn at once, as before.
+   */
+  function placementHeld(active) {
+    // No archive on this host: nothing can move, so nothing to wait for.
+    if (!state.repos.some((r) => typeof r.archived === "boolean")) return false;
+    if (state.placementHoldUntil === undefined) {
+      // From the catalog's arrival, not the page's: a slow host start must not
+      // use up the wait before there is anything to place.
+      state.placementHoldUntil = Date.now() + RAIL_PLACEMENT_HOLD_MS;
+      setTimeout(render, RAIL_PLACEMENT_HOLD_MS + 50);
+    }
+    if (Date.now() >= state.placementHoldUntil) return false;
+    return active.some((r) => {
+      if (!r.available || Number(r.archivedAt) > 0) return false;
+      if (sameCwd(r.cwd, state.workspaceCwd) || sameCwd(r.cwd, state.currentCwd)) return false;
+      return !sessionsForRepo(r).known;
+    });
   }
 
   /** Split the catalog into what belongs in Projects and what belongs in the Archive. */
@@ -1727,9 +1784,37 @@
         pendingResume = null;
         state.activeSessionId = previous;
         render();
-      }, 8000),
+      }, Number(window.__grokRailResumeTimeoutMs) > 0 ? Number(window.__grokRailResumeTimeoutMs) : 8000),
     };
     render();
+  }
+
+  /**
+   * The host has the click (`sessionOpening`): it ends the open with the
+   * conversation or with `failed`, so the 8s give-up stands down -- a cold load
+   * can take a minute, and a click can wait behind another view's load. A
+   * long timer remains for a host that dies mid-open.
+   */
+  function noteSessionOpening(msg) {
+    if (!pendingResume || !msg || pendingResume.id !== msg.sessionId) return;
+    const pending = pendingResume;
+    clearTimeout(pending.timer);
+    if (msg.failed) {
+      pendingResume = null;
+      state.activeSessionId = pending.previous;
+      render();
+      return;
+    }
+    pending.timer = setTimeout(() => {
+      if (pendingResume !== pending) return;
+      pendingResume = null;
+      state.activeSessionId = pending.previous;
+      render();
+    }, 10 * 60_000);
+    if (msg.queued && !pending.queued) {
+      pending.queued = true;
+      render();
+    }
   }
 
   /** Whether a host-sent active id may be written to state. */
@@ -1787,6 +1872,14 @@
     label.className = "rail-session-name";
     label.textContent = sessionRowName(s);
     row.appendChild(label);
+    // The click is waiting for a load another view started (sessionOpening).
+    if (active && pendingResume && pendingResume.queued && pendingResume.id === s.id) {
+      row.classList.add("opening");
+      const note = document.createElement("span");
+      note.className = "rail-session-opening";
+      note.textContent = "opening…";
+      row.appendChild(note);
+    }
 
     if (opts && opts.showRepo) {
       const where = document.createElement("span");
@@ -1845,6 +1938,12 @@
           label: "Continue on phone…",
           onSelect: () => vscode.postMessage({ type: "showRemoteHandoff", source: "projects", sessionId: s.id, repoCwd: repo.cwd }),
         },
+        // A Recent conversation in a folder that is not one of your projects;
+        // the host names the folder only where it can add it.
+        ...(s.addableCwd ? [{
+          label: "Add to Projects",
+          onSelect: () => vscode.postMessage({ type: "addToProjects", cwd: s.addableCwd }),
+        }] : []),
         {
           label: isPinned ? "Unpin conversation" : "Pin conversation",
           disabled: !state.pinnedKnown,
@@ -1899,8 +1998,17 @@
   function onMessage(msg) {
     if (!msg || typeof msg !== "object") return;
     switch (msg.type) {
+      case "sessionOpening":
+        noteSessionOpening(msg);
+        break;
+      case "recentSessions":
+        state.recentSessions = Array.isArray(msg.entries) ? msg.entries : [];
+        state.dots = Object.assign({}, state.dots, msg.dots || {});
+        render();
+        break;
       case "providerState":
         state.museAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "muse");
+        state.agyAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "agy");
         state.showProviderGlyphs = Array.isArray(msg.providers) && msg.providers.filter((provider) => provider && provider.connected).length > 1;
         render();
         break;
@@ -2009,6 +2117,7 @@
         if (pendingPin) clearTimeout(pendingPin.timer);
         pendingPins.delete(msg.id);
         state.pinnedSessions = state.pinnedSessions.filter((s) => s.id !== msg.id);
+        if (Array.isArray(state.recentSessions)) state.recentSessions = state.recentSessions.filter((s) => s.id !== msg.id);
         for (const preview of Object.values(state.previews)) {
           const before = preview.entries.length;
           preview.entries = preview.entries.filter((s) => s.id !== msg.id);

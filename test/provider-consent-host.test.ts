@@ -26,6 +26,8 @@ vi.mock("../src/acp", async original => {
     async newSession() { calls.newSession(this.provider); this.sessionId = "new-id"; return { sessionId: this.sessionId }; }
     async loadSession() { calls.loadSession(this.provider); return { sessionId: "old-id" }; }
     async listSessions() { calls.list(this.provider); return { sessions: [{ sessionId: "saved-id", cwd: process.cwd(), title: "Saved", updatedAt: new Date().toISOString() }] }; }
+    // Claude is listed per folder: no single catalog read.
+    async listSessionCatalog() { return undefined; }
     async deleteSession() { calls.delete(this.provider); }
     async dispose() {}
     isCredentialError() { return false; }
@@ -75,7 +77,8 @@ function coldHost(connected = false, cache?: any, saved?: Record<string, any>) {
   const context = { globalState: state, subscriptions: [], extensionUri: Uri.file(process.cwd()), globalStorageUri: Uri.file(dir), extension: { packageJSON: { version: "4.11.0" } } };
   const host = {
     appendLine: vi.fn(), workspaceRoot: () => dir, workspaceFolders: () => [dir],
-    getConfiguration: () => ({ get: (_key: string, fallback?: any) => fallback, inspect: () => undefined }),
+    // Antigravity is offered only with its experimental setting on.
+    getConfiguration: () => ({ get: (key: string, fallback?: any) => key === "experimentalAntigravity" ? true : fallback, inspect: () => undefined }),
     registerTextDocumentContentProvider: () => ({ dispose() {} }),
     secrets: { get: async () => undefined },
     setContext: vi.fn(), showErrorMessage: vi.fn(), showInformationMessage: vi.fn(),

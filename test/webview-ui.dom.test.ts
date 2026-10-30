@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { openAppSettings, bootWebview, dispatch, click, Posted } from "./webview-harness";
 import { countsAsUserBubble } from "../src/plan-restore";
 import { bracketRemoteSnapshot } from "../src/remote-policy";
+import { normalizeAgySessionResponse } from "../src/agy-backend";
 import type { HostMsg } from "../src/protocol";
 
 const $ = (doc: Document, id: string) => doc.getElementById(id) as HTMLElement;
@@ -894,8 +895,23 @@ describe("mode picker (the plan-gate entry path)", () => {
     expect(labels).toEqual(["Agent mode", "Auto accept"]);
     expect([...$(doc, "mode-popover").querySelectorAll(".mode-item-desc")].map((label) => label.textContent)).toEqual([
       "Codex acts directly, asking approval only for changes it judges sensitive",
-      "Codex automatically approves all permission requests (YOLO)",
+      "Codex automatically approves all permission requests (Full access)",
     ]);
+  });
+
+  // YOLO is Grok Build's own word; other providers get their own name for the
+  // mode, or none.
+  it.each([
+    ["claude", "Claude automatically approves all permission requests (Bypass permissions)"],
+    ["agy", "Antigravity automatically approves all permission requests"],
+  ])("describes Auto accept for %s without YOLO", (provider, description) => {
+    const { window, doc } = bootWebview();
+    dispatch(window, { type: "providerState", providers: [{ id: provider, connected: true }] });
+    dispatch(window, { type: "session", sessionId: "s", provider, models: [] });
+    dispatch(window, { type: "modeChanged", modeId: "agent", modes: ["agent", "yolo"] });
+    click(window, $(doc, "mode-btn"));
+    const descriptions = [...$(doc, "mode-popover").querySelectorAll(".mode-item-desc")].map((label) => label.textContent);
+    expect(descriptions.at(-1)).toBe(description);
   });
 
   it("disables only Plan with the host's version reason, then re-enables it", () => {
@@ -1069,7 +1085,33 @@ describe("context donut (token usage)", () => {
     const { window, doc } = boot();
     dispatch(window, { type: "contextUsage", used: 44123, window: 100000 });
     dispatch(window, { type: "contextUsage", window: 1000000 });
-    expect($(doc, "donut-label").textContent).toBe("44K/1000K");
+    expect($(doc, "donut-label").textContent).toBe("44K/1M");
+  });
+
+  // The owner, 2026-10-15: Gemini's window is "1.05M" from the start, not the
+  // last conversation's 200K or 256K, and never "1049K". Below a million the
+  // label keeps its whole thousands.
+  it("reads a window of a million and up in millions, and starts Antigravity on Gemini's", () => {
+    const { window, doc } = boot();
+    dispatch(window, { type: "contextUsage", used: 44123, window: 256000 });
+    expect($(doc, "donut-label").textContent).toBe("44K/256K");
+    dispatch(window, { type: "contextUsage", window: 500000 });
+    expect($(doc, "donut-label").textContent).toBe("44K/500K");
+    // An Antigravity conversation through the host's own catalog, before the
+    // server's first usage_update.
+    const { models } = normalizeAgySessionResponse({ sessionId: "a", configOptions: [
+      { id: "model", currentValue: "gemini-3.8-flash", options: [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }] },
+    ] });
+    dispatch(window, { type: "providerState", providers: [{ id: "grok", connected: true }, { id: "agy", connected: true }] });
+    dispatch(window, { type: "session", sessionId: "a", provider: "agy", currentModelId: models.currentModelId,
+      models: models.availableModels.map((m: any) => ({ provider: "agy", modelId: m.modelId, name: m.name, totalContextTokens: m._meta.totalContextTokens })) });
+    expect($(doc, "donut-label").textContent).toBe("0K/1.05M");
+    click(window, $(doc, "donut"));
+    expect($(doc, "context-popover").textContent).toContain("0 / 1.05M (0%)");
+    // The server's own figure replaces the default.
+    dispatch(window, { type: "contextUsage", used: 52300, window: 1000000 });
+    expect($(doc, "donut-label").textContent).toBe("52K/1M");
+    expect($(doc, "context-popover").textContent).toContain("52.3K / 1M (5%)");
   });
 });
 
@@ -1779,7 +1821,7 @@ describe("Grokking… indicator (waiting placeholder)", () => {
     dispatch(h.window, {
       type: "session", sessionId: "c1", models: [], currentModelId: "gpt-5.6-sol", provider: "codex",
     });
-    expect(input.placeholder).toBe("Ask GPT…");
+    expect(input.placeholder).toBe("Ask Codex…");
 
     dispatch(h.window, {
       type: "session", sessionId: "g1", models: [], currentModelId: "grok-build", provider: "grok",
@@ -1795,7 +1837,7 @@ describe("Grokking… indicator (waiting placeholder)", () => {
     dispatch(h.window, { type: "agentStart" });
     const el = grokking(h.doc)!;
     expect(el.querySelector(".grokking-label")?.textContent).toBe("Opening AI");
-    expect(el.getAttribute("aria-label")).toBe("OpenAI is working");
+    expect(el.getAttribute("aria-label")).toBe("Codex is working");
     expect(el.querySelector(".grokking-icon svg")).not.toBeNull();
   });
 
@@ -2276,6 +2318,9 @@ describe("gear menu — Other group + About / Settings", () => {
         ...extra,
       });
       dispatch(h.window, { type: "initialized", info: { version: "0.2.33" } });
+      // The remote reaches Settings through the model chip, which stays shut
+      // until the starting session has published its catalog.
+      dispatch(h.window, { type: "session", sessionId: "s", models: [] });
       h.posted.length = 0;
       openAbout(h);
       return h;
@@ -2656,11 +2701,33 @@ describe("thinking traces toggle (#26)", () => {
       options: [{ optionId: "allow", kind: "allow_once", name: "Allow once" }],
     } });
 
+    // No session frame named the agent, so the cue does not guess Grok.
     expect(spoken).toEqual([
       "Which database should I use?",
-      "Grok is waiting for your permission. Review the request and choose an option.",
+      "The agent is waiting for your permission. Review the request and choose an option.",
     ]);
     expect(spoken.join(" ")).not.toContain("private-file.txt");
+  });
+
+  // Copy about the agent names the conversation's own agent, and "the agent"
+  // when the host did not say which it is.
+  it.each([
+    ["claude", "Claude is asking", "Optional comment — Claude decides what to do with it"],
+    ["agy", "Antigravity is asking", "Optional comment — Antigravity decides what to do with it"],
+    [undefined, "The agent is asking", "Optional comment — The agent decides what to do with it"],
+  ])("names the conversation's agent in its cards (%s)", (provider, heading, placeholder) => {
+    const { window, doc } = bootWebview();
+    if (provider) {
+      dispatch(window, { type: "providerState", providers: [{ id: provider, connected: true }] });
+      dispatch(window, { type: "session", sessionId: "s", provider, models: [] });
+    }
+    dispatch(window, { type: "questionRequest", req: {
+      id: 3, questions: [{ question: "Which one?", options: [{ label: "A" }, { label: "B" }], multiSelect: false }],
+    } });
+    expect(doc.querySelector(".card.question .card-title")!.textContent).toBe(heading);
+    dispatch(window, { type: "exitPlanRequest", req: { id: 4, plan: "1. Do it" } });
+    expect((doc.querySelector(".card.plan .plan-feedback") as HTMLTextAreaElement).placeholder).toBe(placeholder);
+    expect(doc.body.textContent).not.toContain("Grok is asking");
   });
 
   it("never speaks a completed local reply inside a history replay bracket", () => {

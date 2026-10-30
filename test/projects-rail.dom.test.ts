@@ -182,7 +182,7 @@ describe("projects rail", () => {
     expect(rail(doc).hidden).toBe(false);
   });
 
-  it("empty first repos frame is No projects yet, not a stuck Loading…", () => {
+  it("empty first repos frame says where projects come from, not a stuck Loading…", () => {
     // Desktop paints "Loading…" until the first `repos` frame. An empty
     // catalog after that frame is a real empty state, not an unfinished boot.
     const { doc, window, posted } = bootWebview({
@@ -200,7 +200,7 @@ describe("projects rail", () => {
     });
     expect(rail(doc).textContent).toContain("Loading…");
     dispatch(window, { type: "repos", entries: [], selectedCwd: "", activeCwd: "" });
-    expect(rail(doc).textContent).toContain("No projects yet");
+    expect(rail(doc).textContent).toContain("Your projects appear here. Open a folder, create one, or add one from Recent.");
     expect(rail(doc).textContent).not.toContain("Loading…");
     // The wide button is also present under a NON-empty list, which is the case
     // the owner raised: with one project the rail is mostly empty space and a
@@ -409,7 +409,7 @@ describe("projects rail", () => {
     expect(dead.disabled).toBe(true);
     // Host-neutral: this page drives the VS Code extension OR the desktop app,
     // and cannot tell which, so it must not name one of them.
-    expect(dead.title).toContain("Update Grok Build");
+    expect(dead.title).toContain("Update AFK Pilot (previously Grok Build)");
     expect(dead.title).not.toContain("the Grok extension");
     click(window, dead);
     expect(posted.filter((p) => p.type === "clearAllSessions")).toEqual([]);
@@ -3018,5 +3018,194 @@ describe("the project icon picker", () => {
     });
     h.window.dispatchEvent(new h.window.Event("resize"));
     expect(h.doc.querySelector(".repo-icon-picker")).toBe(null);
+  });
+});
+
+// A click the host has acknowledged (`sessionOpening`) is not given up on after
+// ten seconds: a cold load can take a minute, and a click can wait behind a load
+// another view started. The highlight stays, says "opening…" while it waits, and
+// only an identity frame or the host's `failed` ends it.
+describe("a click the host is opening", () => {
+  const bootClick = () => {
+    const h = bootWebview({
+      remote: true,
+      beforeScripts: (w: any) => {
+        withRail(w);
+        w.__grokRailTransitionTimeoutMs = 5;
+      },
+    });
+    dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+    dispatch(h.window, {
+      ...sessionsFrame([row("a1", "/work/alpha", "alpha one", 9), row("a2", "/work/alpha", "alpha two", 8)]),
+      activeId: "a1",
+    });
+    const rows = () => h.doc.querySelectorAll(".rail-repo")[repoNames(h.doc).indexOf("alpha")].querySelectorAll(".rail-session");
+    click(h.window, rows()[1] as HTMLElement);
+    return { ...h, rows };
+  };
+  const activeName = (doc: Document) => doc.querySelector(".rail-session.active .rail-session-name")?.textContent;
+  const later = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("keeps the highlight past the give-up timer, says opening while queued, and lands", async () => {
+    const { doc, window, posted } = bootClick();
+    expect(posted).toContainEqual(expect.objectContaining({ type: "resumeSession", id: "a2" }));
+    dispatch(window, { type: "sessionOpening", sessionId: "a2" });
+    dispatch(window, { type: "sessionOpening", sessionId: "a2", queued: true });
+    await later(30);
+    expect(activeName(doc)).toBe("alpha two");
+    expect(doc.querySelector(".rail-session.active .rail-session-opening")?.textContent).toBe("opening\u2026");
+    dispatch(window, {
+      ...sessionsFrame([row("a1", "/work/alpha", "alpha one", 9), row("a2", "/work/alpha", "alpha two", 8)]),
+      activeId: "a2",
+    });
+    expect(activeName(doc)).toBe("alpha two");
+    expect(doc.querySelector(".rail-session-opening")).toBeNull();
+  });
+
+  it("an unanswered click still gives up; a failed one gives up at once", async () => {
+    const unanswered = bootClick();
+    await vi.waitFor(() => expect(activeName(unanswered.doc)).toBe("alpha one"));
+
+    const failed = bootClick();
+    dispatch(failed.window, { type: "sessionOpening", sessionId: "a2", queued: true });
+    expect(activeName(failed.doc)).toBe("alpha two");
+    dispatch(failed.window, { type: "sessionOpening", sessionId: "a2", failed: true });
+    expect(activeName(failed.doc)).toBe("alpha one");
+    // An acknowledgement for a conversation this view did not click changes nothing.
+    const other = bootClick();
+    dispatch(other.window, { type: "sessionOpening", sessionId: "zzz", queued: true });
+    expect(other.doc.querySelector(".rail-session-opening")).toBeNull();
+    await vi.waitFor(() => expect(activeName(other.doc)).toBe("alpha one"));
+  });
+});
+
+// Recent is the host's when the host builds one: what you sent in or opened,
+// across every folder (one that is not a project included), and nothing a
+// project's preview merely lists.
+describe("Recent from the host", () => {
+  const openRecent = (doc: Document, window: Window) => {
+    const btn = [...doc.querySelectorAll(".rail-head-btn")].find((b) => (b.textContent || "").includes("Recent")) as HTMLElement;
+    click(window, btn);
+  };
+  const recentNames = (doc: Document) =>
+    [...doc.querySelectorAll(".rail-list.rail-recent .rail-session-name")].map((e) => e.textContent);
+
+  it("shows exactly the host's list, and drops a removed conversation from it", () => {
+    const { doc, window } = boot();
+    dispatch(window, sessionsFrame([row("a1", "/work/alpha", "listed only", 9), row("a2", "/work/alpha", "sent in", 8)]));
+    dispatch(window, { type: "recentSessions", dots: {}, entries: [
+      row("x1", "/scratch/notes", "outside any project", 10),
+      row("a2", "/work/alpha", "sent in", 8),
+    ] });
+    openRecent(doc, window);
+    expect(recentNames(doc)).toEqual(["outside any project", "sent in"]);
+    // A folder that is not a project still says where the conversation lives.
+    expect(doc.querySelector(".rail-list.rail-recent .rail-session-repo")?.textContent).toBe("notes");
+    dispatch(window, { type: "sessionRemoved", id: "x1", cwd: "/scratch/notes" });
+    expect(recentNames(doc)).toEqual(["sent in"]);
+  });
+
+  it("without one (an older host) still composes Recent from what is loaded", () => {
+    const { doc, window } = boot();
+    dispatch(window, sessionsFrame([row("a1", "/work/alpha", "listed only", 9), row("a2", "/work/alpha", "sent in", 8)]));
+    openRecent(doc, window);
+    expect(recentNames(doc)).toEqual(["listed only", "sent in"]);
+  });
+});
+
+// The first few projects start open, the rest folded, and your own open/fold
+// choice is remembered per viewer. Folding is display only: every project's
+// list is fetched (after the one probe), because the Archive's age rule needs
+// a project's own rows -- fetching folded ones only on opening left a quiet
+// project in Projects here while the VS Code rail had archived it.
+describe("folded project lists", () => {
+  const many = ["alpha", "beta", "delta", "epsilon", "gamma", "zeta"].map((name, i) =>
+    ({ cwd: `/work/${name}`, label: name, available: true, pinned: false, updatedAt: 10 + i }));
+  const asked = (posted: any[]) => posted.filter((m) => m.type === "listRepoSessions").map((m) => m.cwd);
+  const answer = (window: Window, cwd: string) =>
+    dispatch(window, { type: "repoSessions", cwd, entries: [row(`${cwd}-1`, cwd, `${cwd} chat`, Date.now())], dots: {}, total: 1 });
+  const head = (doc: Document, label: string) =>
+    [...doc.querySelectorAll(".rail-repo")].find((s) => s.querySelector(".rail-repo-label")?.textContent === label)!;
+  function bootMany(seed?: string) {
+    const h = bootWebview({ remote: true, beforeScripts: (w: any) => {
+      withRail(w);
+      if (seed) w.localStorage.setItem("grok.remote.railShape:default", seed);
+    } });
+    dispatch(h.window, { type: "repos", entries: many, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+    return h;
+  }
+
+  it("asks for every project after the probe, and keeps the folded ones folded", () => {
+    const { doc, window, posted } = bootMany();
+    // One probe before the host has shown it answers previews...
+    expect(asked(posted)).toEqual(["/work/beta"]);
+    answer(window, "/work/beta");
+    // ...then every other project, open or folded (alpha is the selected
+    // project and lists through `sessions`).
+    expect([...asked(posted)].sort()).toEqual(["/work/beta", "/work/delta", "/work/epsilon", "/work/gamma", "/work/zeta"]);
+    for (const name of ["epsilon", "gamma", "zeta"]) {
+      expect(head(doc, name).getAttribute("data-expanded")).toBe("0");
+      expect(head(doc, name).textContent).not.toContain("Loading…");
+    }
+    // Opening a folded project shows what is already there, without asking again.
+    answer(window, "/work/gamma");
+    click(window, head(doc, "gamma").querySelector(".rail-repo-head") as HTMLElement);
+    expect(asked(posted).filter((c) => c === "/work/gamma")).toHaveLength(1);
+    expect(head(doc, "gamma").getAttribute("data-expanded")).toBe("1");
+    expect(head(doc, "gamma").textContent).toContain("/work/gamma chat");
+  });
+
+  it("keeps an empty project in view while a new conversation is being made there", () => {
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const archivable = many.map((r) => ({ ...r, archived: false }));
+    dispatch(h.window, { type: "repos", entries: archivable, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+    const projects = () => [...h.doc.querySelectorAll(".rail-list.rail-projects .rail-repo-label")].map((e) => e.textContent);
+    // Not answered yet, so the age rule has nothing to go on and leaves it in view.
+    expect(projects()).toContain("zeta");
+    const add = head(h.doc, "zeta").querySelector(".rail-action-btn") as HTMLElement;
+    click(h.window, add);
+    // Its list comes back empty before the host has switched to it: with no
+    // conversations the age rule would archive it, placeholder and all.
+    dispatch(h.window, { type: "repoSessions", cwd: "/work/zeta", entries: [], dots: {}, total: 0 });
+    expect(projects()).toContain("zeta");
+    expect(head(h.doc, "zeta").textContent).toContain("New session");
+  });
+
+  it("archives a quiet folded project, as the VS Code rail does", () => {
+    const old = Date.now() - 60 * 24 * 60 * 60 * 1000;
+    const h = bootWebview({ remote: true, beforeScripts: withRail });
+    const archivable = many.map((r) => ({ ...r, archived: false }));
+    dispatch(h.window, { type: "repos", entries: archivable, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
+    answer(h.window, "/work/beta");
+    for (const name of ["delta", "epsilon", "gamma"]) answer(h.window, `/work/${name}`);
+    dispatch(h.window, { type: "repoSessions", cwd: "/work/zeta", entries: [row("z1", "/work/zeta", "old chat", old)], dots: {}, total: 1 });
+    const projects = [...h.doc.querySelectorAll(".rail-list.rail-projects .rail-repo-label")].map((e) => e.textContent);
+    expect(projects).not.toContain("zeta");
+  });
+
+  it("remembers what you opened and folded on this device", () => {
+    const first = bootMany();
+    answer(first.window, "/work/beta");
+    click(first.window, head(first.doc, "gamma").querySelector(".rail-repo-head") as HTMLElement);
+    click(first.window, head(first.doc, "beta").querySelector(".rail-repo-head") as HTMLElement);
+    const saved = first.window.localStorage.getItem("grok.remote.railShape:default")!;
+    expect(JSON.parse(saved).collapsed).toMatchObject({ "/work/gamma": false, "/work/beta": true });
+
+    const again = bootMany(saved);
+    // The probe goes to the first open project, then the rest fan out.
+    answer(again.window, asked(again.posted)[0]);
+    expect(head(again.doc, "gamma").getAttribute("data-expanded")).toBe("1");
+    expect(head(again.doc, "beta").getAttribute("data-expanded")).toBe("0");
+    expect(asked(again.posted)).toContain("/work/gamma");
+  });
+
+  it("keeps a project you opened out of Project Archive's age rule", () => {
+    const old = Date.now() - 60 * 24 * 60 * 60 * 1000;
+    const { doc, window } = bootMany();
+    answer(window, "/work/beta");
+    click(window, head(doc, "zeta").querySelector(".rail-repo-head") as HTMLElement);
+    dispatch(window, { type: "repoSessions", cwd: "/work/zeta", entries: [row("z1", "/work/zeta", "old chat", old)], dots: {}, total: 1 });
+    const projects = [...doc.querySelectorAll(".rail-list.rail-projects .rail-repo-label")].map((e) => e.textContent);
+    expect(projects).toContain("zeta");
   });
 });

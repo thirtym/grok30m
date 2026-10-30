@@ -235,6 +235,12 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // remote can say what, never where.
   createProject: "full",
   cloneProject: "full",
+  // Add a folder to the host's project list, or answer the prompt that offers
+  // it. Only a folder the host itself offered is accepted (sidebar
+  // addToProjects), it touches no disk, and on VS Code that folder is already in
+  // the catalog a remote may reach -- the list only gains a row.
+  addToProjects: "full",
+  answerProjectPrompt: "full",
   // The follow-up when a clone failed on credentials. A remote `auth` runs
   // the same headless device-code flow as `runGrokLogin` and reports the
   // URL and code in the clone form — the person asking is the only one who
@@ -293,6 +299,11 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   setModel: "propose",
   installCodex: "host-local",
   cancelCodexInstall: "host-local",
+  installAgy: "host-local",
+  cancelAgyInstall: "host-local",
+  // Carries a pasted Gemini API key: it never crosses the relay.
+  agySignIn: "host-local",
+  setExperimentalAntigravity: "host-local",
   questionAnswer: "propose",
   questionCancel: "propose",
   queueSend: "propose",
@@ -575,6 +586,8 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
  */
 export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> = {
   ready: false,
+  addToProjects: false,
+  answerProjectPrompt: false,
   remotePreferences: false,
   listSessions: false,
   sessionsReady: false,
@@ -619,6 +632,10 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   setModel: true,
   installCodex: false,
   cancelCodexInstall: false,
+  installAgy: false,
+  cancelAgyInstall: false,
+  agySignIn: false,
+  setExperimentalAntigravity: false,
   questionAnswer: true,
   questionCancel: true,
   queueSend: true,
@@ -808,6 +825,8 @@ export function allowFromRemote(
 export function allowRemoteRepoTarget(msg: WebviewMsg, isKnownCwd: (cwd: string) => boolean): boolean {
   switch (msg.type) {
     case "selectRepo":
+    case "addToProjects":
+    case "answerProjectPrompt":
     case "toggleRepoPin":
     case "setRepoArchived":
     case "setRepoColor":
@@ -983,6 +1002,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   // first, so a tab sees only routines and projects it may already reach.
   routines: "mirror",
   codexInstallProgress: "host-local",
+  agyInstallProgress: "host-local",
   // Placement is a property of the machine running the extension, and `moveView`
   // is host-local anyway — a remote could neither act on the hint nor need it.
   moveViewHint: "host-local",
@@ -1112,8 +1132,14 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   uiConfirmRequest: "mirror",
   uiConfirmResolved: "mirror",
   sessions: "mirror",
+  // Sent only to the tab that tapped: an id it named itself, and no project data.
+  sessionOpening: "mirror",
+  // Asked of whoever is in the conversation, phone included: the answer
+  // writes the host's list.
+  projectPrompt: "mirror",
   repoSessions: "mirror",
   pinnedSessions: "mirror",
+  recentSessions: "mirror",
   repos: "mirror",
   sessionDot: "mirror",
   queuedSends: "mirror",
@@ -1178,6 +1204,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   mcpConnectorAuthorization: "none",
   routines: "entries",
   codexInstallProgress: "none",
+  agyInstallProgress: "none",
   expandCommandOutputs: "none",
   steerByDefault: "none",
   promptNav: "none",
@@ -1220,6 +1247,11 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   // History / session lists — empty entries are fine; a closed cwd in an entry is not.
   sessions: "entries",
   pinnedSessions: "entries",
+  recentSessions: "entries",
+  sessionOpening: "none",
+  // Names the conversation's own project folder; delivered through emit with
+  // that conversation's scope.
+  projectPrompt: "scope",
   repoSessions: "message-cwd",
   sessionName: "message-cwd",
   composerDraftSession: "scope",
@@ -1358,7 +1390,7 @@ export function mayDeliverRemoteHostMsg(
         );
       }
       const entries =
-        msg.type === "sessions" || msg.type === "pinnedSessions"
+        msg.type === "sessions" || msg.type === "pinnedSessions" || msg.type === "recentSessions"
           ? msg.entries
           : [];
       return entries.every(

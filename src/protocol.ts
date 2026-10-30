@@ -546,7 +546,10 @@ export type HostMsg =
    * agent CLI signed in, so the button reads Disconnect. Absent = the host
    * clears the CLI's credentials (a cloud environment, or a host older than
    * #203), and the button keeps reading Sign out. */
-  | { type: "providerState"; providers: { id: AcpProvider; connected: boolean; unavailableReason?: string; needsLogin?: boolean; keepsCliSignIn?: boolean; cliVersion?: string; adapterVersion?: string; latestCliVersion?: string; updateAvailable?: boolean; cliUpdate?: { status: "idle" | "running" | "succeeded" | "failed"; message?: string } }[]; checking?: boolean }
+  | { type: "providerState"; providers: { id: AcpProvider; connected: boolean; unavailableReason?: string; needsLogin?: boolean; keepsCliSignIn?: boolean; cliVersion?: string; adapterVersion?: string; latestCliVersion?: string; updateAvailable?: boolean; cliUpdate?: { status: "idle" | "running" | "succeeded" | "failed"; message?: string };
+      /** Antigravity only: how it is signed in, and which ways have something
+       *  stored on the machine. Never the key itself. Additive. */
+      signInMethod?: "google" | "api-key"; savedSignIns?: ("google" | "api-key")[] }[]; checking?: boolean }
   /** Grok's grok.com + user-level MCP inventory (`_x.ai/mcp/list`; project-file
    *  servers omitted). The desk keeps launch recipes and `configFile`; remotes
    *  receive `projectMcpServerForRemote` (page fields only — no `tag`).
@@ -576,6 +579,8 @@ export type HostMsg =
       errorId?: string;
     }
   | { type: "codexInstallProgress"; phase: "downloading" | "verifying" | "installing" | "idle"; receivedBytes?: number; totalBytes?: number; reason?: string }
+  /** Same shape for the managed Antigravity server; desk only. */
+  | { type: "agyInstallProgress"; phase: "downloading" | "verifying" | "installing" | "idle"; receivedBytes?: number; totalBytes?: number; reason?: string }
   /** Plan picker gate. `recheckable` means the version probe failed (not a
    *  verified-old CLI) — the row stays clickable so a later pick re-probes. */
   | { type: "planModeAvailability"; available: boolean; reason?: string; recheckable?: boolean }
@@ -906,11 +911,14 @@ export type HostMsg =
   // itself and a terminal is the better affordance, so nothing changes there.
   | {
       type: "onboarding";
-      state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "missing-muse" | "muse-login" | "provider-connected" | "no-project";
+      state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "missing-muse" | "muse-login" | "missing-agy" | "agy-login" | "provider-connected" | "no-project";
       platform?: string;
       reason?: string;
       provider?: AcpProvider;
       launched?: boolean;
+      /** Antigravity: this frame answers a Connect press with the choice of how
+       *  to sign in, so the connect dialog opens on it. Additive. */
+      agyChoice?: true;
       device?: {
         /** starting: spawned, nothing printed yet. waiting: URL and code are on
          *  screen and the CLI is polling (or, with needsCode, waiting for a
@@ -1032,6 +1040,15 @@ export type HostMsg =
   /** A known conversation was removed. Drop it from every catalog view without
    *  changing the client's active conversation or requesting a fresh list. */
   | { type: "sessionRemoved"; id: string; cwd: string }
+  /** The host has a click on conversation `sessionId` and is opening it, so a
+   *  renderer stops waiting on its unanswered-click timer. `queued`: it waits
+   *  for a load another view started (the row says "opening…"). `failed`: the
+   *  open ended without this conversation. An older renderer ignores it. */
+  | { type: "sessionOpening"; sessionId: string; queued?: boolean; failed?: boolean }
+  /** "Add <label> to Projects?" -- the first send in conversation `sessionId`
+   *  whose folder `cwd` is not a project (VS Code hosts). `done` takes it down,
+   *  on every view, once anyone answered. An older renderer ignores it. */
+  | { type: "projectPrompt"; sessionId: string; cwd: string; label: string; done?: boolean }
   // A preview page for ONE repo, answering `listRepoSessions`. Deliberately a
   // separate frame from `sessions`: that one is the focused history list and
   // owns paging/search/auto-open state, so a sibling repo's rows arriving on it
@@ -1053,6 +1070,12 @@ export type HostMsg =
   // no repo-scoped frame can answer it. Entries carry their own `cwd`, which is
   // what lets a row name its repo and reopen in the right checkout.
   | { type: "pinnedSessions"; entries: SessionListEntry[]; dots: Record<string, Dot>; pinRequests?: boolean; requestId?: string }
+  /** Recent across every folder this host lists: conversations the person sent
+   *  something in here, or opened here lately, minus automation, newest first
+   *  (buildRecentSessions). Its arrival is what tells a renderer to show this
+   *  list as Recent instead of composing one from the project previews; an
+   *  older host never sends it. */
+  | { type: "recentSessions"; entries: SessionListEntry[]; dots: Record<string, Dot> }
   // `canAddProject` is how the VS Code projects rail learns it may offer "Add
   // project": that view is resolved on its own and gets no `initialState`, so it
   // has no `capabilities` to read. Optional and additive — a client that never
@@ -1157,6 +1180,12 @@ export type WebviewMsg =
   | { type: "exportExpr"; action: string; kind: string; current?: string; svg?: string; png?: string; svgDark?: string; svgLight?: string }
   | { type: "setEffort"; level: string }
   | { type: "addProjectFolder" }
+  /** Add a folder this host offered (the Add-to-Projects prompt, Recent's
+   *  "Add to Projects") to the host's project list, from any view. */
+  | { type: "addToProjects"; cwd: string }
+  /** The other two answers to the prompt: "Not now" (this conversation) and
+   *  "Never for this folder" (remembered by the host). */
+  | { type: "answerProjectPrompt"; cwd: string; choice: "notNow" | "never" }
   /** Close one project folder. It leaves the rail; nothing leaves the disk. */
   | { type: "removeProjectFolder"; cwd?: string }
   | { type: "openGlobalConfig" }
@@ -1319,6 +1348,12 @@ export type WebviewMsg =
   | { type: "setModel"; modelId: string; provider?: AcpProvider; effort?: string }
   | { type: "installCodex" }
   | { type: "cancelCodexInstall" }
+  | { type: "installAgy" }
+  | { type: "cancelAgyInstall" }
+  /** Sign Antigravity in the chosen way. `key` is a freshly pasted Gemini API
+   *  key, stored in HostSecrets; absent means the saved one. Host-local. */
+  | { type: "agySignIn"; method: "google" | "api-key"; key?: string }
+  | { type: "setExperimentalAntigravity"; value: boolean }
   | { type: "runInstallCmd" }
   | { type: "runMuseInstallCmd" }
   | { type: "runGrokLogin"; provider?: AcpProvider }
@@ -1578,7 +1613,7 @@ export type WebviewMsg =
 // union without failing the build.
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   museSettings: true,
-  cloudHostUpdateState: true, initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, mcpConnectorAuthorization: true, routines: true, codexInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
+  cloudHostUpdateState: true, initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, mcpConnectorAuthorization: true, routines: true, codexInstallProgress: true, agyInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
   contextWindowSelection: true, initialized: true, cliUpdating: true, startupStatus: true, session: true, sessionName: true, composerDraftSession: true, modelChanged: true,
   modeChanged: true, openModePopover: true, voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
@@ -1595,7 +1630,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   xaiNotification: true, subagentUpdate: true, childStream: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true, promptNav: true, pinLiveWorkflows: true, expandDiffCard: true,
   soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, showRemoteHandoff: true, remoteHandoff: true, hostReachable: true, hostLink: true,
   setAllToolDetails: true, focusInput: true, findInSession: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true, uiConfirmResolved: true,
-  sessions: true, sessionRemoved: true, repoSessions: true, pinnedSessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
+  sessions: true, sessionRemoved: true, sessionOpening: true, projectPrompt: true, repoSessions: true, pinnedSessions: true, recentSessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, feedbackAvailability: true, turnFeedbackAck: true, usage: true,
 };
 
@@ -1604,13 +1639,13 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   setContextWindow: true, ready: true, remotePreferences: true, send: true, newSession: true, cancel: true, pickModel: true,
   setMode: true, removeChip: true, toggleChip: true, openFile: true, showInFolder: true, openUrl: true,
   openText: true, openDiff: true, exportExpr: true, setEffort: true, openGlobalConfig: true, openProviderConfig: true,
-  addProjectFolder: true, removeProjectFolder: true, createProject: true, cloneProject: true, setupGithubCli: true, listGithubRepos: true, githubSignOut: true, githubLoginWithToken: true,
+  addProjectFolder: true, addToProjects: true, answerProjectPrompt: true, removeProjectFolder: true, createProject: true, cloneProject: true, setupGithubCli: true, listGithubRepos: true, githubSignOut: true, githubLoginWithToken: true,
   openProjectConfig: true, listMcpServers: true, connectMcpConnector: true, disconnectMcpConnector: true,
   listRoutines: true, saveRoutine: true, deleteRoutine: true, setRoutinePaused: true, runRoutineNow: true, showLogs: true, toggleDevTools: true, openSettings: true, openSettingsSurface: true, closeSettingsSurface: true, dismissWelcomeTip: true, welcomeTipShown: true, moveView: true,
   setShowThinking: true, setAppPurpose: true, setExpandCommandOutputs: true, setSteerByDefault: true, setPromptNav: true, setPinLiveWorkflows: true, setExpandDiffCard: true,
   setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, setDesktopTray: true, summarizeSpeech: true, requestImageFull: true, requestImageOriginal: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
-  questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, runInstallCmd: true, runMuseInstallCmd: true, runGrokLogin: true,
+  questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, installAgy: true, cancelAgyInstall: true, agySignIn: true, setExperimentalAntigravity: true, runInstallCmd: true, runMuseInstallCmd: true, runGrokLogin: true,
   cancelDeviceLogin: true, submitDeviceLoginCode: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, updateCodex: true, updateClaude: true, recheckConnection: true, refreshProviders: true, retryProviderSession: true,
   listSessions: true, sessionsReady: true, setHideAutoSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,
