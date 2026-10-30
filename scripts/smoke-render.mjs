@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
-import { bounded, timeoutMs, selectSmokeModel, selectSmokeEffort, desktopSmokeCatalog, smokeScenario, SUBAGENT_PROMPT, WORKFLOW_PROMPT, delegationAttempted } from "./acp-smoke.mjs";
+import { bounded, timeoutMs, selectSmokeModel, selectSmokeEffort, desktopSmokeCatalog, smokeScenario, SUBAGENT_PROMPT, WORKFLOW_PROMPT, GROK_WORKFLOW_PROMPT, delegationAttempted } from "./acp-smoke.mjs";
 import { knownBoundaries, classifyBoundaries, readRenderedChat, assertRenderedScenario, renderReportMarkdown, completeRenderScenarios, cardResultEvidence, smokeOutcome } from "./smoke-render-report.mjs";
 import { desktopLaunch, parseTrace, desktopFacts, promptCompletion, modelRowIndex, deliveryChunk } from "./smoke-page-driver.mjs";
 import { cleanupBudget, closeDesktop } from "./smoke-cleanup.mjs";
@@ -97,10 +97,18 @@ export async function runRenderSmoke(provider, evidenceParent, cliOverride, sele
     const picker = async (rows = "#gear-popover .model-picker-row") => {
       const deadline = Date.now() + rpcMs;
       for (;;) {
-        await page.waitForFunction(() => {
-          const chip = document.querySelector("#gear-btn");
-          return !!chip && !chip.disabled && chip.getAttribute("aria-disabled") !== "true";
-        }, null, { timeout: Math.max(1, deadline - Date.now()) });
+        // Poll with evaluate, not waitForFunction: the webview's CSP has no
+        // 'unsafe-eval', which waitForFunction needs as soon as its first check
+        // is false (a chip still loading models), so it failed only sometimes.
+        for (;;) {
+          const ready = await page.evaluate(() => {
+            const chip = document.querySelector("#gear-btn");
+            return !!chip && !chip.disabled && chip.getAttribute("aria-disabled") !== "true";
+          });
+          if (ready) break;
+          if (Date.now() >= deadline) throw new Error("model chip never became ready");
+          await page.waitForTimeout(200);
+        }
         const open = await page.locator(rows).first().isVisible().catch(() => false);
         if (!open) await page.locator("#gear-btn").click();
         try {
@@ -210,7 +218,7 @@ export async function runRenderSmoke(provider, evidenceParent, cliOverride, sele
         scenario.model = await setup(name, !selectedScenario && name !== "plain reply");
         const client = status(), from = readEvents().length;
         scenario.trace = { from, clientId: client.clientId, sessionId: client.sessionId };
-        await send(name === "plain reply" ? "Do not use tools. Reply with the single word ready." : name === "subagent" ? SUBAGENT_PROMPT : WORKFLOW_PROMPT);
+        await send(name === "plain reply" ? "Do not use tools. Reply with the single word ready." : name === "subagent" ? SUBAGENT_PROMPT : provider === "grok" ? GROK_WORKFLOW_PROMPT : WORKFLOW_PROMPT);
         if (provider === "muse" && name === "workflow") {
           deliveryProbe = { from, clientId: client.clientId, sessionId: client.sessionId };
           await page.locator("#input").fill("Do not use tools. Reply with the single word ok for this new prompt.");
