@@ -83,6 +83,20 @@ describe("Grok30m overlay", () => {
     expect(chat).toContain("if (historyBtn) historyBtn.onclick");
   });
 
+  it("puts the sessions view and the update check back onto community extension.ts", () => {
+    for (const tag of ["v4.14.2", "v4.15.6"] as const) {
+      const src = show(tag, "src/extension.ts");
+      if (src === undefined) continue;
+      const stamped = applyGrok30mFile("src/extension.ts", src);
+      expect(stamped, tag).toContain('createOutputChannel("Grok30m")');
+      expect(stamped, tag).toContain("new GrokSessionsView(sidebar)");
+      expect(stamped, tag).toContain("sidebar.openPreferred()");
+      expect(stamped, tag).toContain("grok.checkForUpdates");
+      expect(stamped, tag).not.toContain("revealCommandFor");
+      expect(applyGrok30mFile("src/extension.ts", stamped), tag).toBe(stamped);
+    }
+  });
+
   it("expects the renamed command titles community still writes as Grok", () => {
     const src = show("v4.14.0", "test/protocol.test.ts");
     if (src === undefined) return;

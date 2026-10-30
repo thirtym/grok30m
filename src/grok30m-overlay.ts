@@ -15,6 +15,7 @@ export const GROK30M_OVERLAY_PATHS = [
   "media/settings.js",
   "media/webview-helpers.js",
   "src/desktop/webview-msg-validate.ts",
+  "src/extension.ts",
   "src/protocol.ts",
   "src/remote-policy.ts",
   "src/session.ts",
@@ -75,6 +76,8 @@ export function applyGrok30mFile(relPath: string, source: string): string {
       return applyWebviewHelpers(source);
     case "src/desktop/webview-msg-validate.ts":
       return applyValidate(source);
+    case "src/extension.ts":
+      return applyExtension(source);
     case "src/protocol.ts":
       return applyProtocol(source);
     case "src/remote-policy.ts":
@@ -785,6 +788,72 @@ const SETTINGS_TEST = `  it("shows whether this fork is behind community Grok Bu
   });
 
 `;
+
+function applyExtension(src: string): string {
+  src = whenMissing(
+    src,
+    'from "./sessions-view"',
+    'import { GrokSidebar } from "./sidebar";\n',
+    'import { GrokSidebar } from "./sidebar";\nimport { GrokSessionsView } from "./sessions-view";\nimport { runHostMaintenance } from "./host-update";\n',
+    "extension imports",
+  );
+  src = swapOneOf(
+    src,
+    [
+      ['createOutputChannel("Grok")', 'createOutputChannel("Grok30m")'],
+      ['createOutputChannel("AFK Pilot")', 'createOutputChannel("Grok30m")'],
+    ],
+    "output channel",
+  );
+  src = whenMissing(
+    src,
+    "new GrokSessionsView(sidebar)",
+    "  const sidebar = new GrokSidebar(hostContext, host);\n",
+    "  const sidebar = new GrokSidebar(hostContext, host);\n  const sessionsView = new GrokSessionsView(sidebar);\n  // Fetch GitHub Releases on this host (computer or SSH remote), drop leftover\n  // community copies that hide Grok30m's views, and say when community is ahead.\n  void runHostMaintenance(context, output);\n",
+    "sessions host",
+  );
+  src = whenMissing(
+    src,
+    "GrokSessionsView.viewId",
+    "    // Projects rail:",
+    `    vscode.window.registerWebviewViewProvider(GrokSessionsView.viewId, {
+      resolveWebviewView(view) {
+        sessionsView.resolveWebviewView(wrapWebviewView(view));
+      },
+    }, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+    // Projects rail:`,
+    "sessions provider",
+  );
+  src = whenMissing(
+    src,
+    "sidebar.openPreferred()",
+    "    vscode.commands.registerCommand(\"grok.open\", async () => {\n      // Resolved per invocation rather than baked in: the view can be moved\n      // between docks from the gear menu, and in a host that refuses the\n      // secondary side bar the container this used to hardcode never exists at\n      // all — which is how `grok.open` came to fail with \"command not found\".\n      const cmds = await vscode.commands.getCommands(true);\n      await vscode.commands.executeCommand(revealCommandFor(cmds));\n    }),\n",
+    "    vscode.commands.registerCommand(\"grok.open\", () => sidebar.openPreferred()),\n    vscode.commands.registerCommand(\"grok.panel.open\", () => sidebar.openPanel()),\n    vscode.commands.registerCommand(\"grok.sidebar.open\", () => sidebar.openSidebar()),\n",
+    "open commands",
+  );
+  src = rename(src, "  revealCommandFor,\n", "");
+  if (!src.includes("grok.checkForUpdates")) {
+    const updates =
+      "    vscode.commands.registerCommand(\"grok.checkForUpdates\", () =>\n      runHostMaintenance(context, output, { forceCheck: true, notifyIfCurrent: true }),\n    ),\n";
+    src = swapOneOf(
+      src,
+      [
+        [
+          "    vscode.commands.registerCommand(\"grok.logout\", () => sidebar.signOutAgentCli()),\n",
+          "    vscode.commands.registerCommand(\"grok.logout\", () => sidebar.signOutAgentCli()),\n" + updates,
+        ],
+        [
+          "    vscode.commands.registerCommand(\"grok.logout\", () => sidebar.logout()),\n",
+          "    vscode.commands.registerCommand(\"grok.logout\", () => sidebar.logout()),\n" + updates,
+        ],
+      ],
+      "check for updates",
+    );
+  }
+  return src;
+}
 
 function applyProtocolTest(src: string): string {
   // The manifest renames "Grok:" command titles. Community tests assert the
