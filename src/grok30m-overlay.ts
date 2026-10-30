@@ -35,6 +35,23 @@ function swap(src: string, from: string, to: string, label: string): string {
   return src.replace(from, to);
 }
 
+/** First matching shape wins. Community sometimes rewrites a string the fork still has to find. */
+function swapOneOf(
+  src: string,
+  options: ReadonlyArray<readonly [string, string]>,
+  label: string,
+): string {
+  for (const [, to] of options) {
+    if (src.includes(to)) return src;
+  }
+  for (const [from, to] of options) {
+    const count = src.split(from).length - 1;
+    if (count === 1) return src.replace(from, to);
+    if (count > 1) throw new Error(`Grok30m overlay anchor not unique (${label})`);
+  }
+  throw new Error(`Grok30m overlay anchor missing (${label})`);
+}
+
 function whenMissing(src: string, marker: string, from: string, to: string, label: string): string {
   if (src.includes(marker)) return src;
   return swap(src, from, to, label);
@@ -320,21 +337,14 @@ import {`,
     `${SIDEBAR_TAB_METHODS}  private chatLocalResourceRoots(): Uri[] {`,
     "sidebar tab methods",
   );
+  // Community rewrites the mode payload. The post target is the line that stays put.
   src = swap(
     src,
-    `  private postMode(session: Session = this.focused): void {
-    const message: HostMsg = { type: "modeChanged", modeId: this.displayMode(session) };
-    if (session === this.focused) this.view?.webview.postMessage(message);
-    this.sendRemoteSession(session, message);
-  }`,
-    `  private postMode(session: Session = this.focused): void {
-    const message: HostMsg = { type: "modeChanged", modeId: this.displayMode(session) };
-    if (session === this.focused) {
+    `    if (session === this.focused) this.view?.webview.postMessage(message);`,
+    `    if (session === this.focused) {
       const webview = this.webviewFor(session);
       if (webview) webview.postMessage(message);
-    }
-    this.sendRemoteSession(session, message);
-  }`,
+    }`,
     "postMode",
   );
   src = swap(
@@ -642,16 +652,32 @@ import {`,
     '${this.useSessionsSidebar() ? "" : `<button id="history-btn" class="icon-btn" title="Session history"></button>`}',
     "history button",
   );
-  src = swap(
+  src = swapOneOf(
     src,
-    '<h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok Build (Community)"}</h2>',
-    '<h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok30m"}</h2>',
+    [
+      [
+        '<h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok Build (Community)"}</h2>',
+        '<h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok30m"}</h2>',
+      ],
+      [
+        '<h2>${isCloudEnvironment() ? "AFK Pilot Cloud" : "AFK Pilot"}</h2>',
+        '<h2>${isCloudEnvironment() ? "AFK Pilot Cloud" : "Grok30m"}</h2>',
+      ],
+    ],
     "welcome title",
   );
-  src = swap(
+  src = swapOneOf(
     src,
-    '<p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>',
-    '<p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>',
+    [
+      [
+        '<p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>',
+        '<p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>',
+      ],
+      [
+        '`<p class="welcome-byline muted">previously Grok Build (Community)</p>`',
+        '`<p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>`',
+      ],
+    ],
     "welcome byline",
   );
   return src;

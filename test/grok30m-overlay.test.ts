@@ -16,7 +16,11 @@ function read(rel: string): string {
 
 function show(tag: string, rel: string): string | undefined {
   try {
-    return execFileSync("git", ["show", `${tag}:${rel}`], { cwd: root, encoding: "utf8" });
+    return execFileSync("git", ["show", `${tag}:${rel}`], {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
   } catch {
     return undefined;
   }
@@ -77,5 +81,29 @@ describe("Grok30m overlay", () => {
     const chat = applyGrok30mFile("media/chat.js", show(tag, "media/chat.js")!);
     expect(chat).toContain("if (historyBtn) historyBtn.innerHTML");
     expect(chat).toContain("if (historyBtn) historyBtn.onclick");
+  });
+
+  it("keeps community's mode payload and still posts it to the session tab", () => {
+    const cases = [
+      ["v4.13.0", "modes: sessionModes(session.provider)"],
+      ["v4.15.6", "sessionModeMessage(session, this.displayMode(session))"],
+    ] as const;
+    for (const [tag, marker] of cases) {
+      const sidebar = show(tag, "src/sidebar.ts");
+      if (sidebar === undefined) continue;
+      const stamped = applyGrok30mFile("src/sidebar.ts", sidebar);
+      const start = stamped.indexOf("private postMode(");
+      const body = stamped.slice(start, stamped.indexOf("\n  }", start));
+      expect(body, tag).toContain(marker);
+      expect(body, tag).toContain("const webview = this.webviewFor(session);");
+      expect(body, tag).not.toContain("this.view?.webview");
+      if (tag === "v4.15.6") {
+        expect(stamped).toContain(
+          '<h2>${isCloudEnvironment() ? "AFK Pilot Cloud" : "Grok30m"}</h2>',
+        );
+        expect(stamped).toContain("thirtym/grok30m");
+      }
+      expect(applyGrok30mFile("src/sidebar.ts", stamped), tag).toBe(stamped);
+    }
   });
 });
