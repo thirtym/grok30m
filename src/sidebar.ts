@@ -1,3 +1,5 @@
+import { remoteHandoffUrl, remoteHandoffQr, type HandoffSession } from "./remote-handoff";
+import type { RemoteHandoffSource } from "./protocol";
 import { CloudHostUpdate, cloudHostIsIdle, cloudHostBootSupportsUpdate, cloudLiveWorkflowRuns, installedCloudHostVersion, parseCloudHostUpdateAttempt, removeCloudHostUpdateStamps, CLOUD_UPDATE_REFUSAL } from "./cloud-host-update";
 import { MuseBackend, withMuseCredentialBackend } from "./muse-backend";
 import { locateMuseCli, parseMuseVersionOutput } from "./muse-cli-locator";
@@ -87,6 +89,7 @@ import {
   sessionHasWorkInFlight,
   sessionReadyForPrompt,
   sessionUiSnapshot,
+  sessionModeMessage,
   turnIsInFlight,
 } from "./session";
 import { buildReapCandidates, selectReapable, computeDot, Dot } from "./session-pool";
@@ -99,7 +102,8 @@ import { summarizeForSpeech } from "./speech-summary";
 import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
 import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isResumeNotFound, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
 import { createMcpPrepareState, prepareMcpToolCall } from "./mcp-tool";
-import { EFFORT_PREFS_KEY, configWriteTarget, modeToRemember, rememberedEffort, sessionModes, startsInYolo, type EffortPrefs } from "./mode-prefs";
+import { EFFORT_PREFS_KEY, MUSE_MODE_PREF_KEY, MUSE_ON_REQUEST_UNAVAILABLE, MUSE_CLOUD_ON_REQUEST_UNAVAILABLE, configWriteTarget, isMuseModeId, modeToRemember, rememberedEffort, sessionModes, startsInYolo, musePosture, museShellSandboxEnabled, usesClientAutoAccept, type ModeId, type MuseSettings, type EffortPrefs } from "./mode-prefs";
+import { supportsApprovalModeSwitching } from "./acp-backend";
 import { beginAuthRecovery, oauthShadowsXaiApiKey } from "./auth-recovery";
 import {
   WELCOME_TIPS_KEY,
@@ -167,6 +171,7 @@ import {
   APTABASE_APP_KEY_PROD,
   buildSessionStartEvent,
   buildRemotePortalOpenedEvent,
+  buildRemoteHandoffEvent,
   buildSessionRemoteStartedEvent,
   nextTelemetrySession,
   osNameFromPlatform,
@@ -380,9 +385,6 @@ import {
   sessionCatalogDirs,
   sessionDirFor,
 } from "./sessions";
-import { shouldHideAutoSession } from "./session-tags";
-import { COMMUNITY_BASE_VERSION, COMMUNITY_RELEASES_PAGE } from "./community-sync";
-import { peekCommunityLag } from "./release-peek";
 import {
   base64DecodedByteLength,
   isTrustedCodexGeneratedImagePath,
@@ -767,10 +769,6 @@ export class GrokSidebar {
   private view?: HostWebviewView;
   /** Second local consumer of catalog-shaped host messages. Absent until resolved. */
   private projectsRail?: HostWebviewView;
-  /** Dedicated Sessions sidebar (Grok30m). Absent until that view resolves. */
-  private sessionsView?: HostWebviewView;
-  public static readonly panelType = "grok.panel";
-  public static readonly sessionsViewId = "grok.sessions";
   /** The session currently shown in the chat — one member of {@link pool}. */
   private focused = this.newLocalSession();
   /**
@@ -1040,6 +1038,7 @@ export class GrokSidebar {
     "setExpandCommandOutputs",
     "setSteerByDefault",
     "setPromptNav",
+    "setMuseSetting",
     "setPinLiveWorkflows",
     "setExpandDiffCard",
     "setSoundNotifications",
@@ -1083,6 +1082,7 @@ export class GrokSidebar {
     "updateCodex",
     "updateClaude",
     "openRemotePortal",
+    "showRemoteHandoff",
     "remoteSignIn",
     "unlinkRemoteDevice",
   ]);
@@ -1823,10 +1823,29 @@ export class GrokSidebar {
       .flatMap(provider => [...(this.adapterHistory(provider)?.cache?.values() ?? [])]);
   }
 
+  private museSettings(): MuseSettings {
+    const cfg = this.host.getConfiguration("grok");
+    const network = cfg.get<string>("museSandboxNetwork", "proxy-only");
+    return {
+      shellSandbox: cfg.get<boolean>("museShellSandbox", true),
+      sandboxNetwork: network === "restricted" || network === "enabled" ? network : "proxy-only",
+      trustWorkspaces: cfg.get<boolean>("museTrustWorkspaces", false),
+    };
+  }
+
+  private async rememberMusePosture(session: Session, resumeId?: string): Promise<void> {
+    const id = resumeId ?? session.client?.sessionId ?? session.activeSessionId;
+    const posture = session.musePosture;
+    if (!id || session.provider !== "muse" || !posture) return;
+    await this.updateSessionMeta(current => ({
+      ...current, [id]: { ...current[id], musePosture: posture },
+    }));
+  }
+
   private createProviderBackend(provider: AcpProvider): CodexBackend | ClaudeBackend | MuseBackend | undefined {
     if (provider === "codex") return new CodexBackend();
     if (provider === "claude") return new ClaudeBackend();
-    if (provider === "muse") return new MuseBackend();
+    if (provider === "muse") return new MuseBackend(undefined, isCloudEnvironment());
     return undefined;
   }
 
@@ -2954,6 +2973,7 @@ export class GrokSidebar {
       // Staging + grok home are genuinely local disk paths → Uri.file.
       localResourceRoots: this.chatLocalResourceRoots(),
     };
+    this.chatReadyForHandoff = false;
     view.webview.html = this.getHtml(view.webview);
     // Message handlers run async; without this catch a throw (e.g. an fs error
     // in an image-attach path) becomes a silent unhandled rejection and the
@@ -3033,6 +3053,11 @@ export class GrokSidebar {
           type: "expandDiffCard",
           value: this.host.getConfiguration("grok").get<boolean>("expandDiffCard", false),
         });
+      }
+      if (["museShellSandbox", "museSandboxNetwork", "museTrustWorkspaces"].some(key => e.affectsConfiguration(`grok.${key}`))) {
+        const message: HostMsg = { type: "museSettings", value: this.museSettings() };
+        this.post(message);
+        void this.settingsEditor?.webview.postMessage(message);
       }
       if (e.affectsConfiguration("grok.promptNav")) {
         this.post({
@@ -3150,218 +3175,6 @@ export class GrokSidebar {
   /** Drop the rail handle when the view is disposed (or re-created). */
   disposeProjectsRailView(): void {
     this.projectsRail = undefined;
-  }
-
-  attachSessionsView(view: HostWebviewView): void {
-    this.sessionsView = view;
-    view.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [
-        Uri.joinPath(this.context.extensionUri, "media"),
-        Uri.joinPath(this.context.extensionUri, "resources"),
-      ],
-    };
-    view.webview.html = this.getSessionsHtml(view.webview);
-    view.webview.onDidReceiveMessage((raw) => {
-      void this.onSessionsMessage(raw as WebviewMsg);
-    });
-    this.postSessionsList();
-  }
-
-  private grokConfig(): { get<T>(key: string, defaultValue: T): T } | undefined {
-    const get = this.host?.getConfiguration;
-    if (typeof get !== "function") return undefined;
-    const cfg = get.call(this.host, "grok") as { get?: unknown } | undefined;
-    if (!cfg || typeof cfg.get !== "function") return undefined;
-    return cfg as { get<T>(key: string, defaultValue: T): T };
-  }
-
-  private usesPanelTabs(): boolean {
-    return this.grokConfig()?.get<"panel" | "sidebar">("preferredLocation", "panel") === "panel";
-  }
-
-  useSessionsSidebar(): boolean {
-    return this.grokConfig()?.get<boolean>("sessionsSidebar", true) ?? true;
-  }
-
-  hideAutoSessions(): boolean {
-    return this.grokConfig()?.get<boolean>("hideAutoSessions", true) ?? false;
-  }
-
-  private webviewFor(session: Session): HostWebview | undefined {
-    if (this.usesPanelTabs()) {
-      return session.panel?.webview
-        ?? (session === this.focused ? this.view?.webview : undefined);
-    }
-    return session === this.focused ? this.view?.webview : undefined;
-  }
-
-  async openPreferred(): Promise<void> {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else await this.host.revealChatView();
-    if (this.useSessionsSidebar()) {
-      try {
-        await this.host.revealChatView();
-      } catch { /* Sessions lives in its own activity-bar view */ }
-    }
-  }
-
-  openPanel(): void {
-    this.ensurePanelForSession(this.focused);
-  }
-
-  async openSidebar(): Promise<void> {
-    await this.host.revealChatView();
-  }
-
-  private postToSessions(message: HostMsg): void {
-    if (message.type !== "sessions" && message.type !== "sessionDot") return;
-    void this.sessionsView?.webview.postMessage(message);
-  }
-
-  private async onSessionsMessage(msg: WebviewMsg): Promise<void> {
-    switch (msg.type) {
-      case "sessionsReady":
-        this.postSessionsList();
-        break;
-      case "listSessions":
-        this.postSessionsList({
-          offset: msg.offset,
-          limit: msg.limit,
-          query: msg.query,
-          providerCursor: msg.providerCursor,
-        });
-        break;
-      case "setHideAutoSessions":
-        void this.host.getConfiguration("grok").update("hideAutoSessions", !!msg.value);
-        this.postSessionsList();
-        break;
-      case "resumeSession":
-        await this.openSession(msg.id);
-        this.revealChat();
-        break;
-      case "renameSession":
-        this.renameSession(msg.id, msg.name, "local");
-        break;
-      case "deleteSession":
-        await this.deleteSession(msg.id, msg.name, "local");
-        break;
-      case "clearAllSessions":
-        await this.clearAllSessions(this.historyCwdFor("local"), "local");
-        break;
-      case "newSession":
-        await this.newFocusedSession("local");
-        this.revealChat();
-        break;
-    }
-  }
-
-  private revealChat(): void {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else void this.host?.revealChatView?.();
-  }
-
-  private panelTitleFor(session: Session): string {
-    const name = this.sessionDisplayName(session).trim();
-    return name || "Grok30m";
-  }
-
-  private updatePanelTitle(session: Session): void {
-    session.panel?.setTitle?.(this.panelTitleFor(session));
-  }
-
-  private ensurePanelForSession(session: Session, title?: string): void {
-    if (!this.usesPanelTabs() || typeof this.host.openEditorWebview !== "function") return;
-    if (!this.context?.extensionUri) return;
-    if (session.panel) {
-      session.panel.reveal();
-      this.updatePanelTitle(session);
-      return;
-    }
-    const panel = this.host.openEditorWebview({
-      viewType: GrokSidebar.panelType,
-      title: title ?? this.panelTitleFor(session),
-      localResourceRoots: this.chatLocalResourceRoots(),
-    });
-    if (!panel) return;
-    this.bindChatPanel(panel, session);
-  }
-
-  private claimPanelSession(session: Session): void {
-    if (this.focused === session) return;
-    // The tab the user is in, not a replay. focusSession() clears the webview
-    // and would wipe the composer they are about to paste into.
-    this.focused = session;
-    this.touch(session);
-    this.markRead(session);
-    this.updatePanelTitle(session);
-  }
-
-  private bindChatPanel(panel: HostEditorWebview, session: Session): void {
-    session.panel = panel;
-    // Subscribe before assigning html: a restored or cached editor webview can
-    // run scripts in the same turn, and a lost `ready` leaves Starting forever.
-    panel.onDidChangeViewState?.((active) => {
-      if (active) this.claimPanelSession(session);
-    });
-    panel.webview.onDidReceiveMessage((raw) => {
-      const m = raw as WebviewMsg;
-      // Blur of the tab being left must not steal focus back. Every other
-      // message is from the tab the user is acting in — including paste and send.
-      if (!(m.type === "composerFocus" && m.focused === false)) {
-        this.claimPanelSession(session);
-      }
-      if (m.type === "ready" && session.client) {
-        this.rehydrateWebviewFromFocused();
-        return;
-      }
-      void this.onMessage(m, "local").catch((e) => {
-        const text = (e as Error)?.message ?? String(e);
-        this.host.appendLine(`[webview] ${m.type} failed: ${text}`);
-        void this.host.showErrorMessage(`Grok: ${m.type} failed — ${text}`);
-      });
-    });
-    panel.webview.html = this.getHtml(panel.webview);
-    panel.onDidDispose(() => {
-      if (session.panel === panel) session.panel = undefined;
-    });
-  }
-
-  private getSessionsHtml(webview: HostWebview): string {
-    const nonce = getNonce();
-    const mediaUri = (file: string) =>
-      webview.asWebviewUri(Uri.joinPath(this.context.extensionUri, "media", file));
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
-<style>html, body { background: var(--vscode-sideBar-background); }</style>
-<link rel="stylesheet" href="${mediaUri("sessions.css")}" />
-</head>
-<body>
-  <div class="sessions-root">
-    <div class="sessions-header">
-      <span class="sessions-title">Sessions</span>
-      <button id="sessions-new-btn" class="sessions-new-btn" title="New session"></button>
-    </div>
-    <div class="sessions-search-wrap">
-      <input id="sessions-search" class="sessions-search" type="text" placeholder="Search sessions…" />
-    </div>
-    <label class="sessions-filter-auto" title="Hide automated sessions">
-      <input id="sessions-hide-auto" type="checkbox" checked />
-      <span>Hide automated</span>
-    </label>
-    <div id="sessions-list" class="sessions-list"></div>
-    <div id="sessions-footer" class="sessions-footer" hidden>
-      <button id="sessions-clear-btn" class="sessions-clear-all" title="Delete all sessions in this workspace's history"></button>
-    </div>
-  </div>
-  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
-  <script nonce="${nonce}" src="${mediaUri("sessions.js")}"></script>
-</body>
-</html>`;
   }
 
   private chatLocalResourceRoots(): Uri[] {
@@ -3554,6 +3367,10 @@ export class GrokSidebar {
         try { await client.deleteSession(discardId); }
         catch (error) { this.host.appendLine(`[${oldProvider}] could not discard empty session ${discardId}: ${(error as Error).message}`); }
       }
+      // Catalog refreshes can run while the preference write/startup awaits.
+      // Retire the old client before its models or callbacks can be attributed
+      // to the replacement provider.
+      await this.detachClient(session)?.dispose();
       session.provider = provider;
       await this.rememberProjectProvider(this.sessionCwd(session), provider, modelId || undefined);
       await this.startSession(undefined, session);
@@ -3725,26 +3542,19 @@ See design doc for the full state machine diagram.`;
   }
 
   /**
-   * The mode the UI should show. Plan and YOLO are *client* states that the CLI
-   * doesn't model (the CLI only knows agent/plan), so we derive the button label
-   * here rather than echoing the CLI's raw mode id.
+   * Muse reports its native approval mode. Other providers combine their CLI
+   * state with the host's Plan and auto-approval flags.
    */
-  private displayMode(session: Session = this.focused): "agent" | "plan" | "yolo" {
+  private displayMode(session: Session = this.focused): string {
+    if (session.provider === "muse") return session.client?.currentModeId ?? session.musePosture?.mode ?? "agent";
     if (session.planActive) return "plan";
     if (session.autoApprove) return "yolo";
     return "agent";
   }
 
   private postMode(session: Session = this.focused): void {
-    const message: HostMsg = {
-      type: "modeChanged",
-      modeId: this.displayMode(session),
-      modes: sessionModes(session.provider),
-    };
-    if (session === this.focused) {
-      const webview = this.webviewFor(session);
-      if (webview) webview.postMessage(message);
-    }
+    const message = sessionModeMessage(session, this.displayMode(session));
+    if (session === this.focused) this.view?.webview.postMessage(message);
     this.sendRemoteSession(session, message);
   }
 
@@ -3894,7 +3704,7 @@ Only continue if you trust this code.`,
   }
 
   async setMode(
-    modeId: "agent" | "plan" | "yolo",
+    modeId: ModeId,
     session: Session = this.focused,
     requester?: RemoteRequester,
   ): Promise<void> {
@@ -3906,8 +3716,13 @@ Only continue if you trust this code.`,
     // setMode throws "no session" (and for Plan that error is surfaced to the user).
     // The mode button is disabled while busy; this backstops the toggle-mode command.
     if (!session.client || !session.client.sessionId || session.priming) return;
-    // No CLI mode command (Muse). Agent is that CLI's own default — send nothing.
-    // Auto accept is our flag only. Plan would promise a write block it does not have.
+    if (session.provider === "muse" && session.museCloud && modeId === "onRequest") {
+      this.reportRequester(requester, "warning", MUSE_CLOUD_ON_REQUEST_UNAVAILABLE);
+      return;
+    }
+    // Backstop the picker for stale clients and direct/remote commands.
+    if (!sessionModes(session.provider, session.museCloud).includes(modeId) && modeId !== "plan") return;
+    // Muse switches approval without enabling the Plan path.
     if (!supportsModeSwitching(session.provider)) {
       if (!supportsAutoAccept(session.provider)) return;
       if (modeId === "plan") {
@@ -3919,17 +3734,34 @@ Only continue if you trust this code.`,
         return;
       }
       const remember = modeToRemember(modeId);
-      if (remember) void this.rememberGrokConfig("defaultMode", remember);
-      if (modeId === "yolo") {
-        session.autoApprove = true;
-        this.setPlanActive(session, false);
-        this.autoApprovePendingPermissions(session);
+      const client = session.client;
+      if (modeId === "onRequest" && session.museShellSandbox !== true) {
+        this.reportRequester(requester, "warning", MUSE_ON_REQUEST_UNAVAILABLE);
         return;
       }
-      session.autoApprove = false;
+      if (supportsApprovalModeSwitching(session.provider)) {
+        try {
+          await client.setMode(modeId);
+        } catch (error) {
+          if (session.client !== client) return;
+          this.reportRequester(requester, "error", `Couldn't switch mode: ${(error as Error).message}`);
+          return;
+        }
+      }
+      if (session.client !== client) return;
+      if (remember) void this.rememberGrokConfig("defaultMode", remember);
+      await this.state.update(MUSE_MODE_PREF_KEY, modeId);
+      if (session.client !== client) return;
+      session.autoApprove = modeId === "yolo";
+      if (session.musePosture) {
+        session.musePosture = { ...session.musePosture, mode: modeId };
+        await this.rememberMusePosture(session);
+      }
       this.setPlanActive(session, false);
+      if (session.autoApprove) this.autoApprovePendingPermissions(session);
       return;
     }
+    if (modeId === "onRequest" || modeId === "denyUnmatched") return;
     if (modeId === "plan" && !session.planModeAvailable) {
       // Unverified probe: re-check now rather than forcing a session restart.
       // A verified-old CLI is latched and stays refused.
@@ -4498,7 +4330,7 @@ Only continue if you trust this code.`,
     // Auto accept is not a verdict on a plan-review card. Same rule as
     // autoApprovePendingPermissions, including after a failed mode RPC
     // that already cleared the Plan bit.
-    if (supportsAutoAccept(session.provider) && session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
+    if (supportsAutoAccept(session.provider) && usesClientAutoAccept(session.provider) && session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
       const opt = pickAutoAcceptOption(req.options, session.provider);
       if (opt) { client.respondPermission(req.id, opt.optionId); return; }
     }
@@ -4600,6 +4432,7 @@ Only continue if you trust this code.`,
   private autoApprovePendingPermissions(session: Session): void {
     if (!supportsAutoAccept(session.provider)) return;
     const client = session.client;
+    if (!usesClientAutoAccept(session.provider)) return;
     if (!client || session.pendingPermissions.size === 0) return;
     let resolved = 0;
     // Snapshot first — persistPermissionAnswer mutates pendingPermissions.
@@ -4698,7 +4531,7 @@ Only continue if you trust this code.`,
       // for — re-submitting the queued fallback through the relay would
       // charge it twice. Same for the two fallbacks below.
       if (takeQueue) return;
-      const chips = chipsForQueueSend(session.chips, requestedChips);
+      const chips = this.composerChipsForSend(session, requestedChips);
       if (!authored.trim() && !chips.length) return;
       session.queuedSends = enqueueQueuedSend(session.queuedSends, authored, chips);
       if (chips.length) {
@@ -4723,7 +4556,7 @@ Only continue if you trust this code.`,
       session.queuedSendCommit = undefined;
       this.emitQueuedSends(session);
     } else {
-      const chips = chipsForQueueSend(session.chips, requestedChips);
+      const chips = this.composerChipsForSend(session, requestedChips);
       if (!authored.trim() && !chips.length) return;
       contributions = [{ text: authored, chips }];
       if (chips.length) {
@@ -5190,6 +5023,17 @@ Only continue if you trust this code.`,
       );
     }
     const { client, gen, activeSessionId, userMessageCount } = session;
+    // Capture before rewind truncates the buffer. Webview chips are display
+    // data, never authority to attach a path from the host filesystem.
+    let chips: FileChip[] | undefined;
+    let bubble = userMessageCount;
+    for (let i = session.buffer.length - 1; i >= 0; i--) {
+      const message = session.buffer[i];
+      // Replayed chunks have no host-built chips. Only index the live suffix.
+      if (message.type === "userMessageChunk") break;
+      if (message.type !== "userMessage" || message.steer) continue;
+      if (--bubble === userBubbleIndex) { chips = message.chips?.map(chip => ({ ...chip })); break; }
+    }
     try {
       const points = await client.listRewindPoints();
       if (points === "unsupported") {
@@ -5217,7 +5061,7 @@ Only continue if you trust this code.`,
         // Was a modal offering "Copy text to composer" and awaiting the click.
         // Nobody can click it on a cloud machine, so the handler hung there —
         // and the button was the only sensible answer anyway. Do it, and say so.
-        this.restoreComposerFor(session, requester, text);
+        this.restoreComposerFor(session, requester, text, chips);
         return void this.reportRequester(
           requester,
           "info",
@@ -5276,7 +5120,7 @@ Only continue if you trust this code.`,
       const surviving = survivingUserMessagesAfterRewind(points, target);
       await this.truncateSessionCardsAfterRewind(resumeId, surviving);
       this.applyRewindToView(session, surviving);
-      this.restoreComposerFor(session, requester, text);
+      this.restoreComposerFor(session, requester, text, chips);
       if (reportedFiles > 0) {
         this.reportRequester(
           requester,
@@ -5317,9 +5161,14 @@ Only continue if you trust this code.`,
     session: Session,
     requester: RemoteRequester | undefined,
     text: string,
+    chips?: FileChip[],
   ): void {
-    if (!text) return;
-    const message: HostMsg = { type: "restoreComposer", text };
+    if (!text && (!chips || !chips.length)) return;
+    
+    const message: HostMsg = { type: "restoreComposer", text, sessionId: session.activeSessionId || undefined, ...(chips ? { chips } : {}) };
+    const retainChips = () => {
+      if (chips) session.restoredChips = restoreQueuedChips(session.restoredChips, [{ text, chips }]);
+    };
     if (requester) {
       // Resolve through the tab, so a phone that reconnected while the rewind
       // was in flight still receives its own text — then check the tab is still
@@ -5327,13 +5176,15 @@ Only continue if you trust this code.`,
       // whatever that tab is showing NOW.
       const clientId = this.resolveRemoteRequester(requester);
       if (clientId && this.remoteClients.active(clientId) === session) {
+        retainChips();
         this.sendRemoteClient(clientId, message);
         return;
       }
     } else if (this.focused === session) {
       // Same check for the desk: postLocal posts to the focused webview
       // whatever it is displaying.
-      this.postLocal(message);
+      retainChips();
+      this.postLocal(this.view ? this.localizeHistoryMessage(message, this.view.webview) : message);
       return;
     }
     // The asking surface has moved to another conversation. Refusing to deliver
@@ -5352,8 +5203,7 @@ Only continue if you trust this code.`,
     // The webview's own `restoreComposer` appends for exactly this reason
     // ("anything already typed is the user's"); the store follows the same rule
     // rather than being the one place that silently drops a message.
-    const parked = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.queuedDraft;
-    void this.rememberQueuedDraft(id, parked ? `${parked}\n\n${text}` : text);
+    void this.rememberQueuedDraft(id, text, chips ?? [], true);
   }
 
   /** See {@link editLastMessage} for why `session` and `requester` are explicit. */
@@ -8411,33 +8261,50 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Park a composer draft on the conversation it was typed into, because that
    *  conversation is the only place it can be handed back without guessing who
    *  is watching what. */
-  private rememberQueuedDraft(id: string, text: string): Promise<void> {
-    if (!text) return Promise.resolve();
-    return this.updateSessionMeta((current) => ({
-      ...current,
-      [id]: { ...(current[id] ?? {}), queuedDraft: text },
-    }));
+  private rememberQueuedDraft(id: string, text: string, chips?: FileChip[], append = false): Promise<void> {
+    if (!text && !chips?.length) return Promise.resolve();
+    return this.updateSessionMeta((current) => {
+      const { queuedDraftChips: previousChips, ...previous } = current[id] ?? {};
+      return {
+        ...current,
+        [id]: {
+          ...previous,
+          queuedDraft: append && previous?.queuedDraft ? `${previous.queuedDraft}\n\n${text}` : text,
+          ...(chips || (append && previousChips) ? {
+            queuedDraftChips: restoreQueuedChips(append ? previousChips ?? [] : [], [{ text, chips: chips ?? [] }]),
+          } : {}),
+        },
+      };
+    });
   }
 
   /** Hand a parked draft back to this session's live composer, exactly once.
    *  Detached tabs keep META untouched until reattachment because
    *  `restoreComposer` is transient and has no recipient while detached. */
-  private restorePersistedDraft(session: Session): void {
-    const hasComposer =
-      (session === this.focused && this.view !== undefined) ||
-      this.remoteClients.isActiveValueVisible(session);
-    if (!hasComposer || session.needsProvider) return;
+  private restorePersistedDraft(session: Session, recipient?: RemoteRequester | "local"): void {
     const id = session.activeSessionId;
     if (!id) return;
-    const draft = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[id]?.queuedDraft;
-    if (!draft) return;
     void this.updateSessionMeta((current) => {
+      const hasComposer =
+        (session === this.focused && this.view !== undefined) ||
+        this.remoteClients.isActiveValueVisible(session);
+      if (!hasComposer || session.needsProvider || session.activeSessionId !== id) return null;
       const meta = current[id];
-      if (!meta?.queuedDraft) return null;
-      const { queuedDraft: _restored, ...rest } = meta;
+      if (!meta?.queuedDraft && !meta?.queuedDraftChips?.length) return null;
+      if (recipient && recipient !== "local") {
+        const clientId = this.resolveRemoteRequester(recipient);
+        if (!clientId || this.remoteClients.active(clientId) !== session) return null;
+      } else if (recipient === "local" && (session !== this.focused || !this.view)) return null;
+      const draft = meta.queuedDraft ?? "";
+      if (recipient || meta.queuedDraftChips) {
+        const clientId = this.remoteClients.clientsForActiveValue(session)[0];
+        const requester = recipient === "local" ? undefined : recipient ??
+          (session === this.focused && this.view ? undefined : clientId ? { clientId } : undefined);
+        this.restoreComposerFor(session, requester, draft, meta.queuedDraftChips);
+      } else this.emit(session, { type: "restoreComposer", text: draft });
+      const { queuedDraft: _restored, queuedDraftChips: _chips, ...rest } = meta;
       return { ...current, [id]: rest };
     });
-    this.emit(session, { type: "restoreComposer", text: draft });
   }
 
   /** Restore a replacement's captured draft only after its provider start
@@ -8616,7 +8483,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const mime = m.mimeType || guessMediaMime(m.path);
       // Trusted session media: stream from disk when the webview can.
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) {
         const src = webview.asWebviewUri(Uri.file(m.path));
         // Copy image needs PIXELS, and a webview cannot read them back out of an
@@ -10367,6 +10234,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const disposeMs = replacedClient ? clock.elapsed(disposeAt) : 0;
     clock.record("dispose", disposeMs);
+    if (session.provider === "muse" && resumeId) {
+      await this.sessionMetaWrites;
+      if (gen !== session.gen) return undefined;
+    }
     // A brand-new session starts in the remembered mode (#25) immediately, so the
     // toolbar shows the right one from the first paint — no Agent → Auto accept
     // flash while the session spins up and primes. Resumed sessions stay
@@ -10381,7 +10252,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // it so the button shows "Auto accept" instead of a misleading "Agent" (#31).
     // Applies to resumed sessions too (the config is global, not per-session).
     const configAutoApprove = session.provider === "grok" && this.configForcesAutoApprove(this.sessionCwd(session));
-    session.autoApprove = rememberedYolo || configAutoApprove;
+    session.museCloud = session.provider === "muse" && isCloudEnvironment();
+    session.musePosture = session.provider === "muse" ? musePosture(
+      this.state.get<string>(MUSE_MODE_PREF_KEY) ?? (rememberedYolo ? "yolo" : "agent"), !!resumeId,
+      resumeId ? this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[resumeId]?.musePosture : undefined,
+      this.museSettings(),
+      session.museCloud,
+    ) : undefined;
+    session.museShellSandbox = session.musePosture ? museShellSandboxEnabled(session.musePosture, session.museCloud) : undefined;
+    session.autoApprove = session.musePosture ? session.musePosture.mode === "yolo" : rememberedYolo || configAutoApprove;
     session.planActive = false;
     session.hasHistory = !!resumeId;
     session.suppressContent = false;
@@ -10424,11 +10303,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // calls startSession as its own retry, and a reset would let an entitlement
     // failure (#58) pay a full restart+resend cycle on every prompt. Only a clean
     // turn re-arms it.
-    this.emit(session, {
-      type: "modeChanged",
-      modeId: session.autoApprove ? "yolo" : "agent",
-      modes: sessionModes(session.provider),
-    });
+    this.emit(session, sessionModeMessage(session, session.musePosture?.mode ?? (session.autoApprove ? "yolo" : "agent")));
     if (configAutoApprove) this.noticeAlwaysApproveOnce(this.sessionCwd(session));
     if (resumeId) this.emit(session, { type: "clearMessages" });
 
@@ -10524,7 +10399,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       mcpServers: (onDispose) => supportsClientMcpServers(session.provider) ? this.hostMcpServersFor(session, onDispose) : [],
       ...(session.provider === "grok"
         ? { grokVersion: grokHandshakeVersion, grokVersionVerified }
-        : { backend: this.createProviderBackend(session.provider) }),
+        : { backend: session.provider === "muse" ? new MuseBackend(session.musePosture, session.museCloud) : this.createProviderBackend(session.provider) }),
     });
     session.client = client;
     this.syncHumanWait(session);
@@ -10582,6 +10457,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("session", (res) => {
       if (gen !== session.gen) return;
+      const posture = session.musePosture;
       if (res?.sessionId) session.activeSessionId = res.sessionId;
       this.cacheProviderModels(session.provider, client.availableModels, client.currentModelId);
       if (res?.sessionId) {
@@ -10591,6 +10467,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             ...(current[res.sessionId] ?? {}),
             provider: session.provider,
             providerCwd: cwd,
+            ...(posture ? { musePosture: posture } : {}),
           },
         }));
       }
@@ -10629,6 +10506,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("modeChanged", (id) => {
       if (gen !== session.gen) return;
+      if (session.provider === "muse" && isMuseModeId(id)) {
+        session.autoApprove = id === "yolo";
+        if (session.musePosture) session.musePosture = { ...session.musePosture, mode: id };
+        void this.rememberMusePosture(session, resumeId);
+        this.setPlanActive(session, false);
+        return;
+      }
       if (id === "plan") {
         // Raise the safety gate synchronously for every Plan transition. During
         // session/load, current_mode_update events replay before AcpClient has a
@@ -11500,7 +11384,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.host.webviewReloadsUnderLiveSession,
           !!this.focused.client,
         );
+        this.chatReadyForHandoff = true;
         this.postInitialState();
+        if (this.pendingRemoteHandoff) {
+          this.postLocal(this.pendingRemoteHandoff);
+          this.pendingRemoteHandoff = undefined;
+        }
         // Rehydrate already posts catalog + sessions. Cold start needs an early
         // disk list so the rail is not empty while startSession runs — but the
         // catalog scan is deferred so ready returns and the UI paints first
@@ -11619,17 +11508,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           // A phone can take over a running turn: its send may be queued before
           // handleSend reaches the prompt commit point. Receipt is remote use.
           if (session.hasHistory) this.reportRemoteMessage(session, origin);
-          await this.handleSend(msg.text, msg.bare === true, session, origin, queuedSendCommit, msg.submissionId);
+          await this.handleSend(msg.text, msg.bare === true, session, origin, queuedSendCommit, msg.submissionId, undefined, msg.chips);
         } finally {
           if (queuedSendCommit) finishQueuedSendCommit(session, queuedSendCommit, false);
         }
         break;
-      case "newSession":
+      case "newSession": {
+        const onCreated = this.composerDraftReply(msg.draftId, requester);
         // A remote's cwd is deliberately not forwarded: newRemoteSession starts
         // in that tab's own repo, which is the only project it is entitled to.
-        if (origin === "remote" && clientId) await this.newRemoteSession(clientId);
-        else await this.newFocusedSession(origin, msg.cwd);
+        if (origin === "remote" && clientId) await this.newRemoteSession(clientId, true, onCreated);
+        else await this.newFocusedSession(origin, msg.cwd, onCreated);
         break;
+      }
       case "cancel": {
         const cancelled = session.turnToken;
         this.clearPendingHumanRequests(session);
@@ -11645,7 +11536,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         // messages survive focus switches and flush even while backgrounded.
         const s = session;
         const text = typeof msg.text === "string" ? msg.text : "";
-        const chips = chipsForQueueSend(s.chips, msg.chips);
+        const chips = this.composerChipsForSend(s, msg.chips);
         if (text.trim() || chips.length) {
           if (s.hasHistory) this.reportRemoteMessage(s, origin);
           s.queuedSendDispatch = undefined;
@@ -11722,8 +11613,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (this.refuseMismatchedSessionId(msg.sessionId, session, requester)) break;
         await this.removeFocusedWorktree(session, true);
         break;
+      case "showRemoteHandoff":
+        await this.continueOnPhone(msg.source, msg.sessionId, msg.repoCwd, msg.explain);
+        break;
+      case "remoteHandoff":
+        await this.replyRemoteHandoff(msg);
+        break;
       case "remoteSignIn":
-        await this.linkRemoteDevice();
+        await this.linkRemoteDevice(msg.source);
         break;
       case "remoteSignOut":
       case "unlinkRemoteDevice": {
@@ -11743,7 +11640,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         break;
       }
       case "openRemotePortal":
-        this.reportRemotePortalOpened(msg.withHint === true);
+        this.reportRemotePortalOpened(msg.withHint === true, msg.source);
         void this.host.openExternal(httpBaseFromRelayUrl(this.relayUrl()) + (msg.withHint ? "/?remoteHint=1" : ""));
         break;
       case "rewindSession":
@@ -12272,6 +12169,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         await this.host.getConfiguration("grok")
           .update("expandDiffCard", !!msg.value, "global");
         break;
+      case "setMuseSetting": {
+        if (origin === "remote") break;
+        const valid = msg.key === "museSandboxNetwork"
+          ? ["proxy-only", "restricted", "enabled"].includes(msg.value)
+          : (msg.key === "museShellSandbox" || msg.key === "museTrustWorkspaces") && typeof msg.value === "boolean";
+        if (!valid) break;
+        const cfg = this.host.getConfiguration("grok");
+        await cfg.update(msg.key, msg.value, configWriteTarget(cfg.inspect(msg.key)));
+        break;
+      }
       case "setPromptNav":
         await this.host.getConfiguration("grok")
           .update("promptNav", !!msg.value, "global");
@@ -14071,24 +13978,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? offset + entries.length
       : Math.max(offset + entries.length, combinedPage?.providerCursor.grokOffset ?? 0);
     const total = query ? (merged?.length ?? 0) : (grok?.total ?? 0) + adapter.length;
-    const hideAuto = this.hideAutoSessions();
-    const visible = hideAuto
-      ? entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined))
-      : entries;
-    const visibleDots: Record<string, Dot> = {};
-    for (const entry of visible) visibleDots[entry.id] = this.dotForId(entry.id);
     return {
       type: "sessions",
-      entries: visible,
+      entries,
       activeId,
-      dots: visibleDots,
+      dots,
       offset,
-      total: hideAuto ? visible.length : total,
+      total,
       hasMore: query ? nextOffset < total : combinedPage?.hasMore ?? false,
       nextOffset,
       ...(!query && combinedPage ? { providerCursor: combinedPage.providerCursor } : {}),
       query,
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -14335,7 +14235,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
-    const hideAuto = this.hideAutoSessions();
     // Stale per-tab / selected cwds must not scan a closed project's catalog.
     const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
@@ -14384,22 +14283,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     let pageEntries: SessionListEntry[];
     let total: number;
     let nextOffset: number;
-    const filterAuto = (entries: SessionListEntry[]) => {
-      if (!hideAuto) return entries;
-      return entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined));
-    };
-    if (query || hideAuto) {
-      // Search and hide-auto need names, so read (cache-backed) the whole list once, then filter.
+    if (query) {
+      // Search needs names for everything, so read (cache-backed) the whole list once, then filter.
       const all = this.readEntriesCachedMulti(index.map((e) => e.id), mtimeById, cwdById, overrides, grokHome, log)
         .filter((e) => e.kind !== "subagent");
       all.sort((a, b) => b.updatedAt - a.updatedAt);
-      const matched = filterAuto(query
-        ? all.filter(
-            (e) =>
-              e.displayName.toLowerCase().includes(query) ||
-              (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
-          )
-        : all);
+      const matched = all.filter(
+        (e) =>
+          e.displayName.toLowerCase().includes(query) ||
+          (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
+      );
       total = matched.length;
       pageEntries = matched.slice(offset, offset + limit);
       nextOffset = offset + pageEntries.length;
@@ -14487,7 +14380,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       hasMore,
       nextOffset,
       query: opts?.query ?? "",
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -15658,11 +15550,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
-  private reportRemotePortalOpened(withHint: boolean): void {
+  private reportRemotePortalOpened(withHint: boolean, source: RemoteHandoffSource = "topbar"): void {
     this.reportTelemetry((sys, sessionId, timestamp) => buildRemotePortalOpenedEvent({
       installId: this.installId(),
       hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder, isCloudEnvironment()),
-      withHint,
+      withHint, source,
     }, sys, sessionId, timestamp));
   }
 
@@ -17285,18 +17177,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     queuedSendCommit?: { text: string; items: QueuedSendEntry[] },
     submissionId?: string,
     onStarted?: () => void,
+    requestedChips?: FileChip[],
   ): Promise<void> {
     if (this.cloudHostUpdate && !this.cloudHostUpdate.admitting) {
       this.emit(target ?? this.focused, { type: "error", text: CLOUD_UPDATE_REFUSAL });
       return;
     }
-    await this.withCloudHostWork(() => this.handleAdmittedSend(text, bare, target, origin, queuedSendCommit, submissionId, onStarted));
+    await this.withCloudHostWork(() => this.handleAdmittedSend(text, bare, target, origin, queuedSendCommit, submissionId, onStarted, requestedChips));
   }
 
   private async handleAdmittedSend(
     text: string, bare: boolean, target: Session | undefined, origin: MsgOrigin,
     queuedSendCommit?: { text: string; items: QueuedSendEntry[] }, submissionId?: string,
     onStarted?: () => void,
+    requestedChips?: FileChip[],
   ): Promise<void> {
     // `target` lets a queued-send flush fire into a BACKGROUNDED session (its
     // turn ended while another was focused). Only the focused session may spawn
@@ -17328,7 +17222,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // maybeFlushQueuedSends can never re-enter this branch: it only flushes
     // when the turn is over (queuedSendReadyText).
     if (this.turnInFlight(session)) {
-      if (!queuedSendCommit) this.divertRacingSend(session, text, bare);
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, this.composerChipsForSend(session, requestedChips));
       return;
     }
     // Priming is latched before a client exists (sign-out replacements start
@@ -17336,14 +17230,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // race the planned replace. Queue whenever startup already owns this
     // session — not only when a client is sitting without a session id.
     if (session.priming || (session.client && !sessionReadyForPrompt(session))) {
-      if (!queuedSendCommit) this.divertRacingSend(session, text, bare);
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, this.composerChipsForSend(session, requestedChips));
       return;
     }
     const client = session.client ?? await this.ensureClient(session);
     if (!client) return;
     // ensureClient may return mid-startSession; re-check before committing work.
     if (!sessionReadyForPrompt(session)) {
-      if (!queuedSendCommit) this.divertRacingSend(session, text, bare);
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, this.composerChipsForSend(session, requestedChips));
       return;
     }
     const gen = session.gen;
@@ -17389,7 +17283,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       chips = [...queuedChips, ...implicitChips];
     } else {
-      chips = [...session.chips];
+      chips = requestedChips === undefined ? [...session.chips]
+        : [...this.composerChipsForSend(session, requestedChips), ...implicitChips];
     }
 
     // Pre-read every visible image BEFORE anything is cleared or sent. Any
@@ -17861,6 +17756,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       steerByDefault: cfg.get("steerByDefault", false),
       expandDiffCard: cfg.get("expandDiffCard", false),
       promptNav: cfg.get("promptNav", true),
+      museSettings: this.museSettings(),
       pinLiveWorkflows: cfg.get("pinLiveWorkflows", true),
       soundNotifications: cfg.get("soundNotifications", false),
       processingSound: cfg.get("processingSound", false),
@@ -18017,7 +17913,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    */
   private rehydrateWebviewFromFocused(): void {
     const session = this.focused;
-    const wv = this.webviewFor(session);
+    const wv = this.view?.webview;
     if (!wv) return;
     this.touch(session);
     this.markRead(session);
@@ -18071,10 +17967,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
   }
 
+  private composerChipsForSend(session: Session, requested?: FileChip[]): FileChip[] {
+    // Only the recipient's explicit ids can opt restored attachments into a
+    // send. Other surfaces (including old clients) see only shared chips.
+    return chipsForQueueSend(requested === undefined ? session.chips :
+      restoreQueuedChips(session.chips, [{ text: "", chips: session.restoredChips }]), requested);
+  }
+
   private postChips(session: Session = this.focused): void {
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
-    const webview = session === this.focused ? this.webviewFor(session) : undefined;
-    if (webview) {
+    if (session === this.focused && this.view) {
+      const webview = this.view.webview;
       const localMessage: HostMsg = { type: "chips", chips: this.localPreviewChips(session, webview) };
       void webview.postMessage(localMessage);
     }
@@ -18089,7 +17992,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   private localizeHistoryMessage(message: HostMsg, webview: HostWebview): HostMsg {
-    if (message.type === "userMessage" && message.chips) {
+    if ((message.type === "userMessage" || message.type === "restoreComposer") && message.chips) {
       return { ...message, chips: message.chips.map((chip) => isImageChip(chip)
         ? { ...chip, ...(fs.existsSync(chip.path)
           ? { previewSrc: webview.asWebviewUri(Uri.file(chip.path)), fullId: this.registerFullImage(chip.path) }
@@ -18180,6 +18083,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     "cancelDeviceLogin",
     "listSessions",
     "listRepoSessions",
+    "showRemoteHandoff",
     "selectRepo",
     "resumeSession",
     "newSession",
@@ -18200,9 +18104,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
@@ -18220,11 +18122,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Post to the VS Code webview only (plus catalog mirror to the projects rail). */
   private postLocal(message: HostMsg): void {
     this.postTap?.("local", message);
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /**
@@ -18844,11 +18743,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session === this.focused) {
       this.postTap?.("local", message);
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
       // Active-session identity for the projects rail (highlight + pin home).
       this.mirrorToProjectsRail(message);
-      this.postToSessions(message);
     }
     if (!session.replaying) this.sendRemoteSession(session, message);
   }
@@ -18873,10 +18771,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /** Desk-targeted, non-replayable delivery for one-shot notices. */
@@ -18884,10 +18781,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   private async replayLoadedHistory(session: Session, load: () => Promise<void>): Promise<void> {
@@ -19106,7 +19002,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.touch(session);
     this.markRead(session); // opening it clears any unread (green/red) badge
     this.refreshWorkflowCompletions(session);
-    const wv = this.webviewFor(session);
+    const wv = this.view?.webview;
     // Both surfaces need it, and the desk has the same gap the browser does —
     // re-focusing a live conversation never said which agent it belongs to.
     const identity = this.sessionIdentityFrame(session);
@@ -19159,8 +19055,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // the small frame the client actually needs, instead of rebuilding a list
     // that has not changed.
     this.postSessionName(session);
-    // Same as the remote path, and for the same reason: restorePersistedDraft
-    // broadcasts, so it is not called here.
+    this.restorePersistedDraft(session, "local");
   }
 
   /**
@@ -19803,9 +19698,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = session.activeSessionId;
     if (!id) return;
     const message: HostMsg = { type: "sessionDot", id, dot: this.dotForId(id) };
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
@@ -20216,7 +20109,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   }
 
   /** Start a brand-new session, keeping the current one alive in the background. */
-  private async newFocusedSession(origin: MsgOrigin, requestedCwd?: string): Promise<void> {
+  private async newFocusedSession(origin: MsgOrigin, requestedCwd?: string, onCreated?: (id: string) => void): Promise<void> {
     // The answer to a CLI update belongs to the update, not to every
     // conversation opened afterwards. This lives in the two session
     // constructors rather than in `case "newSession"` because a remote's
@@ -20255,6 +20148,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const leavingId = this.focused.activeSessionId;
     this.parkFocused();
     const unused = this.findUnusedEmptySession(targetCwd, "local", leavingId);
+    if (unused) onCreated?.(unused.id);
     if (unused?.session?.client) {
       this.focusSession(unused.session);
     } else if (unused?.session) {
@@ -20273,7 +20167,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // the old transcript stayed onscreen under the fresh session. (The toolbar
       // path just clears twice, a no-op.)
       this.emit(this.focused, { type: "clearMessages" });
-      await this.startSession();
+      const created = this.focused;
+      await this.startSession(undefined, created);
+      if (created.activeSessionId) onCreated?.(created.activeSessionId);
     }
     await this.persistWorktreeBinding(this.focused);
     this.sweepEmptySessions(this.sessionCwd(this.focused));
@@ -20286,7 +20182,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // After the sweep, not before: the sweep can retire the empty session this
     // one replaced, and a list built ahead of it would show a row that is gone.
     this.postSessionsList();
-    this.revealChat();
   }
 
   private focusRemoteSession(clientId: string, session: Session, notifyCatalog = true): void {
@@ -20309,15 +20204,20 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // name has to be re-announced here or the header loses its rename affordance
     // until something unrelated refreshes it.
     this.postSessionName(session);
-    // NOT restorePersistedDraft. It hands the draft back with session-wide
-    // `emit`, which appends it to every surface viewing the conversation — so
-    // calling it here re-created, on the switch-back, the desk-composer
-    // pollution this whole sequence removed. Parked text therefore returns on
-    // the next load of the conversation rather than the instant you switch to
-    // it. That is a narrower promise, kept, instead of a wider one that leaks.
+    this.restorePersistedDraft(session, { clientId });
   }
 
-  private async newRemoteSession(clientId: string, notifyCatalog = true): Promise<void> {
+  /** Names a New's composer draft back to the surface that asked, once the host has its id. */
+  private composerDraftReply(draftId: unknown, requester?: RemoteRequester): ((sessionId: string) => void) | undefined {
+    if (typeof draftId !== "string") return undefined;
+    return (sessionId) => {
+      const reply: HostMsg = { type: "composerDraftSession", draftId, sessionId };
+      if (requester) this.sendRemoteRequester(requester, reply);
+      else this.postLocal(reply);
+    };
+  }
+
+  private async newRemoteSession(clientId: string, notifyCatalog = true, onCreated?: (id: string) => void): Promise<void> {
     this.clearSettledCliUpdates();
     const ownerTabToken = this.remoteClients.tabToken(clientId);
     const cwd = this.remoteClients.cwd(clientId);
@@ -20325,6 +20225,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.parkRemoteSession(clientId);
     this.dropRemoteVoice(clientId);
     const unused = this.findUnusedEmptySession(cwd, "remote", leavingId);
+    if (unused) onCreated?.(unused.id);
     if (unused?.session?.client) {
       this.focusRemoteSession(clientId, unused.session, notifyCatalog);
       return;
@@ -20349,6 +20250,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.remoteClients.setActive(clientId, session);
     this.emit(session, { type: "clearMessages" });
     await this.startSession(undefined, session);
+    if (session.activeSessionId) onCreated?.(session.activeSessionId);
     await this.persistWorktreeBinding(session);
     this.sweepEmptySessions(this.sessionCwd(session));
     if (notifyCatalog) this.postRepoCatalog();
@@ -20766,7 +20668,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // a conversation is not a request to change which project you are in.
     // Desktop's own selectRepo does the whole switch; this is the half VS Code
     // needs because it has no folder to switch.
-    this.revealChat();
     if (this.host.canSwitchWorkspaceFolder) return;
     const openedIn = this.resolveLocalRepoTarget(this.sessionCwd(this.focused));
     if (openedIn && !pathsEqual(openedIn.cwd, this.selectedRepoCwd || "")) {
@@ -21366,7 +21267,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       const requester = this.captureRemoteRequester(clientId);
       const transition = async (currentClientId: string) => {
         if (m.type === "newSession") {
-          await this.newRemoteSession(currentClientId);
+          await this.newRemoteSession(currentClientId, true, this.composerDraftReply(m.draftId, requester));
         } else if (m.type === "resumeSession") {
           await this.openRemoteSession(currentClientId, m.id, m.cwd, true, m.claim === true);
         } else if (m.type === "selectRepo") {
@@ -21500,6 +21401,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.uplink) return;
     const token = await this.readDeviceToken();
     if (!token) return; // not linked yet — the link command starts the uplink itself
+    this.linkedDeviceId ??= this.state.get<string>(GrokSidebar.REMOTE_DEVICE_ID_KEY) || undefined;
     const uplink = new RemoteUplink({
       relayUrl: this.relayUrl(),
       token,
@@ -21534,6 +21436,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         sameCwd: pathsEqual,
       },
       onConnected: () => this.cloudHostUpdate?.connected(),
+      onStatusChanged: () => {
+        if (this.uplink !== uplink) return;
+        if (uplink.deviceId && uplink.deviceId !== this.linkedDeviceId) this.rememberRemoteDeviceId(uplink.deviceId);
+        void this.postRemoteStatus();
+      },
       onClientReady: (clientId, tabToken) => this.handleRemoteClientReady(clientId, tabToken),
       onClientLeft: (clientId) => {
         this.releaseRemoteClient(clientId);
@@ -21577,7 +21484,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (this.uplink !== revokedUplink || storedToken !== revokedToken) return;
 
     this.clearRemoteRuntime();
-    this.post({ type: "remoteStatus", linked: false });
+    this.publishRemoteStatus(false);
     try {
       await this.context.secrets.delete(GrokSidebar.DEVICE_TOKEN_SECRET);
     } catch (e) {
@@ -21604,6 +21511,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private clearRemoteRuntime(): void {
     this.uplink?.dispose();
     this.uplink = undefined;
+    this.rememberRemoteDeviceId(undefined);
     this.stopVoiceInput();
     this.remoteClients.clear();
     this.refreshKeepAwake();
@@ -21661,7 +21569,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    *  edge: start a link, open the browser for the (mock for now) approval, poll
    *  until the relay hands back a long-lived device token, store it in secrets,
    *  connect. Mirrors how a CLI links to a web account. */
-  async linkRemoteDevice(): Promise<void> {
+  async linkRemoteDevice(source: RemoteHandoffSource = "palette"): Promise<void> {
+    this.reportHandoffEvent("remote_link_started", { source });
     const base = httpBaseFromRelayUrl(this.relayUrl());
     try {
       // Already persisted by the time this returns — getOrCreate writes the file
@@ -21691,34 +21600,39 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (!startRes.ok) throw new Error(`link/start ${startRes.status}`);
       const { code } = (await startRes.json()) as { code: string };
       void this.host.openExternal(`${base}/link?code=${encodeURIComponent(code)}`);
-      const token = await this.host.withProgress(
+      const approved = await this.host.withProgress(
         { title: `Approve this device in the browser (code ${code})…`, cancellable: true },
         (cancel) => this.pollLinkApproval(base, code, cancel),
       );
-      if (!token) return; // cancelled / expired — poll loop already surfaced why
-      await this.context.secrets.store(GrokSidebar.DEVICE_TOKEN_SECRET, token);
+      if (!approved) return; // cancelled / expired — poll loop already surfaced why
+      await this.context.secrets.store(GrokSidebar.DEVICE_TOKEN_SECRET, approved.token);
       this.uplink?.dispose();
       this.uplink = undefined;
+      // An older relay omits it; the uplink's `self` frame then supplies it.
+      this.rememberRemoteDeviceId(approved.deviceId);
       await this.maybeStartUplink();
-      this.post({ type: "remoteStatus", linked: true });
+      this.publishRemoteStatus(true);
+      this.reportHandoffEvent("remote_link_completed", {});
       void this.host.showInformationMessage("Remote device linked — this workspace is now reachable from the web client.");
     } catch (e) {
       void this.host.showErrorMessage(`Remote link failed: ${(e as Error)?.message ?? String(e)}`);
     }
   }
 
-  private async pollLinkApproval(base: string, code: string, cancel: HostCancellationToken): Promise<string | undefined> {
+  private async pollLinkApproval(base: string, code: string, cancel: HostCancellationToken): Promise<{ token: string; deviceId?: string } | undefined> {
     const deadline = Date.now() + 5 * 60_000;
     while (Date.now() < deadline && !cancel.isCancellationRequested) {
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 1000));
       const res = await fetch(`${base}/api/link/poll`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ code }),
       });
       if (!res.ok) continue;
-      const body = (await res.json()) as { status: string; token?: string };
-      if (body.status === "approved" && body.token) return body.token;
+      const body = (await res.json()) as { status: string; token?: string; deviceId?: unknown };
+      if (body.status === "approved" && body.token) {
+        return { token: body.token, deviceId: typeof body.deviceId === "string" && body.deviceId ? body.deviceId : undefined };
+      }
       if (body.status === "expired" || body.status === "unknown") {
         void this.host.showErrorMessage("Remote link code expired — run the link command again.");
         return undefined;
@@ -21757,15 +21671,101 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // Still tear the runtime down so the machine stops advertising.
     }
     this.clearRemoteRuntime();
-    this.post({ type: "remoteStatus", linked: false });
+    this.publishRemoteStatus(false);
     void this.host.showInformationMessage("Remote device unlinked.");
   }
 
-  /** Tell the webview whether this machine holds a relay device token (drives
-   *  the gear "AFK Pilot" section's sign-in vs account/sign-out items). */
+  private remoteStatusRevision = 0;
+  /** The linked device's id, from the link reply or the uplink's `self` frame, kept with the link so the phone
+   *  code never waits for a reconnect (after sleep, a network change or a relay deploy). Fixed for a token's life. */
+  private linkedDeviceId?: string;
+  private static readonly REMOTE_DEVICE_ID_KEY = "grok.remote.deviceId";
+
+  private rememberRemoteDeviceId(deviceId: string | undefined): void {
+    this.linkedDeviceId = deviceId;
+    void this.state.update(GrokSidebar.REMOTE_DEVICE_ID_KEY, deviceId);
+  }
+
+  /** Undefined while this window's connection is being refused: another window may hold the link, and a code
+   *  from here would open that window's host. A refusal that outlasts the grace window becomes `heldElsewhere`. */
+  private remoteDeviceId(): string | undefined {
+    if (this.uplink?.refused || this.uplink?.heldElsewhere) return undefined;
+    return this.uplink?.deviceId ?? this.linkedDeviceId;
+  }
+
+  private publishRemoteStatus(linked: boolean): void {
+    this.remoteStatusRevision = (this.remoteStatusRevision ?? 0) + 1;
+    const msg: HostMsg = { type: "remoteStatus", linked,
+      handoffReady: linked && !!this.remoteDeviceId(),
+      ...(linked && this.uplink?.heldElsewhere ? { heldElsewhere: true } : {}),
+      viewerCount: linked ? this.uplink?.viewerCount ?? 0 : 0 };
+    this.post(msg);
+    void this.settingsEditor?.webview.postMessage(msg);
+  }
+
   private async postRemoteStatus(): Promise<void> {
+    const revision = this.remoteStatusRevision ?? 0;
     const token = await this.readDeviceToken();
-    this.post({ type: "remoteStatus", linked: !!token });
+    if ((this.remoteStatusRevision ?? 0) === revision) this.publishRemoteStatus(!!token);
+  }
+
+  private reportHandoffEvent(
+    name: "remote_handoff_shown" | "remote_link_started" | "remote_link_completed",
+    props: { source?: RemoteHandoffSource; linked?: boolean },
+  ): void {
+    this.reportTelemetry((sys, sessionId, timestamp) => buildRemoteHandoffEvent(name, {
+      installId: this.installId(),
+      hostKind: sessionStartHostKind(this.host.canSwitchWorkspaceFolder, isCloudEnvironment()),
+      ...props,
+    }, sys, sessionId, timestamp));
+  }
+
+  private pendingRemoteHandoff?: Extract<HostMsg, { type: "showRemoteHandoff" }>;
+  private chatReadyForHandoff = false;
+
+  async continueOnPhone(source: RemoteHandoffSource = "palette", sessionId?: string, repoCwd?: string, explain?: boolean): Promise<void> {
+    const msg: Extract<HostMsg, { type: "showRemoteHandoff" }> = { type: "showRemoteHandoff", source, sessionId, repoCwd, explain };
+    this.pendingRemoteHandoff = msg;
+    await this.host.revealChatView();
+    if (this.chatReadyForHandoff && this.pendingRemoteHandoff === msg) {
+      this.pendingRemoteHandoff = undefined;
+      this.postLocal(msg);
+    }
+  }
+
+  /** Resolve the row against host-owned catalogs; never substitute the focused chat for a missing id. */
+  private handoffSession(sessionId?: string, repoCwd?: string): HandoffSession | undefined {
+    const id = sessionId || this.focused.activeSessionId;
+    if (!id) return undefined;
+    const live = [...this.pool, this.focused].find((s) => s.activeSessionId === id);
+    const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    const cached = this.sessionCache.get(id)?.entry
+      ?? [...this.allAdapterCatalogs()].flat().find((s) => s.id === id);
+    const cwd = live ? this.sessionCwd(live) : cached?.cwd;
+    if (!cwd) return undefined;
+    const named = repoCwd ? this.localRepoCatalogEntries().find((r) => r.available && pathsEqual(r.cwd, repoCwd)) : undefined;
+    const repo = named && this.sessionCwdsForRepo(named.cwd, overrides).some((c) => pathsEqual(c, cwd))
+      ? named : this.resolveLocalRepoTarget(cwd);
+    if (!repo || (repoCwd && repo !== named)) return undefined;
+    const title = live ? this.sessionDisplayName(live) : cached?.displayName;
+    return { id, repoCwd: repo.cwd, cwd, title: title || "this conversation" };
+  }
+
+  private async replyRemoteHandoff(msg: Extract<WebviewMsg, { type: "remoteHandoff" }>): Promise<void> {
+    const linked = !!await this.readDeviceToken();
+    if (!msg.action || msg.action === "show") this.reportHandoffEvent("remote_handoff_shown", { source: msg.source, linked });
+    const session = this.handoffSession(msg.sessionId, msg.repoCwd);
+    const url = linked ? remoteHandoffUrl(this.relayUrl(), this.remoteDeviceId(), session) : undefined;
+    if (msg.action === "open") {
+      this.reportRemotePortalOpened(!url, msg.source);
+      void this.host.openExternal(url ?? `${httpBaseFromRelayUrl(this.relayUrl())}/?remoteHint=1`);
+      return;
+    }
+    let qrSvg: string | undefined;
+    if (url) {
+      try { qrSvg = remoteHandoffQr(url); } catch { /* Oversized link: Copy/Open still work. */ }
+    }
+    this.postLocal({ type: "remoteHandoff", requestId: msg.requestId, url, qrSvg, title: session?.title || "this conversation" });
   }
 
   /** Ordered catch-up built from this client's cwd and active remote session. */
@@ -21929,7 +21929,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /**
    * Open the shared settings surface as a VS Code editor tab.
    *
-   * Snapshot-on-open: the tab does not subscribe to live chat updates. Every
+   * Settings receives host-local status updates while open. Every
    * change still posts an existing set-/open- message, so the sidebar and
    * chat webview stay in sync through the same handlers the gear uses.
    */
@@ -21939,12 +21939,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (category) {
         void this.settingsEditor.webview.postMessage({ type: "settingsCategory", category });
       }
-      void this.refreshCommunityLagOnSettings();
       return;
     }
     const panel = this.host.openEditorWebview({
       viewType: "grok.settings",
-      title: "Grok30m Settings",
+      title: "Grok Settings",
       localResourceRoots: [
         Uri.joinPath(this.context.extensionUri, "media"),
         Uri.joinPath(this.context.extensionUri, "resources"),
@@ -21968,24 +21967,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         this.host.appendLine(`[settings] ${msg.type} failed: ${text}`);
       });
     });
-    void this.refreshCommunityLagOnSettings();
-  }
-
-  private async refreshCommunityLagOnSettings(): Promise<void> {
-    const panel = this.settingsEditor;
-    if (!panel) return;
-    const lag = await peekCommunityLag(this.context.extensionVersion);
-    if (this.settingsEditor !== panel) return;
-    void panel.webview.postMessage({
-      type: "communityLagStatus",
-      base: lag.base,
-      latest: lag.latest || "",
-      behind: lag.behind,
-      error: lag.error || "",
-    });
   }
 
   private async onSettingsPanelMessage(msg: WebviewMsg): Promise<void> {
+    if (msg.type === "ready") {
+      await this.postRemoteStatus();
+      return;
+    }
     if (!GrokSidebar.SETTINGS_PANEL_TYPES.has(msg.type)) {
       this.host.appendLine(`[settings] ignored ${msg.type}`);
       return;
@@ -22009,6 +21997,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         steerByDefault: cfg.get("steerByDefault", false),
         expandDiffCard: cfg.get("expandDiffCard", false),
         promptNav: cfg.get("promptNav", true),
+        museSettings: this.museSettings(),
         pinLiveWorkflows: cfg.get("pinLiveWorkflows", true),
         fontScale: this.chatFontScale(),
         soundNotifications: cfg.get("soundNotifications", false),
@@ -22035,11 +22024,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         providersChecking: this.providerRefreshInFlight,
         githubState: this.githubStatePayload(),
         extVersion: this.context.extensionVersion,
-        communityBase: COMMUNITY_BASE_VERSION,
-        communityLatest: "",
-        communityBehind: false,
-        communityError: "",
-        communityReleasesUrl: COMMUNITY_RELEASES_PAGE,
         cliVersion: this.providerCliVersions.grok || "",
         hostKind: "extension" as const,
         hostName: deviceDisplayName(os.hostname(), process.platform, os.release()),
@@ -22058,6 +22042,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         steerSupported: true,
         providersKnown: true,
         remoteLinked: opts.remoteLinked,
+        remoteHandoffSupported: true,
+        remoteViewerCount: this.uplink?.viewerCount ?? 0,
         hostCaps: {
           relocateView: this.host.canRelocateView,
           secondarySideBar: this.host.canUseSecondarySideBar,
@@ -22085,7 +22071,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   html, body { background: var(--vscode-editor-background, var(--vscode-sideBar-background)); }
 </style>
 <link rel="stylesheet" href="${mediaUri("settings.css")}" />
-<title>Grok30m Settings</title>
+<title>Grok Settings</title>
 </head>
 <body class="settings-page">
   <div id="settings-root"></div>
@@ -22109,6 +22095,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       window.addEventListener("message", function (e) {
         var msg = e.data;
         if (!msg || !msg.type || !surface) return;
+        if (msg.type === "remoteStatus") {
+          surface.update({}, { remoteLinked: !!msg.linked, remoteViewerCount: msg.viewerCount || 0,
+            remoteHandoffSupported: typeof msg.handoffReady === "boolean" });
+        }
+        if (msg.type === "museSettings") surface.update({ museSettings: msg.value });
         if (msg.type === "voiceConfigured") {
           surface.update({ voiceConfigured: !!msg.value, voiceBackendState: msg.backendState,
             voiceSendPhrase: msg.sendPhrase, voiceKeyterms: msg.keyterms });
@@ -22121,14 +22112,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           } };
           if (msg.current) next.cliVersion = msg.current;
           surface.update(next);
-        }
-        if (msg.type === "communityLagStatus") {
-          surface.update({
-            communityBase: msg.base || "",
-            communityLatest: msg.latest || "",
-            communityBehind: !!msg.behind,
-            communityError: msg.error || "",
-          });
         }
         if (msg.type === "providerState" && Array.isArray(msg.providers)) {
           surface.update({ providers: msg.providers, providersChecking: msg.checking === true });
@@ -22165,6 +22148,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         }
         if (msg.type === "settingsCategory" && msg.category) surface.setCategory(msg.category);
       });
+      vscode.postMessage({ type: "ready" });
     })();
   </script>
 </body>
@@ -22193,9 +22177,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? `
   <aside id="projects-rail" class="projects-rail" aria-label="Projects">
     <div class="rail-top">
-      <span class="rail-brand" title="Grok30m">
+      <span class="rail-brand" title="Grok Build Desktop">
         <span class="mark" style="--rail-mark:url('${railMark}')" aria-hidden="true"></span>
-        <span class="wordmark"><b>Grok</b><span class="dim">30m</span></span>
+        <span class="wordmark"><b>Grok</b> <span class="dim">Build</span></span>
       </span>
       <button id="desk-rail-toggle" class="rail-icon-btn" type="button" title="Hide projects" aria-label="Hide projects" aria-expanded="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>
@@ -22288,8 +22272,8 @@ ${openMain}
       <button id="session-name-edit" class="session-name-edit icon-btn" type="button" hidden></button>
     </div>
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>
-    <button id="remote-btn" class="icon-btn remote-btn" title="Continue remotely" hidden></button>
-    ${this.useSessionsSidebar() ? "" : `<button id="history-btn" class="icon-btn" title="Session history"></button>`}
+    <button id="remote-btn" class="icon-btn remote-btn" title="Remote control" hidden></button>
+    <button id="history-btn" class="icon-btn" title="Session history"></button>
     <button id="new-btn" class="icon-btn" title="New session"></button>
     ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}
     ${this.host.canSwitchWorkspaceFolder ? "" : `<div id="vscode-session-actions"></div>`}
@@ -22300,8 +22284,8 @@ ${fileShellOpen}
   <main id="messages" class="messages">
     <div class="welcome" id="welcome">
       <span class="welcome-mark" role="img" aria-label="Grok" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
-      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok30m"}</h2>
-      <p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>
+      <h2>${isCloudEnvironment() ? "AFK Pilot (Cloud)" : "Grok Build (Community)"}</h2>
+      <p class="welcome-byline muted">by Paweł Huryn (<a href="https://www.productcompass.pm/" class="muted-link">The Product Compass</a>)</p>
       <p id="welcome-version" class="muted welcome-status-busy"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Starting</span></p>
       <div id="welcome-onboarding"></div>
     </div>
