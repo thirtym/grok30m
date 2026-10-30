@@ -21,6 +21,7 @@ export const GROK30M_OVERLAY_PATHS = [
   "src/session.ts",
   "src/sidebar.ts",
   "test/protocol.test.ts",
+  "test/recent-strict.test.ts",
   "test/settings-surface.dom.test.ts",
   "test/webview-harness.ts",
   "test/webview-ui.dom.test.ts",
@@ -88,6 +89,8 @@ export function applyGrok30mFile(relPath: string, source: string): string {
       return applySidebar(source);
     case "test/protocol.test.ts":
       return applyProtocolTest(source);
+    case "test/recent-strict.test.ts":
+      return applyRecentStrict(source);
     case "test/settings-surface.dom.test.ts":
       return applySettingsTest(source);
     case "test/webview-harness.ts":
@@ -853,6 +856,16 @@ function applyExtension(src: string): string {
     );
   }
   return src;
+}
+
+function applyRecentStrict(src: string): string {
+  // The sessions list has its own resumeSession case, earlier in the file.
+  // The stamp lives on the host handler, which is the last one.
+  return rename(
+    src,
+    "source.indexOf('      case \"resumeSession\":')",
+    "source.lastIndexOf('      case \"resumeSession\":')",
+  );
 }
 
 function applyProtocolTest(src: string): string {

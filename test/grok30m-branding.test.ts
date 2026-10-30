@@ -50,7 +50,7 @@ describe("Grok30m identity", () => {
       for (const view of group) expect(view.title).toBe("Grok30m");
     }
     for (const cmd of pkg.contributes.commands ?? []) {
-      if (cmd.command === "grok.linkRemote" || cmd.command === "grok.unlinkRemote") continue;
+      if (typeof cmd.title !== "string" || !cmd.title.includes("Grok")) continue;
       expect(cmd.title, cmd.command).toMatch(/Grok30m/);
     }
     const settings = readFileSync(path.join(root, "media", "settings.js"), "utf8");

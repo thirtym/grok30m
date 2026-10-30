@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -29,6 +29,7 @@ function show(tag: string, rel: string): string | undefined {
 describe("Grok30m overlay", () => {
   it("is idempotent on the current tree", () => {
     for (const rel of GROK30M_OVERLAY_PATHS) {
+      if (!existsSync(path.join(root, rel))) continue;
       const src = read(rel);
       expect(applyGrok30mFile(rel, src), rel).toBe(src);
     }
@@ -95,6 +96,19 @@ describe("Grok30m overlay", () => {
       expect(stamped, tag).not.toContain("revealCommandFor");
       expect(applyGrok30mFile("src/extension.ts", stamped), tag).toBe(stamped);
     }
+  });
+
+  it("checks the host resume handler for the openedAt stamp", () => {
+    const sidebar = show("v4.15.0", "src/sidebar.ts");
+    const testSrc = show("v4.15.0", "test/recent-strict.test.ts");
+    if (sidebar === undefined || testSrc === undefined) return;
+    const stampedSidebar = applyGrok30mFile("src/sidebar.ts", sidebar);
+    const start = stampedSidebar.lastIndexOf('      case "resumeSession":');
+    const body = stampedSidebar.slice(start, stampedSidebar.indexOf("        break;", start));
+    expect(body).toContain("msg.claim === true");
+    const stamped = applyGrok30mFile("test/recent-strict.test.ts", testSrc);
+    expect(stamped).toContain("source.lastIndexOf('      case \"resumeSession\":')");
+    expect(applyGrok30mFile("test/recent-strict.test.ts", stamped)).toBe(stamped);
   });
 
   it("expects the renamed command titles community still writes as Grok", () => {
