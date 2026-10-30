@@ -5,6 +5,11 @@ Upstream base at fork time: [`56d2b4f`](https://github.com/phuryn/grok-build-vsc
 
 Full upstream history: [README.upstream.md](README.upstream.md) and the [upstream repo](https://github.com/phuryn/grok-build-vscode).
 
+## 2.1.26
+
+- **Merge community 4.15.5** (auto-sync).
+- **Grok30m UX kept:** editor-tab chat, Sessions sidebar, hide automated sessions.
+
 ## 2.1.25
 
 - **Merge community 4.15.4** (auto-sync).
