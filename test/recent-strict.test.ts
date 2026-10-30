@@ -180,7 +180,7 @@ describe("buildRecentSessions", () => {
 describe("where the stamps are written", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "src", "sidebar.ts"), "utf8").replace(/\r\n/g, "\n");
   it("stamps openedAt only for a person's open: a desk click or a tab's claim, not a reconnect restore", () => {
-    const start = source.indexOf('      case "resumeSession":');
+    const start = source.lastIndexOf('      case "resumeSession":');
     const body = source.slice(start, source.indexOf("        break;", start));
     expect(body).toContain('if (msg.claim === true && this.remoteClients.active(clientId)?.activeSessionId === msg.id)');
     expect(body).toContain("if (this.focused.activeSessionId === msg.id) void this.noteSessionOpened(msg.id);");

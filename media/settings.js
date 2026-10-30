@@ -1413,10 +1413,40 @@
     {
       id: "aboutThisExtension",
       category: "about",
-      title: "This extension",
+      title: "Grok30m",
       kind: "value",
       visible: (s, env) => !remoteAbout(s, env),
       get: (s) => versionLabel(s && s.extVersion),
+    },
+    {
+      id: "aboutCommunityBase",
+      category: "about",
+      title: "Based on community",
+      kind: "status",
+      visible: (s, env) => !remoteAbout(s, env) && !!(s && s.communityBase),
+      describe: (s) => {
+        const base = s && s.communityBase;
+        const latest = s && s.communityLatest;
+        if (s && s.communityError) {
+          return (base || "") + " · couldn't reach GitHub";
+        }
+        if (s && s.communityBehind && latest) {
+          return latest + " is out (this build: " + base + ")";
+        }
+        if (latest) return latest + " — up to date";
+        return base ? (base + " · checking…") : "";
+      },
+    },
+    {
+      id: "aboutCommunityReleases",
+      category: "about",
+      icon: "github",
+      title: "Community releases",
+      description: "phuryn/grok-build-vscode — the build this fork tracks.",
+      kind: "action",
+      actionLabel: "Open",
+      href: "https://github.com/phuryn/grok-build-vscode/releases",
+      visible: (s, env) => !remoteAbout(s, env),
     },
     {
       id: "aboutGrokCli",
@@ -1815,6 +1845,10 @@
       // than spinning on a refresh that is never coming.
       providersChecking: false,
       extVersion: "",
+      communityBase: "",
+      communityLatest: "",
+      communityBehind: false,
+      communityError: "",
       cliVersion: "",
       hostKind: "",
       hostName: "",
