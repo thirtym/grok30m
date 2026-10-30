@@ -2,7 +2,7 @@
 
 Fork of [Grok Build for VS Code (Community)](https://github.com/phuryn/grok-build-vscode) with one editor tab per session and a Sessions sidebar. A daily GitHub Action merges the next community release, puts those back, and publishes a vsix.
 
-Two ways to use the same agent UI on top of the **Grok Build CLI**:
+Two ways to use the same agent UI, on top of each agent's own CLI:
 
 | | **VS Code extension** | **Grok Build Desktop** |
 |---|---|---|
@@ -12,7 +12,7 @@ Two ways to use the same agent UI on top of the **Grok Build CLI**:
 
 Both speak JSON-RPC to `grok agent stdio` (and to **Codex**, **Claude Code**, **Muse Code** and — experimental, on your own computer only, not on cloud machines — **Antigravity**), share each provider's CLI-owned chat history, and have **Remote Control** built in: pair your phone at **[afkpilot.com](https://afkpilot.com)** once and watch, approve, and steer from your phone or any browser. Drop files in as `@`-context, run **multiple sessions**, generate **images & video inline**, and dictate by **voice**.
 
-No manual setup on either host: onboarding **walks you through installing the `grok` CLI and signing in** — with a **SuperGrok or X Premium+ subscription**, or an **xAI API key**.
+No manual setup on either host: onboarding **walks you through installing the `grok` CLI and signing in** — with a **SuperGrok or X Premium+ subscription**, or an **xAI API key**. The other agents connect from **Settings → Providers**, each with its own account.
 
 ![Grok Build in VS Code, choosing Grok 4.7 and its reasoning effort](docs/screenshots/grok_4.7.png)
 
@@ -22,7 +22,7 @@ No manual setup on either host: onboarding **walks you through installing the `g
 
 ## Why use this?
 
-If you live in your editor **or** want a dedicated agent window, this puts Grok Build in a graphical workflow on top of the CLI: **diff preview** on every proposed edit, **open files and selection as context**, **parallel sessions** with status dots, **resumable history**, **inline images & video**, and **voice dictation**. The CLI does the heavy lifting; these hosts are the GUI for when you'd rather not be in a terminal.
+If you live in your editor **or** want a dedicated agent window, this puts your coding agents in a graphical workflow on top of their CLIs: **diff preview** on every proposed edit, **open files and selection as context**, **parallel sessions** with status dots, **resumable history**, **inline images & video**, and **voice dictation**. The CLIs do the heavy lifting; these hosts are the GUI for when you'd rather not be in a terminal.
 
 ### Features & capabilities
 
@@ -254,7 +254,7 @@ While a device is linked or a local agent turn is in flight, the extension also 
 
 ## Requirements
 
-- **VS Code** 1.106+ (or a compatible editor on the same base — Cursor 3.x qualifies; Antigravity is still on base 1.104 and keeps the last compatible extension version).
+- **VS Code** 1.106+ (or a compatible editor on the same base — Cursor 3.x qualifies; an editor on an older base keeps the last extension version that supports it).
 - **A supported provider CLI** on macOS, Linux, or Windows: Grok Build (`grok`), Codex, Claude Code or Muse Code. Grok and Muse ship native Windows installers, so the extension runs natively on all three — no WSL required (WSL2 + Remote-WSL still works if you prefer it).
 - **A login:** any X or Grok account tries **Grok Build** free, with usage limits (`grok login`). For sustained use, a **SuperGrok or X Premium+** subscription or an xAI API key; with an API key you also get the **grok-4.x** models and **grok-imagine**.
 - **Voice control** is optional and uses Grok sign-in or an OpenAI API key (Codex sign-in alone does not include transcription) — it just needs [`ffmpeg`](https://ffmpeg.org) to record. Setup + advanced options: [docs/voice-setup.md](docs/voice-setup.md).
