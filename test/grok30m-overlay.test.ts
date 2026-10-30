@@ -83,6 +83,18 @@ describe("Grok30m overlay", () => {
     expect(chat).toContain("if (historyBtn) historyBtn.onclick");
   });
 
+  it("expects the renamed command titles community still writes as Grok", () => {
+    const src = show("v4.14.0", "test/protocol.test.ts");
+    if (src === undefined) return;
+    const stamped = applyGrok30mFile("test/protocol.test.ts", src);
+    expect(stamped).toContain('title: "Grok30m: Continue on Phone"');
+    expect(stamped).not.toContain('title: "Grok:');
+    expect(applyGrok30mFile("test/protocol.test.ts", stamped)).toBe(stamped);
+    const later = show("v4.15.6", "test/protocol.test.ts");
+    if (later === undefined) return;
+    expect(applyGrok30mFile("test/protocol.test.ts", later)).toBe(later);
+  });
+
   it("keeps community's mode payload and still posts it to the session tab", () => {
     const cases = [
       ["v4.13.0", "modes: sessionModes(session.provider)"],

@@ -3258,7 +3258,7 @@ export class GrokSidebar {
 
   private revealChat(): void {
     if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else void this.host.revealChatView?.();
+    else void this.host?.revealChatView?.();
   }
 
   private panelTitleFor(session: Session): string {
