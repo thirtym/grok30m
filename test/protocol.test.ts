@@ -19,7 +19,7 @@ const sorted = (a: readonly string[]) => [...a].sort();
 
 describe("host <-> webview message contract (src/protocol.ts is the source of truth)", () => {
   it("contributes the phone handoff command and routes it through the chat host", () => {
-    expect(packageJson.contributes.commands).toContainEqual({ command: "grok.continueOnPhone", title: "Grok: Continue on Phone" });
+    expect(packageJson.contributes.commands).toContainEqual({ command: "grok.continueOnPhone", title: "Grok30m: Continue on Phone" });
     const extension = readFileSync(new URL("../src/extension.ts", import.meta.url), "utf8");
     expect(extension).toContain('registerCommand("grok.continueOnPhone", () => sidebar.continueOnPhone())');
   });
