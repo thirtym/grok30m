@@ -7,7 +7,13 @@ interface ItemState {
   text: string;
   output: string;
   toolCallId?: string;
+  /** `reasoning`: the summary parts as they stream (`item/delta` field `summary.N`). */
+  parts: string[];
+  /** `reasoning`: what has been emitted as thinking, the parts joined. */
+  thought: string;
 }
+
+const newItemState = (): ItemState => ({ revision: -1, text: "", output: "", parts: [], thought: "" });
 
 const MUSE_FAILURE_OUTPUT_LINES = 8;
 
@@ -65,12 +71,14 @@ function museToolFailureMessage(item: Record<string, any>): string {
 /** A single session's raw MSP stream, independent of transport and SDK folds. */
 export class Projection {
   private readonly items = new Map<string, ItemState>();
+  /** The reasoning item that last emitted thinking, if any. */
+  private lastThoughtItem?: string;
   constructor(
     private readonly emit: (update: SessionUpdate) => void,
     private readonly log: (message: string) => void,
   ) {}
 
-  clear(): void { this.items.clear(); }
+  clear(): void { this.items.clear(); this.lastThoughtItem = undefined; }
 
   private append(state: ItemState, id: string, field: "text" | "output", text: string): void {
     const previous = state[field];
@@ -91,6 +99,29 @@ export class Projection {
     }
   }
 
+  /**
+   * Muse's reasoning summary as ACP thinking (#207): the same
+   * `agent_thought_chunk` the other agents send, so "Show thinking traces"
+   * shows it. Parts are joined with a blank line; only new text is emitted.
+   */
+  private think(state: ItemState, id: string): void {
+    const joined = state.parts.filter((part) => part).join("\n\n");
+    if (joined === state.thought || state.thought.startsWith(joined)) return;
+    if (!joined.startsWith(state.thought)) {
+      this.log(`Muse projection: prefix-changing reasoning revision for item ${id}`);
+      return;
+    }
+    let suffix = joined.slice(state.thought.length);
+    state.thought = joined;
+    // A new reasoning item is a new thought. The renderer keeps appending
+    // thinking to one block for the turn, whatever comes in between, so
+    // without a break two summaries ran into one sentence. A block the
+    // renderer has just started drops the leading break itself (appendThought).
+    if (this.lastThoughtItem !== undefined && this.lastThoughtItem !== id) suffix = `\n\n${suffix}`;
+    this.lastThoughtItem = id;
+    this.emit({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: suffix } });
+  }
+
   acceptHistory(item: Record<string, any>): void {
     if (item.kind === "userMessage" && typeof item.text === "string") {
       this.emit({ sessionUpdate: "user_message_chunk", content: { type: "text", text: item.text } });
@@ -109,12 +140,17 @@ export class Projection {
       let state = this.items.get(id);
       if (!state) {
         // Muse may send an answer delta without a preceding item/started.
-        state = { revision: -1, text: "", output: "" };
+        state = newItemState();
         this.items.set(id, state);
       }
       if (state.kind === "reminderChild") return;
       const field: string = params.field ?? "text";
-      if (field === "text" || field === "output") this.append(state, id, field, state[field] + params.delta);
+      const part = /^summary\.(\d+)$/.exec(field);
+      if (part && (state.kind === "reasoning" || state.kind === undefined)) {
+        const n = Number(part[1]);
+        state.parts[n] = (state.parts[n] ?? "") + params.delta;
+        this.think(state, id);
+      } else if (field === "text" || field === "output") this.append(state, id, field, state[field] + params.delta);
       return;
     }
     if (!["item/started", "item/updated", "item/completed"].includes(method)) return;
@@ -123,7 +159,7 @@ export class Projection {
     const id = item.itemId;
     let state = this.items.get(id);
     if (!state) {
-      state = { revision: -1, text: "", output: "" };
+      state = newItemState();
       this.items.set(id, state);
     }
     if (item.revision <= state.revision) return;
@@ -161,6 +197,9 @@ export class Projection {
       if (typeof item.visibleOutput === "string") this.append(state, id, "output", item.visibleOutput);
     } else if (item.kind === "agentMessage" && typeof item.text === "string") {
       this.append(state, id, "text", item.text);
+    } else if (item.kind === "reasoning" && Array.isArray(item.summary)) {
+      state.parts = item.summary.map((part: unknown) => (typeof part === "string" ? part : ""));
+      this.think(state, id);
     }
   }
 }

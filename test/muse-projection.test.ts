@@ -22,6 +22,45 @@ describe("Muse raw notification projection", () => {
     expect(logs).toEqual(["Muse projection: prefix-changing text revision for item answer"]);
   });
 
+  // #207: Muse's reasoning summary was dropped, so "Show thinking traces" never
+  // showed it. Measured live 2026-10-16: item/started reasoning, then
+  // item/delta on fields summary.0 and summary.1, then item/completed with the
+  // parts in `summary`.
+  it("streams a reasoning summary as thinking, one part per paragraph, without repeating it on completion", () => {
+    const updates: any[] = [];
+    const p = new Projection(u => updates.push(u), () => {});
+    p.accept("item/started", { item: { itemId: "r", kind: "reasoning", revision: 1, summary: [] } });
+    p.accept("item/delta", { itemId: "r", field: "summary.0", delta: "Framing the plan" });
+    p.accept("item/delta", { itemId: "r", field: "summary.0", delta: " first." });
+    p.accept("item/delta", { itemId: "r", field: "summary.1", delta: "Then the reply." });
+    p.accept("item/completed", { item: { itemId: "r", kind: "reasoning", revision: 2, summary: ["Framing the plan first.", "Then the reply."] } });
+    expect(updates.every(u => u.sessionUpdate === "agent_thought_chunk")).toBe(true);
+    expect(updates.map(u => u.content.text).join("")).toBe("Framing the plan first.\n\nThen the reply.");
+  });
+
+  // Measured live 2026-10-16: "…ruling out image handling.Analyzing a conflict…"
+  // The renderer keeps one thinking block per turn whatever comes in between,
+  // so every new reasoning item opens a paragraph, after other output too
+  // (review 4.15.1: a tool call between two items still ran them together).
+  it("starts a new paragraph for every new reasoning item", () => {
+    const updates: any[] = [];
+    const p = new Projection(u => updates.push(u), () => {});
+    p.accept("item/delta", { itemId: "r1", field: "summary.0", delta: "First thought." });
+    p.accept("item/delta", { itemId: "r1", field: "summary.0", delta: " More." });
+    p.accept("item/delta", { itemId: "r2", field: "summary.0", delta: "Second thought." });
+    p.accept("item/delta", { itemId: "a", field: "text", delta: "Answer." });
+    p.accept("item/delta", { itemId: "r3", field: "summary.0", delta: "Later thought." });
+    const thinking = updates.filter(u => u.sessionUpdate === "agent_thought_chunk").map(u => u.content.text);
+    expect(thinking).toEqual(["First thought.", " More.", "\n\nSecond thought.", "\n\nLater thought."]);
+  });
+
+  it("replays a reasoning item from history as thinking", () => {
+    const updates: any[] = [];
+    const p = new Projection(u => updates.push(u), () => {});
+    p.acceptHistory({ itemId: "r", kind: "reasoning", revision: 3, summary: ["One.", "Two."] });
+    expect(updates).toEqual([{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "One.\n\nTwo." } }]);
+  });
+
   it.each(["inProgress", "completed", "failed", "cancelled", "rejected", "timedOut", "aborted", "futureStatus"])(
     "projects live and replayed tool status %s using the open terminal contract", status => {
       for (const history of [false, true]) {
