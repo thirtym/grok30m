@@ -11,7 +11,7 @@
  * Git + gh.
  */
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -150,6 +150,24 @@ function conflictedFiles() {
   return out ? out.split("\n").filter(Boolean) : [];
 }
 
+function isWorkflow(file) {
+  return file === ".github/workflows" || file.startsWith(".github/workflows/");
+}
+
+function keepOurWorkflows() {
+  // GITHUB_TOKEN can push the merge, and GitHub rejects that push if it
+  // creates or edits a workflow. There is no workflows: scope to grant it.
+  // Community's workflow updates stay upstream; this fork keeps its own.
+  const added = git([
+    "diff", "--name-only", "--cached", "--diff-filter=A", "--", ".github/workflows",
+  ]).split("\n").filter(Boolean);
+  for (const file of added) {
+    git(["rm", "-f", "--cached", "--", file]);
+    rmSync(path.join(root, file), { force: true });
+  }
+  git(["checkout", "HEAD", "--", ".github/workflows"]);
+}
+
 function writeManifest(version, applyGrok30mManifest) {
   const pkg = readJson("package.json");
   const next = applyGrok30mManifest(pkg, { version });
@@ -211,23 +229,29 @@ function applySync(decision) {
   git(["fetch", COMMUNITY_REMOTE, "--no-tags", `+refs/tags/${decision.communityTag}:refs/tags/${decision.communityTag}`]);
   const overlayPaths = mods.GROK30M_OVERLAY_PATHS;
   try {
-    git(["merge", "--no-edit", decision.communityTag]);
+    git(["merge", "--no-commit", "--no-edit", decision.communityTag]);
   } catch {
     const files = conflictedFiles();
     const auto = new Set(["package.json", "package-lock.json", ...overlayPaths]);
-    const leftover = files.filter((f) => !auto.has(f));
+    const leftover = files.filter((f) => !auto.has(f) && !isWorkflow(f));
     if (leftover.length) {
       try { git(["merge", "--abort"]); } catch { /* still merging */ }
       console.error(`Merge conflicts (not auto-resolved):\n${leftover.join("\n")}`);
       process.exit(2);
     }
     for (const file of files) {
+      if (isWorkflow(file)) {
+        git(["checkout", "--ours", "--", file]);
+        git(["add", "--", file]);
+        continue;
+      }
       if (!auto.has(file)) continue;
       git(["checkout", "--theirs", "--", file]);
       git(["add", "--", file]);
     }
-    git(["commit", "--no-edit"]);
   }
+  keepOurWorkflows();
+  git(["commit", "--no-edit"]);
   reapplyOverlay(mods.applyGrok30mFile, overlayPaths);
   bumpSources(decision.communityVersion, decision.grokVersion, mods);
   execFileSync("npm", ["version", decision.grokVersion, "--no-git-tag-version", "--allow-same-version"], {
