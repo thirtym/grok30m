@@ -13374,9 +13374,9 @@
 
   const MAX_COMMAND_PREVIEW_LINES = 6;
   // A command you are asked to approve shows more of itself than one in the
-  // transcript: 4 lines was too few to judge it (#208). Still clipped, never a
-  // nested scroller -- a scroll box inside the chat catches the wheel while you
-  // scroll the conversation, which #71 asked us to remove. View all has the rest.
+  // transcript (#208). Pending execute cards scroll within this cap, then lose
+  // the box when answered. Transcript IN/OUT previews stay clipped (#71), so
+  // nested scrollers do not accumulate in the conversation's history.
   const PERMISSION_COMMAND_PREVIEW_LINES = 10;
 
   function makeInlineExpandToggle(collapsedText, className, onToggle) {
@@ -13400,7 +13400,7 @@
     return toggle;
   }
 
-  function appendCommandPreview(container, text, className, language, maxLines = MAX_COMMAND_PREVIEW_LINES, openRef, isCommand = false) {
+  function appendCommandPreview(container, text, className, language, maxLines = MAX_COMMAND_PREVIEW_LINES, openRef, isCommand = false, scrollable = false) {
     const fullText = text == null ? "" : String(text);
     const logicalPreview = commandTextPreview(fullText, maxLines);
     const pre = document.createElement("pre");
@@ -13409,11 +13409,13 @@
     // can then compare this element's full scrollHeight with its clamped
     // clientHeight without cloning the text or guessing a line-height.
     pre.classList.add("command-preview-capped");
+    if (scrollable) pre.classList.add("permission-command-preview");
     pre.textContent = fullText;
     pre.style.setProperty("--command-preview-lines", String(maxLines));
     pre.title = fullText;
     container.appendChild(pre);
     let viewAll = null;
+    let scrollCaption = null;
     let expanded = false;
     let previewLabel = logicalPreview.truncated
       ? `View all (${formatCount(logicalPreview.lineCount)} lines) →`
@@ -13482,6 +13484,33 @@ ${fullText}`
       if (!expanded) pre.classList.add("command-preview-capped");
       const renderedTruncated = hasLayout && pre.scrollHeight > pre.clientHeight;
       const truncated = logicalTruncated || renderedTruncated;
+      if (scrollable) {
+        pre.classList.toggle("permission-command-scroll", truncated);
+        if (truncated) {
+          // Tab can reach the scroll region; arrival still focuses the default
+          // action. Native arrow/PageUp/PageDown scrolling needs no key handler.
+          pre.tabIndex = 0;
+          pre.setAttribute("role", "region");
+          pre.setAttribute("aria-label", "Command awaiting approval");
+        } else {
+          pre.removeAttribute("tabindex");
+          pre.removeAttribute("role");
+          pre.removeAttribute("aria-label");
+        }
+      }
+      // Mobile scrollbars are transient: make the hidden command length clear
+      // without opening an overlay or adding another keyboard stop.
+      if (IS_REMOTE && scrollable && truncated) {
+        if (!scrollCaption) {
+          scrollCaption = document.createElement("div");
+          scrollCaption.className = "card-subtitle permission-command-caption";
+          scrollCaption.textContent = `${formatCount(logicalPreview.lineCount)} ${logicalPreview.lineCount === 1 ? "line" : "lines"} · scroll to read all`;
+          pre.after(scrollCaption);
+        }
+      } else if (scrollCaption) {
+        scrollCaption.remove();
+        scrollCaption = null;
+      }
       previewLabel = truncated ? `View all (${formatCount(logicalPreview.lineCount)} lines) →` : "View all →";
       if (!expanded) {
         if (hasLayout && !truncated) pre.classList.remove("command-preview-capped");
@@ -13490,7 +13519,11 @@ ${fullText}`
         pre.classList.remove("command-preview-capped");
       }
       const overflowing = visible && className === "tool-cmd" && pre.clientWidth > 0 && pre.scrollWidth > pre.clientWidth;
-      if (truncated || overflowing) ensureViewAll();
+      // Remote pending commands are fully readable in their scroll box. Omit
+      // View all: the shared overlay has host-only actions and can cover a new
+      // approval that takes keyboard focus. Remote transcript previews still
+      // expand inline; editor/desktop approvals keep their View all action.
+      if ((truncated || overflowing) && !(IS_REMOTE && scrollable)) ensureViewAll();
       else if (viewAll && viewAll.getAttribute("aria-expanded") !== "true") {
         viewAll.remove();
         viewAll = null;
@@ -17270,7 +17303,7 @@ ${fullText}`
     // categorize()'s "command" bucket without being one.
     const isCommandCard = toolKind(req.toolCall) === "execute";
     appendCommandPreview(el, cardTitle, "card-title command-card-title",
-      isCommandCard ? state.commandLanguage : undefined, PERMISSION_COMMAND_PREVIEW_LINES, undefined, isCommandCard);
+      isCommandCard ? state.commandLanguage : undefined, PERMISSION_COMMAND_PREVIEW_LINES, undefined, isCommandCard, isCommandCard);
 
     const diff = state.pendingDiffByToolCallId.get(req.toolCall?.toolCallId);
     if (diff) {

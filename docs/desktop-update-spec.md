@@ -2,7 +2,8 @@
 
 This is the current-state contract for Grok Build Desktop updates. Phase 1
 (notice-only) shipped first. Phase 2 adds a real `electron-updater` download
-on macOS, Windows and Linux under the same rail affordance. Rules from phase 1 carry
+on macOS, Windows and Linux AppImage under the same rail affordance. Debian
+packages use a format-specific download notice. Rules from phase 1 carry
 unless a later section overrides them.
 
 The feed is **not** GitHub Releases. A vsix-only tag becomes GitHub's
@@ -19,22 +20,34 @@ The check lists GitHub Releases (`DESKTOP_RELEASES_API_URL`) and
 `noticeIfUpdateAvailable` picks the newest non-draft release that carries a
 desktop installer (`isDesktopInstallerAsset`: anchored
 `-mac-arm64.dmg` / `-mac-x64.dmg` / `-mac-arm64.zip` / `-mac-x64.zip` /
-`-win-x64.exe` / `-linux-x86_64.AppImage`; `.blockmap` and `.vsix` do not count). Pre-releases count.
+`-win-x64.exe` / `-linux-x86_64.AppImage` / `-linux-amd64.deb`; `.blockmap` and `.vsix` do not count). Pre-releases count.
 The running version is compared with `isNewerVersion` (numeric semver, not
 string order).
 
 When newer, the host posts a host-local `updateAvailable` frame
-`{ version, url }`. The URL is always `desktopUpdatePageUrl(current)` —
+`{ version, url }`. For Windows, macOS and AppImage, the URL is `desktopUpdatePageUrl(current)` —
 `https://afkpilot.com/desktop-update?from=<version>` — never the GitHub
 release page. The rail button says **Update available**; the panel opens
 that page (`openUpdateRelease`, host-local inbound).
+
+For a packaged Linux `.deb`, `readLinuxPackageType` reads the installed
+`/opt/grok-build-desktop/resources/package-type` before any updater is
+constructed. The notice checks only releases with the exact
+`Grok-Build-Desktop-<version>-linux-amd64.deb`
+asset and opens that asset at
+`https://github.com/phuryn/grok-build-vscode/releases/download/<tag>/<filename>`.
+The host constructs the URL from the matched tag and filename; a partial
+release with only another platform's installers does not qualify. Install
+with `sudo apt install ./<filename>.deb` to upgrade in place. No APT repository
+is registered. There is no background download, install on quit, or restart
+button for Debian packages. Check failures remain silent.
 
 No persistent state beyond an in-memory pending notice re-posted after a
 document reload. VS Code never sends the frame.
 
 ## Phase 2 — in-app download
 
-Packaged Windows, macOS and Linux builds download in the background through
+Packaged Windows, macOS and Linux AppImage builds download in the background through
 `electron-updater` and install on quit or when the user clicks the same
 rail button, now labelled **Restart to update**.
 
@@ -51,13 +64,31 @@ Do **not** use the GitHub provider. Point `electron-updater` at:
 Those paths are `desktopUpdateFeedBase` / `desktopUpdateFeedConfig` in
 `src/desktop/app-update.ts`.
 
-**Linux shares the cloud host's artifact, and that is safe without a check.**
+**Linux shares the cloud host's AppImage, and that is safe without a check.**
 One AppImage is attached per release; cloud machines extract it and exec
 `squashfs-root`, desks run the file. `AppImageUpdater.isUpdaterActive()`
 returns false when `process.env.APPIMAGE` is unset, which is exactly the
-extracted case — so a cloud machine's `checkForUpdates()` resolves null with a
+extracted case, so a cloud machine's `checkForUpdates()` resolves null with a
 log line, emits no error and posts no notice, and cannot self-update out from
-under the relay's `refresh-sprite-hosts.mjs`. Only a desk run reaches the feed.
+under the relay's `refresh-sprite-hosts.mjs`. Only a desk run of the AppImage
+reaches the feed.
+
+A `.deb` is attached as well. `scripts/build-linux.cjs` runs electron-builder
+once per format in separate output trees, overriding `productName` only for
+the Debian run to install under `/opt/grok-build-desktop`. The AppImage's
+product name and both formats' packaged `package.json` stay unchanged.
+FpmTarget writes `resources/package-type` with `deb` only in its own tree; target scheduling
+cannot put it in the AppImage. The build and release gate inspect the real
+squashfs and fail if the marker is present. An AppImage consequently stays
+on `AppImageUpdater`, which filters the channel by extension.
+
+Without our package-format guard, electron-updater would select `DebUpdater`
+for the `.deb` and try to elevate `dpkg -i` on quit. That beta path is not our
+update contract: it depends on a working graphical elevation helper and has
+not been verified end to end. `desktopAutoUpdateEnabled` disables it before
+construction, choosing the direct `.deb` notice above. Unknown or unreadable
+package markers also disable automatic installation; a missing marker is the
+normal AppImage layout.
 
 Before the Linux channel existed the client fell back to the phase-1 notice,
 which fired anyway — `pickLatestDesktopRelease` matches the mac and Windows
@@ -102,8 +133,12 @@ list **both** zip archives (`…-mac-arm64.zip` and `…-mac-x64.zip`).
 Squirrel.Mac updates from the zip, not the dmg. A yml that only has one
 arch is a failed build, not a feed the relay should publish. Linux
 `latest-linux.yml` must list `Grok-Build-Desktop-<version>-linux-x86_64.AppImage`
-— note `x86_64`, not the `x64` every other target uses. An AppImage embeds its
-own block map, so there is no sibling `.blockmap` to require or exclude.
+as `path` (note `x86_64` for the AppImage, `amd64` for the Debian package, and `x64` for the Windows and macOS x86-64 targets) and must also
+list `Grok-Build-Desktop-<version>-linux-amd64.deb` in `files`. The legacy
+`path` field stays the AppImage so a client that does not filter by extension
+does not install the deb as if it were the AppImage. Rewrite every `files[]`
+URL, including the deb. An AppImage embeds its own block map, so there is no
+sibling `.blockmap` to require or exclude. The deb has none either.
 
 A vsix-only release is not a desktop latest. Keep serving the previous
 installer-bearing yml until a new desktop build is attached.
@@ -141,7 +176,17 @@ files are generated**. Every `dist*` script still passes `--publish never`.
 GitHub upload stays in `.github/workflows/desktop-release.yml`, which
 attaches `dist-desktop/latest.yml`, `dist-desktop/latest-mac.yml` and
 `dist-desktop/latest-linux.yml`
-alongside the installers.
+alongside the installers. Linux builds merge the two isolated channel files,
+preserving artifact hashes/sizes and explicitly retaining the AppImage's
+legacy `path`/`sha512`. `verify-linux-deb.sh` requires the feed, checks its
+version, exact filenames, file sizes and actual SHA-512 hashes, and rejects
+extra AppImages or debs. The release Linux job runs on `ubuntu-24.04` and gates
+both artifact and release uploads on those checks, Debian/Ubuntu install,
+upgrade and removal, and `verify-linux-sandbox.sh`. That last check explicitly
+enables AppArmor's unprivileged-userns restriction, requires an ordinary
+AppImage launch to fail with the SUID-helper error, then requires a normal
+installed `.deb` launch to show its window with a namespace-isolated Chromium
+zygote. Neither launch passes a sandbox-disabling switch. Packaging CI uses the same gates.
 
 macOS builds both arches in **one** `electron-builder --mac` invocation
 (`dist:mac`). The workflow then asserts `latest-mac.yml` contains both
@@ -150,7 +195,7 @@ drop the first arch (electron-builder issue #5592).
 
 ### Client behaviour
 
-1. Packaged win32/darwin/linux: configure the generic feed, `autoDownload = true`,
+1. Packaged Windows/macOS/AppImage: configure the generic feed, `autoDownload = true`,
    `autoInstallOnAppQuit = true`. Check after first paint and every 12 h.
 2. Update found: download in the background. **No dialog. No button yet.**
    The agent may be mid-turn.
@@ -161,7 +206,8 @@ drop the first arch (electron-builder issue #5592).
 4. Check or download fails (offline, 404, malformed yml, hash mismatch,
    network drop): log only, then run the phase-1 GitHub notice. The rail
    shows **Update available** and opens the download page.
-5. Unpackaged `npm run desktop`, a missing feed, or an updater that declines
+5. Debian installs use the direct-package notice above. Unpackaged
+   `npm run desktop`, a missing feed, or an updater that declines
    to act: phase-1 notice only. The third case is Linux-specific and is NOT an
    error — `checkForUpdates()` resolves null without throwing when
    `process.env.APPIMAGE` is unset, so the check path treats a null result the

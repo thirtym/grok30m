@@ -18,6 +18,7 @@ Asset names are stable so a landing page can link them by version:
 | macOS | arm64 / x64 (archive) | `Grok-Build-Desktop-<version>-mac-arm64.zip` / `…-mac-x64.zip` |
 | Windows | x64 | `Grok-Build-Desktop-<version>-win-x64.exe` |
 | Linux | x86_64 (AppImage) | `Grok-Build-Desktop-<version>-linux-x86_64.AppImage` |
+| Linux | amd64 (Debian package) | `Grok-Build-Desktop-<version>-linux-amd64.deb` |
 
 Example for version `3.1.0`:
 
@@ -25,12 +26,37 @@ Example for version `3.1.0`:
 - `Grok-Build-Desktop-3.1.0-mac-x64.dmg`
 - `Grok-Build-Desktop-3.1.0-win-x64.exe`
 - `Grok-Build-Desktop-3.1.0-linux-x86_64.AppImage`
+- `Grok-Build-Desktop-3.1.0-linux-amd64.deb`
 
-**Note the Linux arch spelling.** electron-builder writes `x86_64` for AppImage
-targets and `x64` for every other one, so anything matching installer names by
-pattern needs both spellings. There is exactly one AppImage per release — see
+**Note the Linux arch spelling.** For x86-64, electron-builder writes `x86_64` for the
+AppImage, `amd64` for the Debian package, and `x64` for every other target, so
+anything matching installer names by pattern needs all three spellings. There
+is exactly one AppImage per release. See
 [Running in a cloud environment](cloud-environments.md) for why adding a second
-would break the fleet tooling.
+would break the fleet tooling. The `.deb` is a different filename and does not
+count as a second AppImage.
+
+On Debian and Ubuntu, install the package with
+`sudo apt install ./Grok-Build-Desktop-<version>-linux-amd64.deb` (or double-click
+it). The package name is `grok-build-desktop`. It installs the binary under
+`/opt/grok-build-desktop`, links `/usr/bin/grok-build-desktop`, and registers
+`grok-build-desktop.desktop` in the application menu. Remove it with
+`sudo apt remove grok-build-desktop`. A newer package upgrades in place.
+
+**Use the `.deb` on Ubuntu 24.04 and later.** Ubuntu restricts unprivileged
+user namespaces through AppArmor. Chromium's fallback helper cannot acquire
+root ownership inside a user's AppImage mount, so that format aborts at launch
+(#213). The Debian post-install script sets `/opt/grok-build-desktop/chrome-sandbox`
+to `root:root`, mode `4755`, on every install and upgrade. Failure fails the
+installation. Chromium can then use its setuid sandbox fallback; the package
+does not disable the sandbox or change the system's user-namespace policy.
+No AppArmor profile is added. Removing the package removes the helper and its
+alternatives registration as well as the menu entry and icon.
+The install directory has no spaces because Chromium splits the setuid-helper
+wrapper path on spaces when launching its zygote.
+
+The AppImage remains the single-file download for systems permitting user
+namespaces. It needs FUSE (`libfuse2` on Debian, `libfuse2t64` on Ubuntu 24.04+).
 
 ## Closing the window
 
@@ -54,7 +80,7 @@ npm install
 npm run compile          # required; electron-builder packs out/ + media/ + resources/
 
 npm run dist:win         # Windows x64 NSIS installer → dist-desktop/
-npm run dist:linux       # Linux x86_64 AppImage (must run on Linux)
+npm run dist:linux       # Linux x86_64 AppImage and amd64 .deb (must run on Linux)
 npm run dist:mac         # macOS arm64 + x64 dmg + zip (must run on macOS)
 npm run dist             # current host's default targets
 npm run dist:dir         # unpacked dir only (fast layout check; no installer)
@@ -63,6 +89,37 @@ npm run dist:dir         # unpacked dir only (fast layout check; no installer)
 Artifacts land in `dist-desktop/` (gitignored). The VS Code VSIX path is unchanged:
 `npm run package` still produces `grok-vscode-phuryn-<version>.vsix` and still
 excludes all desktop sources via `.vscodeignore`.
+
+`dist:linux` builds each format in an isolated unpacked tree, merges their
+channel entries with the AppImage as `path`, and inspects the actual squashfs
+to reject any AppImage containing `resources/package-type`. Only the Debian
+build overrides electron-builder's `productName` to `grok-build-desktop` to
+select its install directory; the AppImage keeps the shared configuration.
+The menu name remains `Grok Build Desktop`, `StartupWMClass` remains
+`Grok Build Desktop (Community)`, and `main.ts` sets the app name and
+`GrokBuildDesktop` settings directory independently of builder metadata.
+The packaged `package.json` is identical in both formats. Linux build hosts
+need `squashfs-tools` and `desktop-file-utils` in addition to Node 20 and npm.
+The release and packaging CI jobs also test Debian 12 / Ubuntu 24.04 package
+lifecycle and native Ubuntu 24.04 sandbox launch before upload.
+
+On Windows with Docker Desktop, run:
+
+```powershell
+powershell -NoProfile -File scripts/build-verify-linux.ps1
+```
+
+It builds from the current working tree in `node:20-bookworm`, checks the
+AppImage and feed, then installs, upgrades from a synthetic earlier package,
+removes and purges in `ubuntu:24.04` and `debian:12`. The predecessor uses the
+same payload with an earlier Debian version because no earlier `.deb` has
+been published. Before upgrading, the test sets the helper to `0755` to check
+that installation repairs it. Results are printed and artifacts are kept in
+`dist-desktop/linux-verify-<id>/`. Container success does not prove AppArmor:
+`scripts/verify-linux-sandbox.sh` runs on the native `ubuntu-24.04` CI runner,
+requires the AppImage's SUID failure, then requires a visible installed app
+and a Chromium zygote in a nested PID namespace, without sandbox-disabling
+flags. It explicitly sets `kernel.apparmor_restrict_unprivileged_userns=1`.
 
 **If `dist:win` fails on `Cannot create symbolic link` (local Windows only):**
 electron-builder downloads its `winCodeSign` bundle for `rcedit` / `signtool`,
@@ -82,7 +139,7 @@ privilege so the normal download path works.
 
 ### Cross-build limits
 
-| From → produces | Windows installer | macOS installers | Linux AppImage |
+| From → produces | Windows installer | macOS installers | Linux AppImage and .deb |
 |---|---|---|---|
 | **Windows** | yes (`dist:win`) | **no** | **no** |
 | **macOS** | possible* | yes (`dist:mac`, both archs) | possible* |
@@ -165,13 +222,22 @@ cert is available.
 
 ## Auto-update
 
-Packaged Windows, macOS and Linux builds check a relay-served generic feed
+Packaged Windows, macOS and Linux AppImage builds check a relay-served generic feed
 (`https://afkpilot.com/update/win/latest.yml`, `…/mac/latest-mac.yml` and
 `…/linux/latest-linux.yml`) on start and every 12 hours, download in the
 background, and install on quit or when the rail button says **Restart to
 update**. Check or download failure is silent and falls back to the
 **Update available** notice (opens `https://afkpilot.com/desktop-update`).
 No GitHub provider — a vsix-only release would stall that feed.
+
+**Debian packages use a download notice.** The host reads the `deb` marker
+from `resources/package-type` before constructing an updater. It checks for
+the newest non-draft GitHub release with a matching amd64 `.deb`, then shows
+**Update available**, which opens that exact package's download URL. Install
+the downloaded package with `sudo apt install ./<filename>.deb`. There is no
+background package download, install on quit, or **Restart to update** promise
+for this format. This avoids relying on DebUpdater's beta desktop-elevation
+path. Unreadable package markers also disable automatic installation.
 
 **Linux serves the same AppImage the cloud machines install, and needs no cloud
 check to stay safe.** `AppImageUpdater.isUpdaterActive()` returns false unless
