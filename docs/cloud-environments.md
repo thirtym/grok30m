@@ -66,7 +66,7 @@ remote.
 
 ### Signing in, and signing out
 
-Connecting an agent uses the device-code flow that any remote client uses
+Connecting Grok, Codex, Claude Code or Muse uses the device-code flow that any remote client uses
 (shipped 3.19.0 — see [Signing agents in](provider-login.md)). It has to work:
 there is no desk to fall back to, so a cloud environment with nothing connected
 could otherwise never be made usable.
@@ -141,3 +141,16 @@ is confined to its own build tree; the release gate rejects an AppImage carrying
 the AppImage is named `grok-build-desktop`. Hosts that run the AppImage file,
 or `AppRun` after extracting it, still use that entry point; process probes
 continue to see `grok-build-desktop`.
+
+Antigravity and DeepSeek are offered on cloud machines too. With `remoteSetup`
+advertised in `providerState`, a phone can install the managed runtime on demand,
+paste an API key into host secret storage, and Sign out to remove credentials.
+Antigravity Sign out clears both its stored key and any stored Google sign-in;
+DeepSeek Sign out deletes its stored key.
+No runtime is added to machine startup. A cloud host advertising
+`googleSignInPaste: true` also offers Google sign-in from a phone. Open the link
+and sign in; the loopback page will not load on the phone. Copy its whole address
+into the card within five minutes. The host validates the state and port against
+this run's link, then forwards the path and query only to its own 127.0.0.1 port.
+The one-time code is neither logged nor saved by the client. Older cloud hosts
+keep the key and stored-sign-in routes. Remote desks cannot start this flow.

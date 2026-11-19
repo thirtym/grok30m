@@ -6,12 +6,15 @@
  * files. The key lives only in a fake HostSecrets.
  */
 import * as fs from "node:fs";
+import * as http from "node:http";
+import { EventEmitter } from "node:events";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GrokSidebar } from "../src/sidebar";
 import { Session } from "../src/session";
 import { CLOUD_ENVIRONMENT_ENV } from "../src/remote-frames";
+import { AGY_PASTE_ADDRESS_ERROR } from "../src/agy-auth";
 
 const FAKE = path.join(__dirname, "fixtures", "fake-agy-acp.cjs");
 const KEY = "AIza-host-test-key";
@@ -40,7 +43,10 @@ function host(opts: { connected?: boolean; experimental?: boolean; method?: "goo
   sidebar.deviceLoginWork = new Set();
   sidebar.deviceLoginWorkSeq = 0;
   sidebar.refreshKeepAwake = vi.fn();
-  sidebar.remoteClients = { detachedActiveValues: () => [], clients: () => [], tabToken: () => undefined, cwdIfPresent: () => undefined };
+  sidebar.captureRemoteRequester = () => ({ clientId: "phone", tabToken: "tab" });
+  sidebar.sendRemoteRequester = vi.fn();
+  sidebar.sendRemoteClient = vi.fn();
+  sidebar.remoteClients = { active: () => session, cwd: () => home, detachedActiveValues: () => [], clients: () => [], tabToken: () => undefined, cwdIfPresent: () => undefined };
   sidebar.locateProvider = vi.fn(() => FAKE);
   sidebar.locatedProviders = () => ({ agy: true });
   sidebar.workspaceRoot = vi.fn(() => home);
@@ -101,11 +107,11 @@ afterEach(() => {
 });
 
 describe("Antigravity in providerState", () => {
-  it("is advertised at a desk with the experimental setting, with Disconnect semantics", () => {
+  it("is advertised with remote setup and Disconnect semantics", () => {
     const sidebar = host({ connected: true });
     sidebar.providerCliVersions = { agy: "1.4.0" };
     sidebar.providerNeedsLogin = { agy: true };
-    expect(row(sidebar)).toEqual({ id: "agy", connected: true, keepsCliSignIn: true, cliVersion: "1.4.0", needsLogin: true, signInMethod: "google" });
+    expect(row(sidebar)).toEqual({ id: "agy", connected: true, keepsCliSignIn: true, cliVersion: "1.4.0", needsLogin: true, signInMethod: "google", remoteSetup: true, googleSignIn: true });
   });
 
   it("names the way it is signed in and what is stored, never the key", async () => {
@@ -116,12 +122,12 @@ describe("Antigravity in providerState", () => {
     expect(JSON.stringify(GrokSidebar.prototype["providerStateMessage"].call(sidebar))).not.toContain(KEY);
   });
 
-  it("is not advertised without the setting, or on a cloud machine", () => {
+  it("is advertised without the retired setting and on a cloud machine", () => {
     const off = host({ connected: true, experimental: false });
-    expect(GrokSidebar.prototype["providerStateMessage"].call(off).providers.map((p: any) => p.id)).not.toContain("agy");
+    expect(GrokSidebar.prototype["providerStateMessage"].call(off).providers.map((p: any) => p.id)).toContain("agy");
     vi.stubEnv(CLOUD_ENVIRONMENT_ENV, "1");
     const cloud = host({ connected: true });
-    expect(GrokSidebar.prototype["providerStateMessage"].call(cloud).providers.map((p: any) => p.id)).not.toContain("agy");
+    expect(GrokSidebar.prototype["providerStateMessage"].call(cloud).providers.map((p: any) => p.id)).toContain("agy");
   });
 
   it("notes the server's version from its handshake", () => {
@@ -136,21 +142,31 @@ describe("Antigravity in providerState", () => {
   it("an Antigravity conversation that cannot start gets a card a renderer will draw", () => {
     const off = host({ experimental: false });
     off.usableProviders = () => ["grok"];
-    // Renderers draw no card for an unadvertised `agy`, so the refusal must not name it.
-    expect(off.refusedStartOnboarding("agy")).toEqual({ state: "connect-agent" });
+    expect(off.refusedStartOnboarding("agy")).toEqual({ state: "missing-agy", provider: "agy" });
     const on = host();
     on.usableProviders = () => ["grok", "agy"];
     expect(on.refusedStartOnboarding("agy")).toEqual({ state: "missing-agy", provider: "agy" });
   });
 
-  it("turns the experiment on and off from the Settings toggle, globally", async () => {
+  it("ignores retired experimental controls from an old client", async () => {
     const sidebar = host();
     await sidebar.onMessage({ type: "setExperimentalAntigravity", value: true }, "local");
     await sidebar.onMessage({ type: "setExperimentalAntigravity", value: false }, "local");
-    expect(sidebar.configUpdate.mock.calls).toEqual([
-      ["experimentalAntigravity", true, "global"],
-      ["experimentalAntigravity", false, "global"],
-    ]);
+    expect(sidebar.configUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe("remote key secrecy", () => {
+  it.each(["none", "store", "connect"])("does not echo the key in frames or logs, including failure=%s", async failure => {
+    const sidebar = host();
+    if (failure === "store") sidebar.context.secrets.store.mockRejectedValue(new Error(KEY));
+    if (failure === "connect") sidebar.adoptSessionsForConnectedProvider.mockRejectedValue(new Error(KEY));
+    await sidebar.onMessage({ type: "agySignIn", method: "api-key", key: KEY }, "remote", "phone");
+    const outbound = [...frames(sidebar.post), ...frames(sidebar.postLocal), ...sidebar.sendRemoteRequester.mock.calls.map((c: any[]) => c[1]), ...sidebar.sendRemoteClient.mock.calls.map((c: any[]) => c[1]), sidebar.providerStateMessage()];
+    expect(JSON.stringify(outbound)).not.toContain(KEY);
+    expect(JSON.stringify(sidebar.host.appendLine.mock.calls)).not.toContain(KEY);
+    expect(sidebar.host.createTerminal).not.toHaveBeenCalled();
+    if (failure === "none") expect(sidebar.sendRemoteRequester).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ state: "provider-connected" }));
   });
 });
 
@@ -166,7 +182,7 @@ describe("Connect offers the choice of how to sign in", () => {
     expect(sidebar.adoptSessionsForConnectedProvider).not.toHaveBeenCalled();
   });
 
-  it("answers a missing server with the install panel, at the desk only", async () => {
+  it("answers a missing server with the install panel", async () => {
     const sidebar = host();
     sidebar.locateProvider = vi.fn(() => undefined);
     await sidebar.onMessage({ type: "runGrokLogin", provider: "agy" }, "local");
@@ -177,24 +193,127 @@ describe("Connect offers the choice of how to sign in", () => {
     expect(sidebar.providerConnectionState.agy).toBeUndefined();
   });
 
-  it("installs only on a local request", async () => {
+  it("accepts local and remote install requests", async () => {
     const sidebar = host();
     sidebar.installManagedAgyServer = vi.fn(async () => {});
     await sidebar.onMessage({ type: "installAgy" }, "remote");
-    expect(sidebar.installManagedAgyServer).not.toHaveBeenCalled();
-    await sidebar.onMessage({ type: "installAgy" }, "local");
     expect(sidebar.installManagedAgyServer).toHaveBeenCalledTimes(1);
+    await sidebar.onMessage({ type: "installAgy" }, "local");
+    expect(sidebar.installManagedAgyServer).toHaveBeenCalledTimes(2);
   });
 
-  it("ignores a sign-in choice that did not come from this computer", async () => {
+  it("accepts a remote key into host secret storage", async () => {
     const sidebar = host();
     await sidebar.onMessage({ type: "agySignIn", method: "api-key", key: KEY }, "remote");
-    expect(sidebar.secrets.size).toBe(0);
-    expect(sidebar.providerConnectionState.agy).toBeUndefined();
+    expect(sidebar.secrets.get("grok.agy.geminiApiKey")).toBe(KEY);
+    expect(sidebar.providerConnectionState.agy).toBe(true);
   });
 });
 
 describe("Sign in with Google", () => {
+  it("refuses browser sign-in from a remote desk but may adopt an existing token", async () => {
+    const sidebar = host();
+    sidebar.startDeviceLogin = vi.fn();
+    await sidebar.onMessage({ type: "agySignIn", method: "google" }, "remote", "phone");
+    expect(sidebar.startDeviceLogin).not.toHaveBeenCalled();
+    expect(sidebar.providerConnectionState.agy).toBeUndefined();
+    expect(row(sidebar)).not.toHaveProperty("googleSignInPaste");
+    expect(sidebar.sendRemoteRequester).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ agyChoice: true, reason: expect.stringContaining("API key") }));
+    signIn();
+    await sidebar.onMessage({ type: "agySignIn", method: "google" }, "remote", "phone");
+    expect(sidebar.providerConnectionState.agy).toBe(true);
+    expect(sidebar.startDeviceLogin).not.toHaveBeenCalled();
+    expect(sidebar.sendRemoteRequester).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ state: "provider-connected" }));
+  });
+
+  it.each(["local", "remote"])("a cloud host starts paste sign-in from %s and advertises it", async origin => {
+    vi.stubEnv(CLOUD_ENVIRONMENT_ENV, "1");
+    const sidebar = host(); sidebar.startDeviceLogin = vi.fn();
+    await sidebar.onMessage({ type: "agySignIn", method: "google" }, origin, origin === "remote" ? "phone" : undefined);
+    expect(sidebar.startDeviceLogin).toHaveBeenCalledWith("agy", FAKE, origin === "remote" ? "phone" : undefined, { remote: origin === "remote" });
+    expect(row(sidebar)).toMatchObject({ remoteSetup: true, googleSignIn: false, googleSignInPaste: true });
+    sidebar.startDeviceLogin.mockClear();
+    signIn();
+    await sidebar.onMessage({ type: "agySignIn", method: "google" }, origin, origin === "remote" ? "phone" : undefined);
+    expect(sidebar.startDeviceLogin).not.toHaveBeenCalled();
+    expect(sidebar.providerConnectionState.agy).toBe(true);
+  });
+
+  it("the device runner also refuses a direct remote desk request", async () => {
+    const sidebar = host({ connected: true });
+    sidebar.agySignInClient = vi.fn();
+    await sidebar.startDeviceLogin("agy", FAKE, "phone", { remote: true });
+    expect(sidebar.agySignInClient).not.toHaveBeenCalled();
+    expect(sidebar.deviceLogins.size).toBe(0);
+  });
+
+  it.each([false, true])("keeps callback codes out of the ACP log on cloud=%s", cloud => {
+    vi.stubEnv(CLOUD_ENVIRONMENT_ENV, cloud ? "1" : "");
+    const sidebar = host();
+    const client = sidebar.agySignInClient(FAKE, new AbortController().signal);
+    client.opts.log("[stderr] GET /?code=sentinel-callback-code");
+    if (cloud) expect(sidebar.host.appendLine).not.toHaveBeenCalled();
+    else expect(sidebar.host.appendLine).toHaveBeenCalledWith("[stderr] GET /?code=sentinel-callback-code");
+  });
+
+  it("sanitizes an unexpected callback submission exception before the remote error handler", async () => {
+    const sidebar = host({ connected: true });
+    sidebar.deviceLogins.set("agy", { handle: { submitCode: () => { throw new Error("sentinel-callback-code"); } } });
+    await sidebar.onMessage({ type: "submitDeviceLoginCode", provider: "agy", code: "http://127.0.0.1:43210/?code=sentinel-callback-code" }, "remote", "phone");
+    expect(JSON.stringify(sidebar.sendRemoteClient.mock.calls)).not.toContain("sentinel-callback-code");
+    expect(JSON.stringify(sidebar.host.appendLine.mock.calls)).not.toContain("sentinel-callback-code");
+    expect(sidebar.sendRemoteClient).toHaveBeenCalledWith("phone", expect.objectContaining({ type: "error" }));
+  });
+
+  it("a phone's invalid paste stays waiting, then a valid callback adopts the stored Google token without echoing it", async () => {
+    vi.stubEnv(CLOUD_ENVIRONMENT_ENV, "1");
+    const sidebar = host();
+    let approve!: () => void;
+    const client = Object.assign(new EventEmitter(), {
+      start: vi.fn(async () => {}),
+      authenticate: vi.fn(() => new Promise<void>(resolve => { approve = resolve; })),
+      dispose: vi.fn(async () => {}),
+    });
+    sidebar.agySignInClient = () => client;
+    // Credential verification still uses the host's token-file check.
+    sidebar.reprobeProviderCredentials = vi.fn(async () => sidebar.agyGoogleSignedIn());
+    const callbacks: string[] = [];
+    const server = http.createServer((req, res) => {
+      callbacks.push(req.url!);
+      signIn();
+      res.end("Signed in");
+      approve();
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+    try {
+      await sidebar.onMessage({ type: "agySignIn", method: "google" }, "remote", "phone");
+      await vi.waitFor(() => expect(client.authenticate).toHaveBeenCalled());
+      const port = (server.address() as any).port;
+      const url = "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({ redirect_uri: `http://127.0.0.1:${port}/`, state: "this-run" });
+      client.emit("stderr", `Open the following link to authenticate the ACP server: ${url}\n`);
+      const device = () => sidebar.sendRemoteClient.mock.calls.map((c: any[]) => c[1].device).filter(Boolean).at(-1);
+      expect(device()).toMatchObject({ status: "waiting", needsCode: true, url });
+      const address = `http://127.0.0.1:${port}/?state=this-run&code=sentinel-callback-code&scope=email`;
+      await sidebar.onMessage({ type: "submitDeviceLoginCode", provider: "agy", code: address.replace("this-run", "wrong-run") }, "remote", "phone");
+      expect(device()).toMatchObject({ status: "waiting", submitted: false, message: AGY_PASTE_ADDRESS_ERROR });
+      expect(sidebar.deviceLogins.size).toBe(1);
+      expect(callbacks).toEqual([]);
+      await sidebar.onMessage({ type: "submitDeviceLoginCode", provider: "agy", code: address }, "remote", "phone");
+      expect(device()).toMatchObject({ status: "waiting", submitted: true });
+      await vi.waitFor(() => expect(device()).toEqual({ status: "done" }));
+      await vi.waitFor(() => expect(sidebar.adoptSessionsForConnectedProvider).toHaveBeenCalledWith("agy", sidebar.focused));
+      expect(callbacks).toEqual([new URL(address).pathname + new URL(address).search]);
+      expect(sidebar.providerNeedsLogin.agy).toBe(false);
+      const outbound = [...frames(sidebar.post), ...frames(sidebar.postLocal), ...sidebar.sendRemoteClient.mock.calls.map((c: any[]) => c[1]), ...sidebar.sendRemoteRequester.mock.calls.map((c: any[]) => c[1]), sidebar.providerStateMessage()];
+      expect(JSON.stringify(outbound)).not.toContain("sentinel-callback-code");
+      expect(JSON.stringify(sidebar.host.appendLine.mock.calls)).not.toContain("sentinel-callback-code");
+      expect(sidebar.host.createTerminal).not.toHaveBeenCalled();
+    } finally {
+      sidebar.deviceLogins.get("agy")?.handle.cancel();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
   it("adopts a stored Google sign-in without starting a server", async () => {
     signIn();
     const sidebar = host({ method: "api-key" });

@@ -1,15 +1,14 @@
 # Antigravity over ACP
 
 Google's Antigravity is the fifth provider (`agy` internally; "Antigravity" on
-screen). It is **experimental and desk-only**: offered only with
-`grok.experimentalAntigravity` on, never on a cloud machine
-(`GrokSidebar.agyOffered`), and every renderer surface keys off the host naming
-`agy` in `providerState`, the way Muse is gated. The setting is a switch in
-Settings -> Advanced (`setExperimentalAntigravity`, host-local, written
-globally); the switch reads its state from that same `providerState`, so it
-needs no frame of its own and is hidden on a remote.
+screen). Offered on desktops and cloud machines, starting disconnected.
+Every renderer surface keys off `agy` in `providerState`; `remoteSetup: true`
+enables remote managed installation and API-key setup. An older host without
+that capability keeps the computer-only instructions. There is no experimental
+setting.
 
-Measured against `agy_acp_server` **1.4.0** on Windows 11, 2026-10-14 and -15.
+Measured against `agy_acp_server` **1.4.0** on Windows 11, 2026-10-14 and -15,
+and Google sign-in on a Linux cloud host, 2026-11-11.
 The server's Python source (unpacked from the Linux bundle) was read rather than
 guessed at; handler names below are its own. The choices that rest on 1.4.0's
 behaviour, and what should make us look again, are collected at the end under
@@ -86,13 +85,13 @@ aistudio.google.com/apikey). Vertex AI and Enterprise sign-in are not offered.
   a relay the host runs on 127.0.0.1 (`agy-key-relay.ts`), and the relay alone
   holds the key. The server is spawned with `AGY_ACP_ENABLE_GATEWAY_AUTH=1` and
   authenticates `{methodId: "gateway", _meta: {gateway: {baseUrl:
-  "http://127.0.0.1:<port>/<prefix>"}}}`; no key reaches it. Why gateway mode
+  "http://127.0.0.1:<port>/<prefix>/<lease>"}}}`; no key reaches it. Why gateway mode
   and why a relay are under [Decisions to revisit](#decisions-to-revisit).
   The host keeps the key in HostSecrets (`grok.agy.geminiApiKey`: VS Code
   SecretStorage, or the desktop's safe storage) and in the relay's memory while
   a key's server runs -- not settings, state, logs, telemetry or
-  `providerState`, which carries only which ways are saved. `agySignIn` is
-  host-local and refused from a remote. Gateway auth is per connection and,
+  `providerState`, which carries only which ways are saved. `agySignIn` accepts
+  write-only key submission from local and remote clients. Gateway auth is per connection and,
   unlike the other methods, never written to the shared `settings.json`.
 - **Never put the key in the server's environment.** The server's environment
   reaches the agent's shell commands: a marker variable set on the spawn was
@@ -111,7 +110,7 @@ aistudio.google.com/apikey). Vertex AI and Enterprise sign-in are not offered.
   the same error from someone's code mid-reply is not a refusal of ours -- and
   the client emits `credentialRejected`; the host marks the account as needing
   sign-in and opens the choice again with "Google rejected this API key."
-- **Disconnect** keeps both the Google sign-in and the saved key; Connect then
+- **Disconnect at a desk** keeps both the Google sign-in and the saved key; Connect then
   offers the choice again, marking which way was last used and which are
   saved. **Sign out** (`AFK Pilot: Log Out`) clears only the current method's
   credential: for Google, ACP **`logout`** (the method name, measured against a
@@ -119,9 +118,29 @@ aistudio.google.com/apikey). Vertex AI and Enterprise sign-in are not offered.
   -32601), which clears the token and the saved method; for a key, the saved
   key is deleted. Settings' button only disconnects, as for every desk provider
   (#203).
-- Remote sign-in is refused before consent is recorded ("Connect Antigravity on
-  the computer first."): it would open a browser, or take a key, on an
-  unattended desk.
+- A remote desk may paste a key or adopt an existing Google sign-in
+  (`agyGoogleSignInPresent`), without starting `authenticate`. A local desk
+  still offers browser sign-in (`googleSignIn`). Cloud hosts additionally
+  advertise `googleSignInPaste`: `authenticate` prints the Google OAuth URL
+  with a random loopback redirect port, state and PKCE challenge, then waits
+  300 seconds. After signing in on the phone, its loopback page cannot load;
+  the person copies the whole address into the existing paste-code card.
+  `agySignInCallback` validates HTTP loopback, the printed port, code and state
+  before requesting the path/query at fixed 127.0.0.1. The server retains its
+  PKCE verifier and exchanges the code; Linux stores `acp_token.json`. Invalid
+  addresses keep waiting with a static message, expiry offers a fresh run.
+  Pasted addresses are never echoed or persisted; cloud sign-in ACP logs and
+  error output are suppressed because the server can print callback codes.
+  Absent `googleSignInPaste`, older cloud hosts keep their existing routes.
+- Installation and cancellation are `full` remote actions. Setup replies and
+  `agyInstallProgress` go to the requesting tab, including after reconnect.
+  Desk Disconnect preserves both credentials. Cloud Sign out removes the
+  saved API key and any stored Google sign-in through ACP `logout`, regardless
+  of the method last used. It never starts a browser or asks a host modal.
+- Key fields clear on submission and have no draft or retry storage. Known
+  offline submissions are refused before reaching the transport. The relay
+  client's outbox is outside this checkout: its exclusion of key messages,
+  including a socket-drop race, still requires verification.
 
 ## Sessions
 
@@ -140,8 +159,12 @@ aistudio.google.com/apikey). Vertex AI and Enterprise sign-in are not offered.
   the key -- 40 models for the key measured, Gemini 4 Argon among them -- with
   **no `thinking_level`** (a gateway's models are listed exactly as declared,
   `server.py` `_thinking_variants`), and a turn's generate call carries no
-  thinking config. So key mode has no effort control: `AgyBackend` sends none
-  and the picker shows none. The picker keeps the Gemini chat models (see the
+  thinking config. `AgyBackend` therefore offers Low / Medium / High only for
+  models whose API listing carries `thinking: true`; `agyThinkingLevel` maps
+  the person's default or live choice onto those three levels. Each server's
+  relay lease holds its own level, and the relay pins
+  `generationConfig.thinkingConfig.thinkingLevel` on generate calls without
+  an ACP `thinking_level` RPC or a restart. The picker keeps the Gemini chat models (see the
   model filter below), newest first, and a conversation with no remembered
   model starts on `gemini-4-argon`, else on the newest model offered
   (`AgyBackend.defaultModelId`).
@@ -257,8 +280,8 @@ excepted.
 
 ## Not in v1
 
-Cloud machines, MCP connectors, Plan mode, Vertex AI and Enterprise sign-in,
-signing in from a phone, a usage meter, effort control on a key, and a
+MCP connectors, Plan mode, Vertex AI and Enterprise sign-in,
+a usage meter, and a
 subagent card that shows its child's own words or result (its tool calls do
 show, see [Subagents](#subagents)).
 
@@ -312,7 +335,8 @@ observable change that should make us look again.
   spawned and closed when none remains. It replaces whatever credential arrives
   with the key and forwards only to `generativelanguage.googleapis.com`;
   anything without the prefix is 403. Its log names status, method and path,
-  never the key, the prefix, a query or a body, and the server's own output is
+  plus the applied thinking level on generate calls, never the key, the prefix,
+  a query or a body, and the server's own output is
   redacted for the prefix (it logs its gateway address).
 - **Why:** gateway mode cannot carry the key itself. The harness sends its own
   `x-goog-api-key: dummy_api_key` on every generate call (`server.py`
@@ -324,6 +348,18 @@ observable change that should make us look again.
   (`gateway/model_discovery.py` `_discovery_endpoints`) and for generate calls
   (measured against a local stand-in, with and without a trailing slash); the
   generate call is `POST <baseUrl>/v1beta/models/<model>:streamGenerateContent?alt=sse`.
+- **Key effort:** each lease adds its own path segment beneath the prefix;
+  its mutable level isolates concurrent conversations. Only generate bodies
+  with an explicit choice for a thinking model are buffered and rewritten;
+  other requests and generate responses stream. An existing thinking config
+  is replaced only by an explicit choice. A 400 whose JSON error message says
+  the thinking level is not supported retries once without `thinkingConfig`;
+  that model/level is skipped for later requests during this relay's life.
+  Other errors pass through. The owner's Gemini API benchmark accepted
+  low/medium/high for Carbon (2026-11-10) and Argon (2026-10-13), omitted ==
+  medium; Carbon refused minimal and silently mapped xhigh/max to its default.
+  The relay therefore never invents those extra tiers. Malformed JSON passes
+  through unchanged so the relay cannot discard a conversation's contents.
 - **Risk, including quota:** any process of the same user that learns the port
   and prefix can spend the key's quota while a key's server runs; the prefix
   is never written to our logs, and the agent's commands can already spend it
@@ -363,19 +399,27 @@ observable change that should make us look again.
 - **Revisit when:** Google fixes the workspace ordering (the smoke passes
   without the append), or the server lets a client name its working root.
 
-### Desk only, no MCP connectors, no Plan
+### Desktop and cloud setup; no MCP connectors or Plan
 
-- **Decision:** Antigravity is offered at a desk only, never on a cloud
-  machine or signed in from a phone; it gets `mcpServers: []`; it has no Plan
-  mode.
-- **Why:** signing in opens a browser or takes a key at the computer, which an
-  unattended desk cannot do; the server swaps its file tools for ours when a
-  client advertises fs, which is not the server measured here, and MCP through
-  it was not measured at all; `/plan` waits for a "Proceed" click ACP cannot
-  deliver.
-- **Risk:** the provider is narrower than the others.
-- **Revisit when:** a cloud machine has a way to sign in without a desk; the
-  server's MCP path is measured; ACP can deliver a plan approval.
+- **Decision:** offer Antigravity to everyone. Install and key entry work
+  locally or remotely. Cloud Google sign-in uses a pasted loopback address
+  (`googleSignInPaste`); remote desks may adopt only an existing sign-in.
+  `remoteSetup` gates install/key controls; each capability is additive so
+  older hosts keep their existing routes.
+- **Why:** a phone can supply a key or return Google's callback to the host,
+  removing the need for a person at its screen. The measured Linux OAuth flow
+  retains its PKCE verifier in the ACP process, so forwarding the validated
+  callback completes that same sign-in. Every remote already has full host
+  access; no key or callback is read back to any client.
+- **Verification limit:** the Linux server's Google OAuth URL, five-minute wait
+  and token path were measured on a cloud host. The complete phone paste flow
+  still needs a live run; unit tests cover validation, local HTTP, adoption,
+  routing, expiry and client persistence.
+- **Unchanged:** `mcpServers: []`, no Plan mode. Advertising client fs swaps
+  the server's file tools for ours; MCP through it is unmeasured; `/plan` waits
+  for a "Proceed" click ACP cannot deliver.
+- **Revisit when:** the server's MCP path is measured; ACP can deliver a plan
+  approval.
 
 ### How subagents are shown
 
