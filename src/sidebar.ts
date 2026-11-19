@@ -1,4 +1,5 @@
 import { decideDefaultModeCohort } from "./default-mode-cohort";
+import { workspaceGrokHome } from "./workspace-grok-home";
 import { parseContextWindowSize, type ContextWindowSelection } from "./context-selection";
 import { remoteHandoffUrl, remoteHandoffQr, type HandoffSession } from "./remote-handoff";
 import type { RemoteHandoffSource } from "./protocol";
@@ -84,7 +85,7 @@ import {
 } from "./routines";
 import { RoutineRunStore } from "./routine-store";
 import { routinesMessageForRemote } from "./remote-policy";
-import { PersistedState } from "./persisted-state";
+import { PersistedState, mementoWithout } from "./persisted-state";
 import {
   Session,
   SessionStartIntent,
@@ -117,6 +118,9 @@ import { pickSttBackend, resolveOpenAiVoiceKey, SttBackend, SttPreference, Voice
 import { OPENAI_STT_MODEL } from "./openai-voice";
 import { summarizeForSpeech } from "./speech-summary";
 import type { PromptResultMeta, PromptUsage, SessionInfoContext } from "./acp-dispatch";
+import { DeepSeekBackend, DEEPSEEK_COLD_REOPEN, type DeepSeekHarness } from "./deepseek-backend";
+import { DEEPSEEK_API_KEY_SECRET, deepseekKey, validDeepSeekKey, isDeepSeekCredentialError, deepseekPromptErrorText } from "./deepseek-auth";
+import { locateDeepSeek, installManagedDeepSeek, DEEPSEEK_VERSION } from "./deepseek-managed-installer";
 import { MediaRef, adapterCompactSignal, adapterContextOccupancy, agentTimestampMsFromMeta, autoCompactStartedNote, childStreamFromRoute, commandOutputForToolCall, commandOutputFromLiveTerminal, contextUsedFromCompactNotification, enforceCompleteSessionCost, errorDetail, gateZeroTokenMeta, isAuthErrorText, isCredentialError, isIncompatibleAgentError, isResumeNotFound, isRateLimitError, isSubagentLifecycleUpdate, occupancyFromAdapterTurn, parseSessionInfoContext, permissionOutcomeFor, promptErrorText, rateLimitNoticeText, sessionInfoCacheFresh, sumUsage, summarizeBackgroundCommand, usageIsRealMeasurement, type UpdateRoute } from "./acp-dispatch";
 import { createMcpPrepareState, prepareMcpToolCall } from "./mcp-tool";
 import { EFFORT_PREFS_KEY, MUSE_MODE_PREF_KEY, MUSE_ON_REQUEST_UNAVAILABLE, museSandboxUnavailable, museOnRequestUnavailable, resolvedDefaultMode, configWriteTarget, isMuseModeId, modeToRemember, rememberedEffort, sessionModes, startsInNativeAuto, startsInYolo, musePosture, museShellSandboxEnabled, usesClientAutoAccept, type ModeId, type MuseSettings, type EffortPrefs } from "./mode-prefs";
@@ -406,9 +410,6 @@ import {
   sessionCatalogDirs,
   sessionDirFor,
 } from "./sessions";
-import { shouldHideAutoSession } from "./session-tags";
-import { COMMUNITY_BASE_VERSION, COMMUNITY_RELEASES_PAGE } from "./community-sync";
-import { peekCommunityLag } from "./release-peek";
 import {
   base64DecodedByteLength,
   isTrustedCodexGeneratedImagePath,
@@ -813,10 +814,6 @@ export class GrokSidebar {
   private view?: HostWebviewView;
   /** Second local consumer of catalog-shaped host messages. Absent until resolved. */
   private projectsRail?: HostWebviewView;
-  /** Dedicated Sessions sidebar (Grok30m). Absent until that view resolves. */
-  private sessionsView?: HostWebviewView;
-  public static readonly panelType = "grok.panel";
-  public static readonly sessionsViewId = "grok.sessions";
   /** The session currently shown in the chat — one member of {@link pool}. */
   private focused = this.newLocalSession();
   /**
@@ -853,6 +850,10 @@ export class GrokSidebar {
   private adapterHistoryRuns?: Map<AcpProvider, Promise<void>>;
   private codexInstallAbort?: AbortController;
   private agyInstallAbort?: AbortController;
+  private deepseekInstallAbort?: AbortController;
+  private deepseekKeySource?: "environment" | "saved";
+  private deepseekSessionCache = new Map<string, SessionListEntry[]>();
+  private deepseekModelProbe?: Promise<void>;
   private providerConnectionState: ProviderConnections = {};
   private providerRuns = new Map<AcpProvider, AbortController>();
   private providerLoginAttempts = new Map<AcpProvider, AbortController>();
@@ -1099,7 +1100,7 @@ export class GrokSidebar {
     "setRoutinePaused",
     "runRoutineNow",
     "setShowThinking",
-    "setExperimentalAntigravity",
+    "setExperimentalAntigravity", "setExperimentalDeepSeek", "installDeepSeek", "cancelDeepSeekInstall", "deepseekConnect",
     "setAppPurpose",
     "setExpandCommandOutputs",
     "setSteerByDefault",
@@ -1109,6 +1110,7 @@ export class GrokSidebar {
     "setExpandDiffCard",
     "setSoundNotifications",
     "setProcessingSound",
+    "setInputNeededSound",
     "setReadRepliesAloud",
     "setSummarizeRepliesAloud",
     "setVoiceSendPhrase",
@@ -1310,7 +1312,9 @@ export class GrokSidebar {
       () => this.host.getConfiguration("grok").inspect("defaultMode"),
     );
     this.state = new PersistedState(
-      context.globalState,
+      // A home of its own keeps its own routines: never seeded from, nor
+      // written into, the globalState every other window shares.
+      workspaceGrokHome() ? mementoWithout(context.globalState, new Set([ROUTINES_KEY])) : context.globalState,
       path.join(resolveGrokHome(process.env), "client-state"),
       fs,
       (line) => this.host.appendLine(line),
@@ -1845,6 +1849,9 @@ export class GrokSidebar {
       });
       return this.agyServerPath;
     }
+    if (provider === "deepseek") return this.deepseekOffered() ? locateDeepSeek({
+      configuredPath: this.host.getConfiguration("grok").get<string>("deepseekPath", ""), storageRoot: this.context.globalStorageUri.fsPath,
+    }) : undefined;
     if (this.claudeCliPath && fs.existsSync(this.claudeCliPath)) return this.claudeCliPath;
     const located = locateClaudeCli({
       configuredPath: this.host.getConfiguration("grok").get<string>("claudeCliPath", ""),
@@ -1880,14 +1887,24 @@ export class GrokSidebar {
       muse: !!this.locateProvider("muse"),
       // Not offered reads as not installed, so nothing can run it.
       agy: this.agyOffered() && !!this.locateProvider("agy"),
+      deepseek: this.deepseekOffered() && !!this.locateProvider("deepseek"),
     };
   }
 
   /**
-   * Antigravity is experimental and desk-only: off unless
-   * `grok.experimentalAntigravity` is set, and never on a cloud machine. Every
-   * Antigravity surface keys off the host advertising it, so this is the gate.
+   * Experimental providers are desk-only. Their providerState advertisement
+   * is the renderer gate; cloud hosts never advertise either one.
    */
+  private deepseekOffered(): boolean {
+    return this.host?.getConfiguration?.("grok")?.get<boolean>("experimentalDeepSeek", false) === true && !isCloudEnvironment();
+  }
+
+  private async deepseekCredential() {
+    const credential = deepseekKey(process.env, await this.context.secrets.get(DEEPSEEK_API_KEY_SECRET));
+    this.deepseekKeySource = credential.source;
+    return credential;
+  }
+
   private agyOffered(): boolean {
     return this.host?.getConfiguration?.("grok")?.get<boolean>("experimentalAntigravity", false) === true
       && !isCloudEnvironment();
@@ -1904,7 +1921,7 @@ export class GrokSidebar {
     state: "connect-agent" | ReturnType<typeof missingProviderState>;
     provider?: AcpProvider;
   } {
-    if (provider === "agy" && !this.agyOffered()) return { state: "connect-agent" };
+    if (provider === "agy" && !this.agyOffered() || provider === "deepseek" && !this.deepseekOffered()) return { state: "connect-agent" };
     return {
       state: this.usableProviders().length ? missingProviderState(provider) : "connect-agent",
       provider,
@@ -1918,6 +1935,7 @@ export class GrokSidebar {
     if (provider === "codex") return { cache: this.codexSessionCache };
     if (provider === "muse") return { cache: this.museSessionCache ??= new Map() };
     if (provider === "agy") return { cache: this.agySessionCache ??= new Map() };
+    if (provider === "deepseek") return { cache: this.deepseekSessionCache ??= new Map() };
     if (provider === "claude") return { cache: this.claudeSessionCache };
     return undefined;
   }
@@ -1946,11 +1964,12 @@ export class GrokSidebar {
     }));
   }
 
-  private createProviderBackend(provider: AcpProvider): CodexBackend | ClaudeBackend | MuseBackend | AgyBackend | undefined {
+  private createProviderBackend(provider: AcpProvider, harness?: DeepSeekHarness): CodexBackend | ClaudeBackend | MuseBackend | AgyBackend | DeepSeekBackend | undefined {
     if (provider === "codex") return new CodexBackend();
     if (provider === "claude") return new ClaudeBackend();
     if (provider === "muse") return new MuseBackend(undefined, museSandboxUnavailable(isCloudEnvironment()));
     if (provider === "agy") return new AgyBackend();
+    if (provider === "deepseek") return new DeepSeekBackend({ storageRoot: this.context.globalStorageUri.fsPath, harness });
     return undefined;
   }
 
@@ -1986,7 +2005,7 @@ export class GrokSidebar {
    * something available the session's own provider is the specific gap to
    * close, so show that.
    */
-  private onboardingForSession(session: Session): "connect-agent" | "auth-required" | "codex-login" | "claude-login" | "muse-login" | "agy-login" {
+  private onboardingForSession(session: Session): "connect-agent" | "auth-required" | "codex-login" | "claude-login" | "muse-login" | "agy-login" | "deepseek-login" {
     if (session.hasHistory) return providerLoginState(session.provider);
     return this.usableProviders().length ? providerLoginState(session.provider) : "connect-agent";
   }
@@ -2088,6 +2107,52 @@ export class GrokSidebar {
     for (const session of this.remoteClients.detachedActiveValues()) rearm(session);
   }
 
+  private async invalidateDeepSeekModels(): Promise<void> {
+    this.providerRuns?.get("deepseek")?.abort();
+    this.providerRuns?.delete("deepseek");
+    this.deepseekModelProbe = undefined;
+    const { deepseek: _old, ...rest } = this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {});
+    await this.state.update(PROVIDER_MODEL_CACHE_KEY, rest);
+  }
+
+  /** On a renderer boot, only a first-ever catalog needs a probe. A cached one
+   *  already fills the picker and every real session refreshes it; probing
+   *  anyway starts a second dsh beside the conversation's own, and two ~18 s
+   *  boots beside the other agents' starts measured 64 s on a desk (2026-11-03). */
+  private warmDeepSeekCatalogOnBoot(): void {
+    if (this.state.get<ProviderModelCache>(PROVIDER_MODEL_CACHE_KEY, {}).deepseek?.models?.length) return;
+    void this.warmConnectedDeepSeekModels();
+  }
+
+  /** session/new discovers models without sending a prompt or proving the key. */
+  private warmConnectedDeepSeekModels(): Promise<void> {
+    if (!this.deepseekOffered() || !this.hasProviderConsent("deepseek")) return Promise.resolve();
+    if (this.deepseekModelProbe) return this.deepseekModelProbe;
+    const signal = this.providerRunSignal("deepseek");
+    const cliPath = this.locateProvider("deepseek");
+    if (!cliPath) return Promise.resolve();
+    const probe = (async () => {
+      const credential = await this.deepseekCredential();
+      signal.throwIfAborted();
+      const client = new AcpClient({ signal, cliPath, cwd: this.workspaceRoot() || this.projectHomeDir(),
+        env: { ...process.env, ...(credential.key ? { DEEPSEEK_API_KEY: credential.key } : {}) },
+        backend: this.createProviderBackend("deepseek"), log: () => {} });
+      try {
+        await client.start();
+        signal.throwIfAborted();
+        await client.newSession();
+        signal.throwIfAborted();
+        await this.cacheProviderModels("deepseek", client.availableModels, client.currentModelId);
+      } finally { await client.dispose(); }
+    })().catch(() => {
+      if (!signal.aborted) this.host.appendLine("[deepseek] Could not read the model catalog. Reconnect DeepSeek to retry.");
+    }).finally(() => {
+      if (this.deepseekModelProbe === probe) this.deepseekModelProbe = undefined;
+    });
+    this.deepseekModelProbe = probe;
+    return probe;
+  }
+
   private async warmConnectedCodexModels(requireProof = false): Promise<boolean> {
     if (!this.hasProviderConsent("codex")) return false;
     const signal = this.providerRunSignal("codex");
@@ -2177,6 +2242,11 @@ export class GrokSidebar {
   private async reprobeProviderCredentials(provider: AcpProvider, requireProof = false): Promise<boolean> {
     if (!this.hasProviderConsent(provider)) return false;
     const signal = this.providerRunSignal(provider);
+    if (provider === "deepseek") {
+      if (!this.deepseekOffered()) return false;
+      await this.warmConnectedDeepSeekModels();
+      return !!(await this.deepseekCredential()).key;
+    }
     // MSP exposes no credential-status operation. A catalog read cannot prove sign-in.
     if (provider === "muse") return false;
     // Antigravity's honest cheap answer is its stored sign-in. A probe process
@@ -2614,6 +2684,7 @@ export class GrokSidebar {
   private async deviceLoginCredentialReady(provider: AcpProvider, requireProof = false): Promise<boolean> {
     if (!this.hasProviderConsent(provider)) return false;
     const signal = this.providerRunSignal(provider);
+    if (provider === "deepseek") return this.reprobeProviderCredentials(provider, requireProof);
     if (provider === "muse") return this.providerCredentialFilePresent(provider);
     if (provider === "agy") return this.reprobeProviderCredentials(provider, requireProof);
     if (provider === "claude") {
@@ -2833,20 +2904,24 @@ export class GrokSidebar {
     });
   }
 
-  /** Download the pinned Antigravity server into extension storage. Desk only:
-   *  the message is host-local, and the gate keeps it off cloud machines. */
-  private async installManagedAgyServer(): Promise<void> {
-    if (this.agyInstallAbort || !this.agyOffered()) return;
-    if (this.locateProvider("agy")) {
-      this.postLocal({ type: "onboarding", state: "agy-login", provider: "agy", platform: process.platform });
+  /** Shared desk installer UI and progress for Antigravity and DeepSeek. */
+  private async installManagedAgyServer(provider: "agy" | "deepseek" = "agy"): Promise<void> {
+    if (provider === "agy" ? this.agyInstallAbort || !this.agyOffered() : this.deepseekInstallAbort || !this.deepseekOffered()) return;
+    if (this.locateProvider(provider)) {
+      this.postLocal({ type: "onboarding", state: providerLoginState(provider), provider, platform: process.platform });
+      return;
+    }
+    if (provider === "deepseek" && this.host.getConfiguration("grok").get<string>("deepseekPath", "").trim()) {
+      this.postLocal({ type: "onboarding", state: "missing-deepseek", provider, platform: process.platform,
+        reason: "The configured DeepSeek installation is incomplete or uses a different version. Correct grok.deepseekPath, or clear it to use the managed install." });
       return;
     }
     const controller = new AbortController();
-    this.agyInstallAbort = controller;
+    if (provider === "agy") this.agyInstallAbort = controller; else this.deepseekInstallAbort = controller;
     // One frame per percent: the archive arrives in thousands of chunks.
     let lastStep = "";
     try {
-      const binary = await installManagedAgy({
+      const binary = await (provider === "agy" ? installManagedAgy : installManagedDeepSeek)({
         storageRoot: this.context.globalStorageUri.fsPath,
         signal: controller.signal,
         onProgress: (phase, value) => {
@@ -2854,22 +2929,23 @@ export class GrokSidebar {
           const step = `${phase}:${percent}`;
           if (step === lastStep) return;
           lastStep = step;
-          this.postLocal({ type: "agyInstallProgress", phase, receivedBytes: value?.receivedBytes, totalBytes: value?.totalBytes });
+          this.postLocal({ type: "agyInstallProgress", provider, phase, receivedBytes: value?.receivedBytes, totalBytes: value?.totalBytes });
         },
       });
-      this.agyServerPath = binary;
+      if (provider === "agy") this.agyServerPath = binary;
       this.postProviderState();
-      this.postLocal({ type: "agyInstallProgress", phase: "idle" });
-      this.postLocal({ type: "onboarding", state: "agy-login", provider: "agy", platform: process.platform });
+      this.postLocal({ type: "agyInstallProgress", provider, phase: "idle" });
+      this.postLocal({ type: "onboarding", state: providerLoginState(provider), provider, platform: process.platform });
     } catch (error) {
       const reason = controller.signal.aborted
-        ? "Antigravity installation was cancelled."
-        : `Antigravity installation failed: ${errorDetail(error)}`;
-      this.host.appendLine(`[agy] managed install failed: ${reason}`);
-      this.postLocal({ type: "agyInstallProgress", phase: "idle", reason });
-      this.postLocal({ type: "onboarding", state: "missing-agy", platform: process.platform, reason, provider: "agy" });
+        ? providerDisplayName(provider) + " installation was cancelled."
+        : `${providerDisplayName(provider)} installation failed: ${errorDetail(error)}`;
+      this.host.appendLine(`[${provider}] managed install failed: ${reason}`);
+      this.postLocal({ type: "agyInstallProgress", provider, phase: "idle", reason });
+      this.postLocal({ type: "onboarding", state: missingProviderState(provider), platform: process.platform, reason, provider });
     } finally {
       if (this.agyInstallAbort === controller) this.agyInstallAbort = undefined;
+      if (this.deepseekInstallAbort === controller) this.deepseekInstallAbort = undefined;
     }
   }
 
@@ -2931,6 +3007,8 @@ export class GrokSidebar {
     return {
       type: "providerState",
       providers: [
+        ...(this.deepseekOffered() ? [{ id: "deepseek" as const, connected: connected.deepseek === true && located.deepseek === true, ...button,
+          keySource: this.deepseekKeySource, ...(needsLogin.deepseek ? { needsLogin: true } : {}), ...(located.deepseek ? { cliVersion: DEEPSEEK_VERSION } : {}) }] : []),
         { id: "muse", connected: museConnected, ...button,
           ...(museConnected && versions.muse ? { cliVersion: versions.muse } : {}),
           ...(needsLogin.muse ? { needsLogin: true } : {}) },
@@ -3053,7 +3131,7 @@ export class GrokSidebar {
         if (opts.credentials === true) await this.reprobeProviderCredentials(provider).catch(() => false);
         // Antigravity's version arrives with its handshake: there is no cheap
         // `--version` for a server that takes 15-25 s to start on Windows.
-        if (provider !== "grok" && provider !== "agy") await this.reprobeProviderVersion(provider);
+        if (provider !== "grok" && provider !== "agy" && provider !== "deepseek") await this.reprobeProviderVersion(provider);
       }));
     } finally {
       this.providerRefreshInFlight = false;
@@ -3340,6 +3418,19 @@ export class GrokSidebar {
         this.codexCliPath = undefined;
         this.postProviderState();
       }
+      if (e.affectsConfiguration("grok.deepseekPath") || e.affectsConfiguration("grok.experimentalDeepSeek")) {
+        this.deepseekInstallAbort?.abort();
+        void this.invalidateDeepSeekModels().then(() => this.warmConnectedDeepSeekModels());
+        for (const s of new Set([this.focused, ...this.pool, ...this.remoteClients.detachedActiveValues()])) {
+          if (s.provider === "deepseek") {
+            const client = this.detachClient(s); void client?.dispose();
+            s.priming = false; s.status = "idle";
+            this.emit(s, { type: "setBusy", value: false });
+          }
+        }
+        this.deepseekSessionCache?.clear(); this.adapterHistoryStamps?.delete("deepseek");
+        void this.deepseekCredential().then(() => this.postProviderState());
+      }
       if (e.affectsConfiguration("grok.agyServerPath") || e.affectsConfiguration("grok.experimentalAntigravity")) {
         this.agyServerPath = undefined;
         this.postProviderState();
@@ -3400,6 +3491,12 @@ export class GrokSidebar {
         this.post({
           type: "processingSound",
           value: this.host.getConfiguration("grok").get<boolean>("processingSound", false),
+        });
+      }
+      if (e.affectsConfiguration("grok.inputNeededSound")) {
+        this.post({
+          type: "inputNeededSound",
+          value: this.host.getConfiguration("grok").get<boolean>("inputNeededSound", false),
         });
       }
       if (e.affectsConfiguration("grok.readRepliesAloud")) {
@@ -3494,218 +3591,6 @@ export class GrokSidebar {
   /** Drop the rail handle when the view is disposed (or re-created). */
   disposeProjectsRailView(): void {
     this.projectsRail = undefined;
-  }
-
-  attachSessionsView(view: HostWebviewView): void {
-    this.sessionsView = view;
-    view.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [
-        Uri.joinPath(this.context.extensionUri, "media"),
-        Uri.joinPath(this.context.extensionUri, "resources"),
-      ],
-    };
-    view.webview.html = this.getSessionsHtml(view.webview);
-    view.webview.onDidReceiveMessage((raw) => {
-      void this.onSessionsMessage(raw as WebviewMsg);
-    });
-    this.postSessionsList();
-  }
-
-  private grokConfig(): { get<T>(key: string, defaultValue: T): T } | undefined {
-    const get = this.host?.getConfiguration;
-    if (typeof get !== "function") return undefined;
-    const cfg = get.call(this.host, "grok") as { get?: unknown } | undefined;
-    if (!cfg || typeof cfg.get !== "function") return undefined;
-    return cfg as { get<T>(key: string, defaultValue: T): T };
-  }
-
-  private usesPanelTabs(): boolean {
-    return this.grokConfig()?.get<"panel" | "sidebar">("preferredLocation", "panel") === "panel";
-  }
-
-  useSessionsSidebar(): boolean {
-    return this.grokConfig()?.get<boolean>("sessionsSidebar", true) ?? true;
-  }
-
-  hideAutoSessions(): boolean {
-    return this.grokConfig()?.get<boolean>("hideAutoSessions", true) ?? false;
-  }
-
-  private webviewFor(session: Session): HostWebview | undefined {
-    if (this.usesPanelTabs()) {
-      return session.panel?.webview
-        ?? (session === this.focused ? this.view?.webview : undefined);
-    }
-    return session === this.focused ? this.view?.webview : undefined;
-  }
-
-  async openPreferred(): Promise<void> {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else await this.host.revealChatView();
-    if (this.useSessionsSidebar()) {
-      try {
-        await this.host.revealChatView();
-      } catch { /* Sessions lives in its own activity-bar view */ }
-    }
-  }
-
-  openPanel(): void {
-    this.ensurePanelForSession(this.focused);
-  }
-
-  async openSidebar(): Promise<void> {
-    await this.host.revealChatView();
-  }
-
-  private postToSessions(message: HostMsg): void {
-    if (message.type !== "sessions" && message.type !== "sessionDot") return;
-    void this.sessionsView?.webview.postMessage(message);
-  }
-
-  private async onSessionsMessage(msg: WebviewMsg): Promise<void> {
-    switch (msg.type) {
-      case "sessionsReady":
-        this.postSessionsList();
-        break;
-      case "listSessions":
-        this.postSessionsList({
-          offset: msg.offset,
-          limit: msg.limit,
-          query: msg.query,
-          providerCursor: msg.providerCursor,
-        });
-        break;
-      case "setHideAutoSessions":
-        void this.host.getConfiguration("grok").update("hideAutoSessions", !!msg.value);
-        this.postSessionsList();
-        break;
-      case "resumeSession":
-        await this.openSession(msg.id);
-        this.revealChat();
-        break;
-      case "renameSession":
-        this.renameSession(msg.id, msg.name, "local");
-        break;
-      case "deleteSession":
-        await this.deleteSession(msg.id, msg.name, "local");
-        break;
-      case "clearAllSessions":
-        await this.clearAllSessions(this.historyCwdFor("local"), "local");
-        break;
-      case "newSession":
-        await this.newFocusedSession("local");
-        this.revealChat();
-        break;
-    }
-  }
-
-  private revealChat(): void {
-    if (this.usesPanelTabs()) this.ensurePanelForSession(this.focused);
-    else void this.host?.revealChatView?.();
-  }
-
-  private panelTitleFor(session: Session): string {
-    const name = this.sessionDisplayName(session).trim();
-    return name || "Grok30m";
-  }
-
-  private updatePanelTitle(session: Session): void {
-    session.panel?.setTitle?.(this.panelTitleFor(session));
-  }
-
-  private ensurePanelForSession(session: Session, title?: string): void {
-    if (!this.usesPanelTabs() || typeof this.host.openEditorWebview !== "function") return;
-    if (!this.context?.extensionUri) return;
-    if (session.panel) {
-      session.panel.reveal();
-      this.updatePanelTitle(session);
-      return;
-    }
-    const panel = this.host.openEditorWebview({
-      viewType: GrokSidebar.panelType,
-      title: title ?? this.panelTitleFor(session),
-      localResourceRoots: this.chatLocalResourceRoots(),
-    });
-    if (!panel) return;
-    this.bindChatPanel(panel, session);
-  }
-
-  private claimPanelSession(session: Session): void {
-    if (this.focused === session) return;
-    // The tab the user is in, not a replay. focusSession() clears the webview
-    // and would wipe the composer they are about to paste into.
-    this.focused = session;
-    this.touch(session);
-    this.markRead(session);
-    this.updatePanelTitle(session);
-  }
-
-  private bindChatPanel(panel: HostEditorWebview, session: Session): void {
-    session.panel = panel;
-    // Subscribe before assigning html: a restored or cached editor webview can
-    // run scripts in the same turn, and a lost `ready` leaves Starting forever.
-    panel.onDidChangeViewState?.((active) => {
-      if (active) this.claimPanelSession(session);
-    });
-    panel.webview.onDidReceiveMessage((raw) => {
-      const m = raw as WebviewMsg;
-      // Blur of the tab being left must not steal focus back. Every other
-      // message is from the tab the user is acting in — including paste and send.
-      if (!(m.type === "composerFocus" && m.focused === false)) {
-        this.claimPanelSession(session);
-      }
-      if (m.type === "ready" && session.client) {
-        this.rehydrateWebviewFromFocused();
-        return;
-      }
-      void this.onMessage(m, "local").catch((e) => {
-        const text = (e as Error)?.message ?? String(e);
-        this.host.appendLine(`[webview] ${m.type} failed: ${text}`);
-        void this.host.showErrorMessage(`Grok: ${m.type} failed — ${text}`);
-      });
-    });
-    panel.webview.html = this.getHtml(panel.webview);
-    panel.onDidDispose(() => {
-      if (session.panel === panel) session.panel = undefined;
-    });
-  }
-
-  private getSessionsHtml(webview: HostWebview): string {
-    const nonce = getNonce();
-    const mediaUri = (file: string) =>
-      webview.asWebviewUri(Uri.joinPath(this.context.extensionUri, "media", file));
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';" />
-<style>html, body { background: var(--vscode-sideBar-background); }</style>
-<link rel="stylesheet" href="${mediaUri("sessions.css")}" />
-</head>
-<body>
-  <div class="sessions-root">
-    <div class="sessions-header">
-      <span class="sessions-title">Sessions</span>
-      <button id="sessions-new-btn" class="sessions-new-btn" title="New session"></button>
-    </div>
-    <div class="sessions-search-wrap">
-      <input id="sessions-search" class="sessions-search" type="text" placeholder="Search sessions…" />
-    </div>
-    <label class="sessions-filter-auto" title="Hide automated sessions">
-      <input id="sessions-hide-auto" type="checkbox" checked />
-      <span>Hide automated</span>
-    </label>
-    <div id="sessions-list" class="sessions-list"></div>
-    <div id="sessions-footer" class="sessions-footer" hidden>
-      <button id="sessions-clear-btn" class="sessions-clear-all" title="Delete all sessions in this workspace's history"></button>
-    </div>
-  </div>
-  <script nonce="${nonce}" src="${mediaUri("webview-helpers.js")}"></script>
-  <script nonce="${nonce}" src="${mediaUri("sessions.js")}"></script>
-</body>
-</html>`;
   }
 
   private chatLocalResourceRoots(): Uri[] {
@@ -4139,10 +4024,7 @@ See design doc for the full state machine diagram.`;
 
   private postMode(session: Session = this.focused): void {
     const message = sessionModeMessage(session, this.displayMode(session));
-    if (session === this.focused) {
-      const webview = this.webviewFor(session);
-      if (webview) webview.postMessage(message);
-    }
+    if (session === this.focused) this.view?.webview.postMessage(message);
     this.sendRemoteSession(session, message);
   }
 
@@ -4304,6 +4186,7 @@ Only continue if you trust this code.`,
     // setMode throws "no session" (and for Plan that error is surfaced to the user).
     // The mode button is disabled while busy; this backstops the toggle-mode command.
     if (!session.client || !session.client.sessionId || session.priming) return;
+    if (session.provider === "deepseek" && session.deepseekHarness === "minimal") return;
     if (session.provider === "muse" && session.museSandboxUnavailable && modeId === "onRequest") {
       this.reportRequester(requester, "warning", museOnRequestUnavailable(session.museSandboxUnavailable));
       return;
@@ -4842,7 +4725,7 @@ Only continue if you trust this code.`,
     this.postSessionsList();
   }
 
-  private noteSessionActivity(session: Session, sent = false): void {
+  private noteSessionActivity(session: Session, sent = false, prompted = sent): void {
     const sid = session.activeSessionId ?? session.client?.sessionId;
     if (!sid) return;
     const activeAt = Date.now();
@@ -4853,7 +4736,9 @@ Only continue if you trust this code.`,
     const routineRun = (previous.customName ?? "").trim().startsWith(ROUTINE_SESSION_TAG);
     void this.state.update(SESSION_META_KEY, {
       ...overrides,
-      [sid]: { ...previous, activeAt, ...(sent && !routineRun ? { sentAt: activeAt } : {}) },
+      [sid]: { ...previous, activeAt,
+        ...(prompted && session.provider === "deepseek" ? { deepseekPrompted: true } : {}),
+        ...(sent && !routineRun ? { sentAt: activeAt } : {}) },
     });
     for (const provider of INTERNAL_PROVIDERS.filter(usesAdapterHistory)) {
       const history = this.adapterHistory(provider);
@@ -4951,7 +4836,7 @@ Only continue if you trust this code.`,
     // Auto accept is not a verdict on a plan-review card. Same rule as
     // autoApprovePendingPermissions, including after a failed mode RPC
     // that already cleared the Plan bit.
-    if (supportsAutoAccept(session.provider) && usesClientAutoAccept(session.provider) && session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
+    if (!(session.provider === "deepseek" && session.deepseekHarness === "minimal") && supportsAutoAccept(session.provider) && usesClientAutoAccept(session.provider) && session.autoApprove && !planActive && !isPlanReviewPermission(req.toolCall?.kind)) {
       const opt = pickAutoAcceptOption(req.options, session.provider);
       if (opt) { client.respondPermission(req.id, opt.optionId); return; }
     }
@@ -5051,7 +4936,7 @@ Only continue if you trust this code.`,
    *  unread plan, and the card must stay answerable. A card with no allow
    *  option is left for the user as well. */
   private autoApprovePendingPermissions(session: Session): void {
-    if (!supportsAutoAccept(session.provider)) return;
+    if (!supportsAutoAccept(session.provider) || session.provider === "deepseek" && session.deepseekHarness === "minimal") return;
     const client = session.client;
     if (!usesClientAutoAccept(session.provider)) return;
     if (!client || session.pendingPermissions.size === 0) return;
@@ -9488,7 +9373,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       const mime = m.mimeType || guessMediaMime(m.path);
       // Trusted session media: stream from disk when the webview can.
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) {
         const src = webview.asWebviewUri(Uri.file(m.path));
         // Copy image needs PIXELS, and a webview cannot read them back out of an
@@ -9632,6 +9517,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     provider: AcpProvider = "grok",
     opts: { fromRemote?: boolean; report?: (text: string) => void; signOutCli?: boolean } = {},
   ): Promise<void> {
+    if (provider === "deepseek" && opts.signOutCli) {
+      if (opts.fromRemote || !this.deepseekOffered()) return;
+      await this.context.secrets.delete(DEEPSEEK_API_KEY_SECRET);
+      await this.deepseekCredential();
+      await this.disconnectProvider(provider, opts.report);
+      return;
+    }
     if (!opts.signOutCli && !isCloudEnvironment()) {
       await this.disconnectProvider(provider, opts.report);
       return;
@@ -10213,6 +10105,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.codexInstallAbort = undefined;
     this.agyInstallAbort?.abort(new Error("Installation cancelled."));
     this.agyInstallAbort = undefined;
+    this.deepseekInstallAbort?.abort(new Error("Installation cancelled."));
+    this.deepseekInstallAbort = undefined;
     void this.agyRelay?.close();
     try { this.keepAwake.stop(); } catch { /* the pid watcher reaps it anyway */ }
     try { this.settingsEditor?.dispose(); } catch { /* tab already gone */ }
@@ -10294,6 +10188,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private probeProviderVersion(provider: AcpProvider): Promise<string> {
     if (!this.hasProviderConsent(provider)) return Promise.resolve("");
+    if (provider === "deepseek") return Promise.resolve(DEEPSEEK_VERSION);
     if (provider === "agy") return Promise.resolve(this.providerCliVersions.agy ?? "");
     if (provider === "codex") return this.probeCodexVersion();
     if (provider === "claude") return this.probeClaudeVersion();
@@ -11058,6 +10953,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     currentClient?.on("messageChunk", captureChunk);
     session.suppressContent = true;
     try {
+      // Internal prompts count as dsh history, but are not sends by the person.
+      if (currentClient && session.provider === "deepseek") this.noteSessionActivity(session, false, true);
       await currentClient?.prompt(
         "Summarize our conversation so far in a concise paragraph. Be brief.",
       );
@@ -11073,6 +10970,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.emit(session, { type: "sessionContext" });
       session.suppressContent = true;
       try {
+        if (session.provider === "deepseek") this.noteSessionActivity(session, false, true);
         await session.client.prompt(`[Context from previous session]\n${summary}`);
       } catch { /* best effort */ } finally {
         session.suppressContent = false;
@@ -11159,7 +11057,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     target: Session = this.focused,
     intent: SessionStartIntent = "replace",
     clock?: OpenClock,
-    opts: { silent?: boolean; canReplace?: () => boolean } = {},
+    opts: { silent?: boolean; canReplace?: () => boolean; modelId?: string; deepseekHarness?: DeepSeekHarness } = {},
   ): Promise<AcpClient | undefined> {
     return this.withCloudHostWork(async () => {
       if (target.provider === "muse") await this.museCliChange;
@@ -11176,7 +11074,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     /** A start the PERSON did not ask for. Its failure belongs wherever the
      *  caller is reporting, never as a red banner in a conversation they were
      *  only looking at. The caller reads the undefined return instead. */
-    opts: { silent?: boolean; canReplace?: () => boolean } = {},
+    opts: { silent?: boolean; canReplace?: () => boolean; modelId?: string; deepseekHarness?: DeepSeekHarness } = {},
   ): Promise<AcpClient | undefined> {
     // Read the caller's clock BEFORE this function can add to it: the load
     // reservation, the workspace-switch queue, the cwd resolution, the
@@ -11239,7 +11137,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // Session (hasHistory still false) and then loads an existing conversation
     // into it. Treating that as empty handed a Grok rail click to Codex, then
     // blamed Codex for the spawn that followed.
-    if (!resumeId && !target.hasHistory && !this.usableProviders().includes(target.provider)) {
+    if (!resumeId && !opts.deepseekHarness && !target.hasHistory && !this.usableProviders().includes(target.provider)) {
       const fallback = this.defaultProviderForProject(this.sessionCwd(target));
       if (fallback !== target.provider && this.usableProviders().includes(fallback)) {
         this.host.appendLine(
@@ -11315,6 +11213,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     clock.record("approve-gate", approveGateMs);
     const openedAt = clock.now();
     const replacedClient = session.client;
+    // dsh resume supplies no transcript. A session frame in our buffer proves
+    // this host already holds this conversation, even after its client died.
+    // A cold open may have reserved activeSessionId but has no such frame.
+    const warmDeepSeekResume = session.provider === "deepseek" && !!resumeId
+      && session.activeSessionId === resumeId
+      && session.buffer.some(m => m.type === "session" && m.sessionId === resumeId);
     if (replacedClient) {
       this.queueInFlightPlanCommentsOnExit(session, replacedClient, session.gen);
     }
@@ -11329,7 +11233,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await testDelay.wait;
       if (gen !== session.gen) return undefined;
     }
-    session.buffer = [];
+    if (!warmDeepSeekResume) session.buffer = [];
     session.subscriptionUsage = undefined;
     session.status = "idle";
     // The replacement session has no turn, whatever the old one was doing. This
@@ -11367,7 +11271,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     const disposeMs = replacedClient ? clock.elapsed(disposeAt) : 0;
     clock.record("dispose", disposeMs);
-    if (session.provider === "muse" && resumeId) {
+    if ((session.provider === "muse" || session.provider === "deepseek") && resumeId) {
       await this.sessionMetaWrites;
       if (gen !== session.gen) return undefined;
     }
@@ -11375,7 +11279,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // toolbar shows the right one from the first paint — no Agent → Auto accept
     // flash while the session spins up and primes. Resumed sessions stay
     // verdict-driven (plan-restore decides), so they don't pre-apply it.
-    const rememberedYolo = supportsAutoAccept(session.provider) && startsInYolo(
+    if (session.provider === "deepseek") session.deepseekHarness = (resumeId ? this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {})[resumeId]?.deepseekHarness : opts.deepseekHarness ?? session.deepseekHarness) ?? "default";
+    const rememberedYolo = !(session.provider === "deepseek" && session.deepseekHarness === "minimal") && supportsAutoAccept(session.provider) && startsInYolo(
       this.defaultModeForProvider(session.provider),
       !!resumeId,
     );
@@ -11405,7 +11310,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.museShellSandbox = session.musePosture ? museShellSandboxEnabled(session.musePosture, !!session.museSandboxUnavailable) : undefined;
     session.autoApprove = session.musePosture ? session.musePosture.mode === "yolo" : rememberedYolo || configAutoApprove;
     session.planActive = false;
-    session.hasHistory = !!resumeId;
+    if (!warmDeepSeekResume) session.hasHistory = !!resumeId;
     session.suppressContent = false;
     session.captureAgentText = undefined;
     session.lastSessionInfoAt = 0;
@@ -11418,11 +11323,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.planModeRecovery?.warningTimer) clearTimeout(session.planModeRecovery.warningTimer);
     session.planModeRecovery = undefined;
     session.interjectionCount = 0;
-    session.historyEventCount = 0;
+    if (!warmDeepSeekResume) session.historyEventCount = 0;
     session.replayUserRaw = "";
     session.replayUserCounted = false;
     session.replayUserIsInterjection = false;
-    session.userMessageCount = 0;
+    if (!warmDeepSeekResume) session.userMessageCount = 0;
     if (!resumeId || resumeId !== session.activeSessionId) {
       session.telemetrySessionOrigin = undefined;
       session.remoteMessageReported = false;
@@ -11434,9 +11339,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.feedbackCommandsAdvertise = undefined;
     session.liveFeedbackEligible = false;
     session.turnRating = 0;
-    session.activeSessionId = undefined;
-    session.titleGenerated = false;
-    session.firstUserMessageForTitle = undefined;
+    if (!warmDeepSeekResume) session.activeSessionId = undefined;
+    if (!warmDeepSeekResume) {
+      session.titleGenerated = false;
+      session.firstUserMessageForTitle = undefined;
+    }
     session.priming = true;
     session.compactUsageArmed = false;
     session.adapterCompactThisTurn = false;
@@ -11448,7 +11355,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // turn re-arms it.
     this.emit(session, sessionModeMessage(session, session.musePosture?.mode ?? (session.autoApprove ? "yolo" : session.nativeAuto ? "auto" : "agent")));
     if (configAutoApprove) this.noticeAlwaysApproveOnce(this.sessionCwd(session));
-    if (resumeId) this.emit(session, { type: "clearMessages" });
+    if (resumeId && !warmDeepSeekResume) this.emit(session, { type: "clearMessages" });
 
     // Lock the composer (spinner, disabled) for start() + newSession()/load so a
     // prompt cannot be sent before the session exists. Success and failure paths
@@ -11475,6 +11382,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // server's own session/new start Google's browser sign-in, which on a
     // phone-driven start opens at an empty desk. Signing in stays a press at
     // the computer.
+    const deepseekCredential = session.provider === "deepseek" ? await this.deepseekCredential() : undefined;
+    if (session.provider === "deepseek" && !deepseekCredential?.key) {
+      if (gen !== session.gen) return undefined;
+      this.pool.delete(session); session.priming = false;
+      this.emit(session, { type: "setBusy", value: false });
+      this.setProviderNeedsLogin("deepseek", true);
+      this.emit(session, { type: "onboarding", state: "deepseek-login", provider: "deepseek", platform: process.platform });
+      return undefined;
+    }
     const agyCredential = session.provider === "agy" ? await this.agyCredentialFor() : undefined;
     if (session.provider === "agy" && !agyCredential) {
       if (gen !== session.gen) return undefined;
@@ -11537,7 +11453,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (this.mcpConnectorKeysReady) await this.mcpConnectorKeysReady;
     if (gen !== session.gen) return undefined;
-    const env = session.provider === "grok" ? this.buildEnv(cwd) : { ...process.env };
+    const env = session.provider === "grok" ? this.buildEnv(cwd) : { ...process.env, ...(deepseekCredential?.key ? { DEEPSEEK_API_KEY: deepseekCredential.key } : {}) };
     const effortStr = this.defaultEffortForProvider(session.provider);
     const effort = effortStr ? (effortStr as EffortLevel) : undefined;
     // Transient spawn/init after an update can throw once; retry the plain
@@ -11550,7 +11466,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // gateway address, so its output is redacted for the relay's prefix.
     const createBoundClient = (relay?: AgyRelayLease): AcpClient => {
     try { runSignal.throwIfAborted(); } catch (error) { relay?.release(); throw error; }
-    const redact = (text: string) => relay ? this.agyKeyRelay().redact(text) : text;
+    const redact = (text: string) => deepseekCredential?.key ? text.split(deepseekCredential.key).join("[redacted]") : relay ? this.agyKeyRelay().redact(text) : text;
     const client = new AcpClient({
       signal: runSignal,
       cliPath,
@@ -11564,7 +11480,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ...(session.provider === "grok"
         ? { grokVersion: grokHandshakeVersion, grokVersionVerified }
         : { backend: session.provider === "muse" ? new MuseBackend(session.musePosture, session.museSandboxUnavailable)
-          : session.provider === "agy" ? new AgyBackend({ keyMode: !!relay }) : this.createProviderBackend(session.provider) }),
+          : session.provider === "agy" ? new AgyBackend({ keyMode: !!relay }) : this.createProviderBackend(session.provider, session.deepseekHarness) }),
     });
     if (relay) client.once("exit", () => relay.release());
     session.client = client;
@@ -11636,6 +11552,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
             provider: session.provider,
             providerCwd: cwd,
             ...(posture ? { musePosture: posture } : {}),
+            ...(session.provider === "deepseek" ? { deepseekHarness: session.deepseekHarness ?? "default" } : {}),
           },
         }));
       }
@@ -11647,6 +11564,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         worktree: !!session.worktree,
         provider: session.provider,
       });
+      if (session.provider === "deepseek") this.emit(session, sessionModeMessage(session, this.displayMode(session)));
       if (session.provider === "grok") {
         const metaEnabled = parseFeedbackEnabledMeta(res);
         if (metaEnabled !== undefined) session.feedbackMetaEnabled = metaEnabled;
@@ -11686,6 +11604,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     client.on("modelChanged", (id) => {
       if (gen !== session.gen) return;
       this.emit(session, { type: "modelChanged", modelId: id });
+      if (session.provider === "deepseek") this.emit(session, sessionModeMessage(session, this.displayMode(session)));
     });
     client.on("modeChanged", (id) => {
       if (gen !== session.gen) return;
@@ -11957,7 +11876,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     });
     client.on("contextUsage", (used: number | undefined, window?: number) => {
       if (gen !== session.gen) return;
-      if (session.provider === "muse") {
+      if (session.provider === "muse" || session.provider === "deepseek") {
         const id = session.activeSessionId;
         if (id) {
           const current = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
@@ -12200,7 +12119,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       await client.start();
       clock.record("spawn+init", clock.elapsed(spawnAt));
       if (gen !== session.gen) { client.dispose(); return undefined; }
-      const defaultModel = this.providerDefaultForProject(cwd, session.provider) ?? "";
+      const defaultModel = opts.modelId ?? this.providerDefaultForProject(cwd, session.provider) ?? "";
       if (resumeId) {
         replayBegan = true;
         // Queue any saved plans BEFORE replay starts so the webview can interleave
@@ -12257,7 +12176,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
         const loadAt = clock.now();
         let replayAt = 0;
-        await this.replayLoadedHistory(session, async () => {
+        const load = async () => {
           try {
             await client.loadSession(resumeId, defaultModel || undefined);
           } catch (e) {
@@ -12279,10 +12198,15 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           clock.record("new", 0);
           clock.record("load", clock.elapsed(loadAt));
           replayAt = clock.now();
-        });
+        };
+        // No replay means neither a replay bracket nor its inference that zero
+        // replayed messages makes this an untouched, switchable conversation.
+        if (session.provider === "deepseek") await load();
+        else await this.replayLoadedHistory(session, load);
         clock.record("replay(post)", clock.elapsed(replayAt));
+        if (session.provider === "deepseek" && !warmDeepSeekResume) this.emit(session, { type: "planNotice", text: DEEPSEEK_COLD_REOPEN });
         session.activeSessionId = resumeId;
-        session.titleGenerated = true; // existing session, name already in storage
+        if (!warmDeepSeekResume) session.titleGenerated = true; // existing session, name already in storage
 
         // Plan-gate restoration: the CLI replays its own current_mode_update
         // events during loadSession, which our modeChanged handler honors by
@@ -12701,7 +12625,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "send":
         // A bare `/context-window` never arrives: the webview opens its context
         // popup for that. Here it is just a size that does not parse.
-        if (/^\/context-window(?:\s|$)/i.test(msg.text.trim())) {
+        if (session.provider !== "deepseek" && /^\/context-window(?:\s|$)/i.test(msg.text.trim())) {
           const size = parseContextWindowSize(msg.text.trim().replace(/^\/context-window/i, ""));
           if (size === undefined) this.emit(session, { type: "error", text: "Use /context-window 500k or a whole token count offered by the model." });
           else await this.changeContextWindow(session, size);
@@ -12739,7 +12663,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           // A phone can take over a running turn: its send may be queued before
           // handleSend reaches the prompt commit point. Receipt is remote use.
           if (session.hasHistory) this.reportRemoteMessage(session, origin);
-          await this.handleSend(msg.text, msg.bare === true, session, origin, queuedSendCommit, msg.submissionId, undefined, msg.chips);
+          await this.handleSend(msg.text, msg.bare === true, session, origin, queuedSendCommit, msg.submissionId, undefined, msg.chips,
+            // Older renderers (or a provider switch in flight) can miss the
+            // pre-send image gate. Return text to its sender, not every viewer.
+            () => { if (!queuedSendCommit) this.restoreComposerFor(session, requester, msg.text); });
         } finally {
           if (queuedSendCommit) finishQueuedSendCommit(session, queuedSendCommit, false);
         }
@@ -13252,6 +13179,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "installCodex":
         await this.installManagedCodexCli();
         break;
+      case "installDeepSeek":
+        if (origin === "local") await this.installManagedAgyServer("deepseek");
+        break;
+      case "cancelDeepSeekInstall":
+        if (origin === "local") this.deepseekInstallAbort?.abort(new Error("Installation cancelled."));
+        break;
       case "installAgy":
         if (origin !== "local") break;
         await this.installManagedAgyServer();
@@ -13396,6 +13329,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         );
         break;
       }
+      case "setExperimentalDeepSeek":
+        if (origin === "local" && !isCloudEnvironment()) await this.host.getConfiguration("grok").update("experimentalDeepSeek", !!msg.value, "global");
+        this.postProviderState();
+        break;
       case "setExperimentalAntigravity":
         // The config watcher re-posts providerState, which is what the
         // toggle reads back.
@@ -13445,6 +13382,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       case "setProcessingSound":
         await this.host.getConfiguration("grok")
           .update("processingSound", !!msg.value, "global");
+        break;
+      case "setInputNeededSound":
+        await this.host.getConfiguration("grok")
+          .update("inputNeededSound", !!msg.value, "global");
         break;
       case "setReadRepliesAloud":
         await this.host.getConfiguration("grok")
@@ -13548,6 +13489,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
       case "runGrokLogin": {
         const provider: AcpProvider = isInternalProvider(msg.provider) ? msg.provider : "grok";
+        if (provider === "deepseek") {
+          if (origin !== "local" || !this.deepseekOffered()) break;
+          await this.deepseekCredential(); this.postProviderState();
+          this.postLocal({ type: "onboarding", state: this.locateProvider(provider) ? "deepseek-login" : "missing-deepseek", provider, platform: process.platform });
+          break;
+        }
         if (provider === "agy" && (origin === "remote" || !this.agyOffered())) {
           // Google's sign-in opens a browser on THIS machine, which from a
           // phone would be a desk nobody is sitting at. Refused before any
@@ -13714,6 +13661,58 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           provider,
           launched: true,
         });
+        break;
+      }
+      case "deepseekConnect": {
+        if (origin !== "local" || !this.deepseekOffered() || !this.locateProvider("deepseek")) break;
+        if (msg.key !== undefined) {
+          if (!validDeepSeekKey(msg.key)) break;
+          await this.context.secrets.store(DEEPSEEK_API_KEY_SECRET, msg.key);
+        }
+        const credential = await this.deepseekCredential();
+        if (!credential.key) break;
+        const exits: Promise<void>[] = [];
+        for (const live of new Set([this.focused, ...this.pool, ...this.remoteClients.detachedActiveValues()])) {
+          if (live?.provider !== "deepseek" || !live.client) continue;
+          const client = this.detachClient(live); if (client) exits.push(client.dispose());
+          live.priming = false; live.status = "idle";
+          this.emit(live, { type: "setBusy", value: false });
+        }
+        await Promise.all(exits);
+        await this.invalidateDeepSeekModels();
+        this.setProviderNeedsLogin("deepseek", false);
+        await this.setProviderConnected("deepseek", true);
+        await this.warmConnectedDeepSeekModels();
+        await this.adoptSessionsForConnectedProvider("deepseek", session);
+        this.postProviderState();
+        this.postLocal({ type: "onboarding", state: "provider-connected", provider: "deepseek", platform: process.platform });
+        break;
+      }
+      case "setDeepSeekHarness": {
+        const reply = this.composerDraftReply(msg.draftId, requester);
+        if (!this.deepseekOffered() || session.provider !== "deepseek") { reply?.(msg.sessionId); break; }
+        const matches = () => session.client?.sessionId === msg.sessionId && session.gen === msg.generation
+          && session.client?.currentModelId === msg.modelId && !session.priming && !turnIsInFlight(session) && !this.pickerChange;
+        if (!matches() || (msg.harness !== "minimal" && msg.harness !== "default") || (session.deepseekHarness ?? "default") === msg.harness) {
+          reply?.(msg.sessionId);
+          this.emit(session, sessionModeMessage(session, this.displayMode(session)));
+          break;
+        }
+        const locked = () => session.hasHistory || session.userMessageCount > 0;
+        if (locked()) {
+          reply?.(msg.sessionId);
+          this.emit(session, { type: "error", text: "Start a new session to use a different DeepSeek harness." });
+          this.emit(session, sessionModeMessage(session, this.displayMode(session)));
+          break;
+        }
+        try {
+          await this.startSession(undefined, session, "replace", undefined, {
+            deepseekHarness: msg.harness, modelId: msg.modelId, canReplace: () => matches() && !locked(),
+          });
+        } finally {
+          reply?.(session.client?.sessionId ?? session.activeSessionId ?? msg.sessionId);
+          this.emit(session, sessionModeMessage(session, this.displayMode(session)));
+        }
         break;
       }
       case "agySignIn": {
@@ -14700,7 +14699,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private reservedMcpIdentityFor(session: Session): ReservedMcpIdentity {
     const cwd = this.sessionCwd(session);
     const parts: ReservedMcpIdentity[] = [];
-    if (session.provider === "muse" || session.provider === "agy") return { names: [], urls: [] };
+    if (session.provider === "muse" || session.provider === "agy" || session.provider === "deepseek") return { names: [], urls: [] };
     for (const filePath of mcpConfigPaths({
       cwd,
       provider: session.provider,
@@ -15261,6 +15260,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const cached: SessionListEntry[] = [];
     if (providers.includes("codex")) cached.push(...(this.codexSessionCache.get(projectProviderKey(cwd)) ?? []));
     if (providers.includes("muse")) cached.push(...(this.museSessionCache?.get(projectProviderKey(cwd)) ?? []));
+    if (providers.includes("deepseek")) cached.push(...(this.deepseekSessionCache?.get(projectProviderKey(cwd)) ?? []));
     if (providers.includes("agy")) cached.push(...(this.agySessionCache?.get(projectProviderKey(cwd)) ?? []));
     if (providers.includes("claude")) cached.push(...(this.claudeSessionCache.get(projectProviderKey(cwd)) ?? []));
     // The adapters list everything, so the horizon (HISTORY_HORIZON_MS) is
@@ -15270,6 +15270,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const adapter = cached.filter((entry) => withinHistoryHorizon(entry.updatedAt, now));
     for (const session of this.pool) {
       if (!usesAdapterHistory(session.provider) || !session.activeSessionId || !pathsEqual(this.sessionCwd(session), cwd)) continue;
+      if (session.provider === "deepseek" && !this.deepseekSessionHasPrompt(session.activeSessionId, overrides)) continue;
       if (adapter.some((entry) => entry.id === session.activeSessionId)) continue;
       adapter.push(this.liveSessionEntry(session, session.activeSessionId, this.sessionCwd(session), overrides));
     }
@@ -15292,24 +15293,17 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? offset + entries.length
       : Math.max(offset + entries.length, combinedPage?.providerCursor.grokOffset ?? 0);
     const total = query ? (merged?.length ?? 0) : (grok?.total ?? 0) + adapter.length;
-    const hideAuto = this.hideAutoSessions();
-    const visible = hideAuto
-      ? entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined))
-      : entries;
-    const visibleDots: Record<string, Dot> = {};
-    for (const entry of visible) visibleDots[entry.id] = this.dotForId(entry.id);
     return {
       type: "sessions",
-      entries: visible,
+      entries,
       activeId,
-      dots: visibleDots,
+      dots,
       offset,
-      total: hideAuto ? visible.length : total,
+      total,
       hasMore: query ? nextOffset < total : combinedPage?.hasMore ?? false,
       nextOffset,
       ...(!query && combinedPage ? { providerCursor: combinedPage.providerCursor } : {}),
       query,
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -15519,6 +15513,14 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     return run;
   }
 
+  private deepseekSessionHasPrompt(id: string, overrides: SessionMetaOverrides): boolean {
+    // Both dsh homes are host-managed. Creation/rename/listing alone says
+    // nothing about prompts; keep failed sends as well as completed turns.
+    // sentAt also counts: records written before deepseekPrompted existed.
+    return overrides[id]?.deepseekPrompted === true || typeof overrides[id]?.sentAt === "number"
+      || [...this.pool].some((s) => s.provider === "deepseek" && s.activeSessionId === id && s.userMessageCount > 0);
+  }
+
   /**
    * One listing of a provider's history, for every folder asked about
    * (adapterHistoryFolders), filling each folder's rows in the cache.
@@ -15565,6 +15567,19 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         .filter(([, o]) => typeof o?.pinnedAt === "number").map(([id]) => id));
       const catalog = listAgyCatalog(process.platform, { since: Date.now() - HISTORY_HORIZON_MS, keepIds: pinned });
       for (const [key, cwd] of listable()) listed.set(key, agySessionsFor(catalog, cwd, process.platform));
+    } else if (provider === "deepseek") {
+      for (const harness of ["default", "minimal"] as const) {
+        const client = new AcpClient({ signal, cliPath, cwd: this.projectHomeDir(), env: { ...process.env },
+          backend: this.createProviderBackend(provider, harness), log: () => {} });
+        try {
+          await client.start();
+          for (const [key, cwd] of listable()) {
+            const page = await client.listSessions(cwd, process.platform);
+            listed.set(key, [...(listed.get(key) ?? []), ...page.sessions]);
+          }
+        } finally { await client.dispose(); }
+        if (signal.aborted) return;
+      }
     } else {
       const client = await this.adapterHistoryClient(provider, cliPath);
       if (!client || signal.aborted) return;
@@ -15579,8 +15594,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       }
     }
     if (signal.aborted) return;
-    const result = { sessions: [...listed.values()].flat() };
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
+    if (provider === "deepseek") {
+      for (const [key, sessions] of listed) {
+        listed.set(key, sessions.filter((entry) => this.deepseekSessionHasPrompt(entry.sessionId, overrides)));
+      }
+    }
+    const result = { sessions: [...listed.values()].flat() };
     const stableOverrides: SessionMetaOverrides = { ...overrides };
     // First-seen adapter listing time is a baseline only. Claude restamps
     // `updatedAt` on `session/load` (measured). Codex does not restamp, but
@@ -15593,6 +15613,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const stampable = (entry: BackendSessionListEntry) => !!overrides[entry.sessionId]
       || withinHistoryHorizon(adapterListEntry(entry, {}, provider, listedAt).updatedAt, listedAt);
     for (const entry of result.sessions) {
+      if (provider === "deepseek") continue; // No timestamp in dsh's list; never invent one.
       const previous = stableOverrides[entry.sessionId] ?? {};
       if (typeof previous.activeAt === "number" || !stampable(entry)) continue;
       stableOverrides[entry.sessionId] = {
@@ -15629,6 +15650,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           ...previous,
           provider,
           providerCwd: entry.cwd,
+          ...(entry.deepseekHarness ? { deepseekHarness: entry.deepseekHarness } : {}),
           activeAt: typeof previous.activeAt === "number"
             ? previous.activeAt
             : stableOverrides[entry.sessionId]?.activeAt,
@@ -15660,7 +15682,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const offset = Math.max(0, opts?.offset ?? 0);
     const limit = opts?.limit ?? SESSION_PAGE_SIZE;
     const query = (opts?.query ?? "").trim().toLowerCase();
-    const hideAuto = this.hideAutoSessions();
     // Stale per-tab / selected cwds must not scan a closed project's catalog.
     const authorized = this.authorizedSessionCwds();
     const listCwd = authorizedListCwd(cwd, authorized, pathsEqual);
@@ -15712,22 +15733,16 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     let pageEntries: SessionListEntry[];
     let total: number;
     let nextOffset: number;
-    const filterAuto = (entries: SessionListEntry[]) => {
-      if (!hideAuto) return entries;
-      return entries.filter((e) => e.id === activeId || !shouldHideAutoSession(e.displayName, undefined));
-    };
-    if (query || hideAuto) {
-      // Search and hide-auto need names, so read (cache-backed) the whole list once, then filter.
+    if (query) {
+      // Search needs names for everything, so read (cache-backed) the whole list once, then filter.
       const all = this.readEntriesCachedMulti(index.map((e) => e.id), mtimeById, cwdById, overrides, grokHome, log)
         .filter((e) => e.kind !== "subagent");
       all.sort((a, b) => b.updatedAt - a.updatedAt);
-      const matched = filterAuto(query
-        ? all.filter(
-            (e) =>
-              e.displayName.toLowerCase().includes(query) ||
-              (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
-          )
-        : all);
+      const matched = all.filter(
+        (e) =>
+          e.displayName.toLowerCase().includes(query) ||
+          (e.worktreeLabel && e.worktreeLabel.toLowerCase().includes(query)),
+      );
       total = matched.length;
       pageEntries = matched.slice(offset, offset + limit);
       nextOffset = offset + pageEntries.length;
@@ -15766,6 +15781,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       for (const s of this.pool) {
         const id = s.activeSessionId;
         if (!id || onDisk.has(id) || seen.has(id)) continue;
+        if (s.provider === "deepseek" && !this.deepseekSessionHasPrompt(id, overrides)) continue;
         const sCwd = this.sessionCwd(s);
         if (!repoCwdKeys.has(normalizeFsPath(sCwd))) continue;
         const entry = this.liveSessionEntry(s, id, sCwd, overrides);
@@ -15815,7 +15831,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       hasMore,
       nextOffset,
       query: opts?.query ?? "",
-      hideAutoSessions: hideAuto,
     };
   }
 
@@ -15907,7 +15922,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const firstMsg = (session.firstUserMessageForTitle || "").trim()
       || (overrides[id]?.autoName || "").trim();
     const displayName = customName || session.agentTitle || (firstMsg ? fallbackName(firstMsg, now) : "New session");
-    const ts = session.lastActiveAt || now;
+    const ts = session.provider === "deepseek"
+      ? adapterListEntry({ sessionId: id, cwd }, overrides, "deepseek").updatedAt
+      : session.lastActiveAt || now;
     return {
       id,
       cwd,
@@ -16907,6 +16924,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       claude: pickSttBackend({ ...state, provider: "claude" }) ?? null,
       muse: pickSttBackend({ ...state, provider: "muse" }) ?? null,
       agy: pickSttBackend({ ...state, provider: "agy" }) ?? null,
+      deepseek: pickSttBackend({ ...state, provider: "deepseek" }) ?? null,
     } };
   }
 
@@ -18369,6 +18387,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     owner: AttachmentOwner = () => this.focused,
     previewId?: string,
   ): Promise<Session | undefined> {
+    if (owner()?.provider === "deepseek") throw new Error("DeepSeek does not accept image attachments on this ACP route.");
     const dir = this.imageStagingDir();
     await fs.promises.mkdir(dir, { recursive: true });
     const absPath = path.join(dir, `image-${randomUUID()}${extFromMime(mimeType)}`);
@@ -18381,6 +18400,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // raced a reconnect that is about to come back.
       return undefined;
     }
+    if (session.provider === "deepseek") throw new Error("DeepSeek does not accept image attachments on this ACP route.");
     const rel = originPath
       ? normalizeRelPath(path.relative(this.sessionCwd(session), originPath))
       : undefined;
@@ -18549,8 +18569,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // and flushes any queued sends itself, so a notice emitted afterwards could
     // land behind that queued turn's userMessage/agentStart — reading as if the
     // new turn had failed, and clearing the busy state of a turn that had only
-    // just begun. Live-only as a consequence (the restart clears the buffer);
-    // the conversation itself is reloaded from disk intact.
+    // just begun. Replay-capable providers reload the conversation from disk;
+    // a warm DeepSeek restart retains the host's buffer, including this notice.
     session.staleSendReported = true;
     this.emit(session, {
       type: "agentError",
@@ -18623,12 +18643,13 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     submissionId?: string,
     onStarted?: () => void,
     requestedChips?: FileChip[],
+    onImageReadFailure?: () => void,
   ): Promise<void> {
     if (this.cloudHostUpdate && !this.cloudHostUpdate.admitting) {
       this.emit(target ?? this.focused, { type: "error", text: CLOUD_UPDATE_REFUSAL });
       return;
     }
-    await this.withCloudHostWork(() => this.handleAdmittedSend(text, bare, target, origin, queuedSendCommit, submissionId, onStarted, requestedChips));
+    await this.withCloudHostWork(() => this.handleAdmittedSend(text, bare, target, origin, queuedSendCommit, submissionId, onStarted, requestedChips, onImageReadFailure));
   }
 
   private async handleAdmittedSend(
@@ -18636,6 +18657,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     queuedSendCommit?: { text: string; items: QueuedSendEntry[] }, submissionId?: string,
     onStarted?: () => void,
     requestedChips?: FileChip[],
+    onImageReadFailure?: () => void,
   ): Promise<void> {
     // `target` lets a queued-send flush fire into a BACKGROUNDED session (its
     // turn ended while another was focused). Only the focused session may spawn
@@ -18744,7 +18766,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         if (chip.hidden || !isImageChip(chip)) continue;
         const read = await this.readImageChip(chip, session, gen);
         if (read === "gone") return;
-        if (read === "failed") return;
+        if (read === "failed") { onImageReadFailure?.(); return; }
         images.push(read);
       }
     }
@@ -18869,7 +18891,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           this.rememberAdapterContext(session, { compacted: true });
         }
       }
-      const meta = await client.prompt(promptBlocks);
+      const meta = session.provider === "deepseek"
+        ? await client.prompt(promptBlocks, contributions?.map(item => item.text) ?? [text])
+        : await client.prompt(promptBlocks);
       if (gen !== session.gen) {
         this.emitAbandonedSend(session);
         return;
@@ -18960,9 +18984,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // prompt went to the session the person is looking at.
       this.host.appendLine(
         `[${session.provider}] prompt failed for session ${session.client?.sessionId ?? session.activeSessionId ?? "none"}`
-        + `: ${errorDetail(e)}`,
+        + `: ${session.provider === "deepseek" ? deepseekPromptErrorText(e) : errorDetail(e)}`,
       );
-      this.emit(session, { type: "agentError", text: promptErrorText(e) });
+      this.emit(session, { type: "agentError", text: session.provider === "deepseek" ? deepseekPromptErrorText(e) : promptErrorText(e) });
       this.noteLiveTurnEnded(session);
       this.setStatus(session, "error");
     } finally {
@@ -19001,6 +19025,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     chips: FileChip[],
     promptBlocks: Parameters<AcpClient["prompt"]>[0],
   ): Promise<boolean> {
+    if (session.provider === "deepseek") {
+      if (isDeepSeekCredentialError(err)) this.setProviderNeedsLogin("deepseek", true);
+      return false;
+    }
     const errorText = errorDetail(err);
     const credential = session.client?.isCredentialError(err) === true || isCredentialError(err);
     if (!credential && !isAuthErrorText(errorText)) return false;
@@ -19207,6 +19235,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       pinLiveWorkflows: cfg.get("pinLiveWorkflows", true),
       soundNotifications: cfg.get("soundNotifications", false),
       processingSound: cfg.get("processingSound", false),
+      inputNeededSound: cfg.get("inputNeededSound", false),
       readRepliesAloud: cfg.get("readRepliesAloud", false),
       telemetryEnabled: cfg.get("telemetry.enabled", true),
       // Desktop-only and platform-gated; the row hides itself on everything
@@ -19299,6 +19328,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // than waiting for a first attempt.
     this.postProjectSetup();
     for (const provider of this.connectedProviders()) {
+      if (provider === "deepseek") {
+        this.warmDeepSeekCatalogOnBoot();
+        continue;
+      }
       const signal = this.providerRunSignal(provider);
       void this.probeProviderVersion(provider).then(version => {
         if (!signal.aborted) return this.refreshModelsIfCliChanged(provider, version);
@@ -19362,11 +19395,12 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
    */
   private rehydrateWebviewFromFocused(): void {
     const session = this.focused;
-    const wv = this.webviewFor(session);
+    const wv = this.view?.webview;
     if (!wv) return;
     this.touch(session);
     this.markRead(session);
     this.refreshWorkflowCompletions(session);
+    if (session.provider === "deepseek") void session.client?.refreshCommands?.();
     void wv.postMessage({ type: "clearMessages" });
     void wv.postMessage({ type: "historyReplay", active: true });
     for (const m of session.buffer) {
@@ -19396,6 +19430,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session: Session,
     gen: number,
   ): Promise<PromptImageInput | "failed" | "gone"> {
+    if (session.provider === "deepseek") {
+      this.emit(session, { type: "agentError", text: "DeepSeek does not accept image attachments on this ACP route. Remove the image to send this message." });
+      return "failed";
+    }
     try {
       const bytes = await fs.promises.readFile(chip.path);
       if (bytes.length === 0) throw new Error("file is empty");
@@ -19425,8 +19463,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
 
   private postChips(session: Session = this.focused): void {
     const remoteMessage: HostMsg = { type: "chips", chips: session.chips };
-    const webview = session === this.focused ? this.webviewFor(session) : undefined;
-    if (webview) {
+    if (session === this.focused && this.view) {
+      const webview = this.view.webview;
       const localMessage: HostMsg = { type: "chips", chips: this.localPreviewChips(session, webview) };
       void webview.postMessage(localMessage);
     }
@@ -19558,9 +19596,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   ]);
   private post(message: HostMsg): void {
     if (this.focused.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     if (GrokSidebar.DEVICE_GLOBAL_REMOTE_TYPES.has(message.type)) {
       this.broadcastRemoteDevice(message);
@@ -19578,11 +19614,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   /** Post to the VS Code webview only (plus catalog mirror to the projects rail). */
   private postLocal(message: HostMsg): void {
     this.postTap?.("local", message);
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /**
@@ -20213,11 +20246,10 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session === this.focused) {
       this.postTap?.("local", message);
-      const webview = this.webviewFor(session);
+      const webview = this.view?.webview;
       if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
       // Active-session identity for the projects rail (highlight + pin home).
       this.mirrorToProjectsRail(message);
-      this.postToSessions(message);
     }
     if (!session.replaying || message.type === "startupStatus") this.sendRemoteSession(session, message);
   }
@@ -20263,10 +20295,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     }
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   /** Desk-targeted, non-replayable delivery for one-shot notices. */
@@ -20274,10 +20305,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     if (session.suppressContent && GrokSidebar.SUPPRESS_TYPES.has(message.type)) return;
     if (session !== this.focused) return;
     this.postTap?.("local", message);
-    const webview = this.webviewFor(session);
+    const webview = this.view?.webview;
     if (webview) webview.postMessage(this.localizeHistoryMessage(message, webview));
     this.mirrorToProjectsRail(message);
-    this.postToSessions(message);
   }
 
   private async replayLoadedHistory(session: Session, load: () => Promise<void>): Promise<void> {
@@ -20528,7 +20558,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     this.touch(session);
     this.markRead(session); // opening it clears any unread (green/red) badge
     this.refreshWorkflowCompletions(session);
-    const wv = this.webviewFor(session);
+    if (session.provider === "deepseek") void session.client?.refreshCommands?.();
+    const wv = this.view?.webview;
     // Both surfaces need it, and the desk has the same gap the browser does —
     // re-focusing a live conversation never said which agent it belongs to.
     const identity = this.sessionIdentityFrame(session);
@@ -21113,6 +21144,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       this.emit(session, { type: "questionResolved", requestId, outcome: "closed" });
     }
     session.pendingQuestions.clear();
+    // Request ids belong to a connection and can be reused by its replacement.
+    // Retire the visible and buffered cards before forgetting their requests.
+    for (const requestId of session.pendingPermissions.keys()) {
+      this.emit(session, { type: "permissionResolved", requestId, outcome: "closed" });
+    }
     session.pendingPermissions.clear();
     session.pendingExitPlans.clear();
     this.syncHumanWait(session);
@@ -21226,9 +21262,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = session.activeSessionId;
     if (!id) return;
     const message: HostMsg = { type: "sessionDot", id, dot: this.dotForId(id) };
-    const chat = this.webviewFor(this.focused);
-    if (chat) chat.postMessage(message);
-    else if (!this.usesPanelTabs()) this.view?.webview.postMessage(message);
+    this.view?.webview.postMessage(message);
     this.mirrorToProjectsRail(message);
     const overrides = this.state.get<SessionMetaOverrides>(SESSION_META_KEY, {});
     const sent = new Set<string>();
@@ -21705,7 +21739,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       // path just clears twice, a no-op.)
       this.emit(this.focused, { type: "clearMessages" });
       const created = this.focused;
-      await this.startSession(undefined, created);
+      await this.startSession(undefined, created, "replace");
       if (created.activeSessionId) onCreated?.(created.activeSessionId);
     }
     await this.persistWorktreeBinding(this.focused);
@@ -21719,7 +21753,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // After the sweep, not before: the sweep can retire the empty session this
     // one replaced, and a list built ahead of it would show a row that is gone.
     this.postSessionsList();
-    this.revealChat();
   }
 
   private focusRemoteSession(clientId: string, session: Session, notifyCatalog = true): void {
@@ -21733,6 +21766,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const identity = this.sessionIdentityFrame(session);
     if (identity) this.sendRemoteClient(clientId, identity);
     this.refreshWorkflowCompletions(session);
+    if (session.provider === "deepseek") void session.client?.refreshCommands?.();
     for (const msg of bracketRemoteSnapshot(session.buffer)) this.sendRemoteClient(clientId, msg);
     for (const msg of sessionUiSnapshot(session, this.displayMode(session))) this.sendRemoteClient(clientId, msg);
     if (notifyCatalog) this.postRepoCatalog();
@@ -21787,7 +21821,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     session.provider = this.defaultProviderForProject(cwd);
     this.remoteClients.setActive(clientId, session);
     this.emit(session, { type: "clearMessages" });
-    await this.startSession(undefined, session);
+    await this.startSession(undefined, session, "replace");
     if (session.activeSessionId) onCreated?.(session.activeSessionId);
     await this.persistWorktreeBinding(session);
     this.sweepEmptySessions(this.sessionCwd(session));
@@ -22250,7 +22284,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // a conversation is not a request to change which project you are in.
     // Desktop's own selectRepo does the whole switch; this is the half VS Code
     // needs because it has no folder to switch.
-    this.revealChat();
     if (this.host.canSwitchWorkspaceFolder) return;
     const openedIn = this.resolveLocalRepoTarget(this.sessionCwd(this.focused));
     if (openedIn && !pathsEqual(openedIn.cwd, this.selectedRepoCwd || "")) {
@@ -22609,6 +22642,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   private buildEnv(cwd: string): NodeJS.ProcessEnv {
     const dotEnv = this.readDotEnv(cwd);
     const env: NodeJS.ProcessEnv = { ...process.env, ...dotEnv };
+    // Account selection must agree with the host's history/config readers.
+    const accountHome = workspaceGrokHome();
+    if (accountHome) env.GROK_HOME = accountHome;
 
     // XAI_API_KEY is the generic xAI key name; grok CLI needs GROK_CODE_XAI_API_KEY.
     // Map from either source (workspace .env or the user's shell environment).
@@ -22853,6 +22889,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           await this.newRemoteSession(currentClientId, true, this.composerDraftReply(m.draftId, requester));
         } else if (m.type === "resumeSession") {
           await this.openRemoteSession(currentClientId, m.id, m.cwd, true, m.claim === true);
+        } else if (m.type === "setDeepSeekHarness") {
+          await this.onMessage(m, "remote", currentClientId);
         } else if (m.type === "selectRepo") {
           await this.selectRemoteRepo(currentClientId, m.cwd);
         }
@@ -23374,6 +23412,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const initial = this.messageForRemote({ ...this.buildInitialStateMsg(session), cwd: listCwd ?? "" });
     const sessionCwd = session ? this.sessionCwd(session) : "";
     const sessionCwdOk = !!session && !!authorizedListCwd(sessionCwd, authorized, pathsEqual);
+    if (sessionCwdOk && session?.provider === "deepseek") void session.client?.refreshCommands?.();
     const snap: HostMsg[] = [];
     snap.push(initial);
     if (this.cloudHostUpdate) snap.push(this.cloudHostUpdate.snapshot);
@@ -23527,7 +23566,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (category) {
         void this.settingsEditor.webview.postMessage({ type: "settingsCategory", category });
       }
-      void this.refreshCommunityLagOnSettings();
       return;
     }
     const panel = this.host.openEditorWebview({
@@ -23555,21 +23593,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         const text = (e as Error)?.message ?? String(e);
         this.host.appendLine(`[settings] ${msg.type} failed: ${text}`);
       });
-    });
-    void this.refreshCommunityLagOnSettings();
-  }
-
-  private async refreshCommunityLagOnSettings(): Promise<void> {
-    const panel = this.settingsEditor;
-    if (!panel) return;
-    const lag = await peekCommunityLag(this.context.extensionVersion);
-    if (this.settingsEditor !== panel) return;
-    void panel.webview.postMessage({
-      type: "communityLagStatus",
-      base: lag.base,
-      latest: lag.latest || "",
-      behind: lag.behind,
-      error: lag.error || "",
     });
   }
 
@@ -23607,6 +23630,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         fontScale: this.chatFontScale(),
         soundNotifications: cfg.get("soundNotifications", false),
         processingSound: cfg.get("processingSound", false),
+        inputNeededSound: cfg.get("inputNeededSound", false),
         readRepliesAloud: cfg.get("readRepliesAloud", false),
         summarizeRepliesAloud: cfg.get("summarizeRepliesAloud", true),
         voiceConfigured: !!this.voiceBackendState(this.sessionCwd(this.focused), this.focused.provider).backend,
@@ -23629,11 +23653,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
         providersChecking: this.providerRefreshInFlight,
         githubState: this.githubStatePayload(),
         extVersion: this.context.extensionVersion,
-        communityBase: COMMUNITY_BASE_VERSION,
-        communityLatest: "",
-        communityBehind: false,
-        communityError: "",
-        communityReleasesUrl: COMMUNITY_RELEASES_PAGE,
         cliVersion: this.providerCliVersions.grok || "",
         hostKind: "extension" as const,
         hostName: deviceDisplayName(os.hostname(), process.platform, os.release()),
@@ -23681,7 +23700,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
   html, body { background: var(--vscode-editor-background, var(--vscode-sideBar-background)); }
 </style>
 <link rel="stylesheet" href="${mediaUri("settings.css")}" />
-<title>Grok30m Settings</title>
+<title>Grok Settings</title>
 </head>
 <body class="settings-page">
   <div id="settings-root"></div>
@@ -23722,14 +23741,6 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
           } };
           if (msg.current) next.cliVersion = msg.current;
           surface.update(next);
-        }
-        if (msg.type === "communityLagStatus") {
-          surface.update({
-            communityBase: msg.base || "",
-            communityLatest: msg.latest || "",
-            communityBehind: !!msg.behind,
-            communityError: msg.error || "",
-          });
         }
         if (msg.type === "providerState" && Array.isArray(msg.providers)) {
           surface.update({ providers: msg.providers, providersChecking: msg.checking === true });
@@ -23795,9 +23806,9 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       ? `
   <aside id="projects-rail" class="projects-rail" aria-label="Projects">
     <div class="rail-top">
-      <span class="rail-brand" title="Grok30m">
+      <span class="rail-brand" title="Grok Build Desktop">
         <span class="mark" style="--rail-mark:url('${railMark}')" aria-hidden="true"></span>
-        <span class="wordmark"><b>Grok</b><span class="dim">30m</span></span>
+        <span class="wordmark"><b>Grok</b> <span class="dim">Build</span></span>
       </span>
       <button id="desk-rail-toggle" class="rail-icon-btn" type="button" title="Hide projects" aria-label="Hide projects" aria-expanded="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>
@@ -23891,7 +23902,7 @@ ${openMain}
     </div>
     <button id="repo-btn" class="repo-chip" type="button" title="Choose repository"></button>
     <button id="remote-btn" class="icon-btn remote-btn" title="Remote control" hidden></button>
-    ${this.useSessionsSidebar() ? "" : `<button id="history-btn" class="icon-btn" title="Session history"></button>`}
+    <button id="history-btn" class="icon-btn" title="Session history"></button>
     <button id="new-btn" class="icon-btn" title="New session"></button>
     ${this.host.canSwitchWorkspaceFolder ? `<div id="session-head-actions"></div>` : ""}
     ${this.host.canSwitchWorkspaceFolder ? "" : `<div id="vscode-session-actions"></div>`}
@@ -23902,8 +23913,8 @@ ${fileShellOpen}
   <main id="messages" class="messages">
     <div class="welcome" id="welcome">
       <span class="welcome-mark" role="img" aria-label="AFK Pilot" style="--welcome-mark:url('${resourceUri("grok-icon.svg")}')"></span>
-      <h2>${isCloudEnvironment() ? "AFK Pilot Cloud" : "Grok30m"}</h2>
-      ${isCloudEnvironment() ? "" : `<p class="welcome-byline muted">30m fork of Grok Build (Community) — <a href="https://github.com/thirtym/grok30m" class="muted-link">thirtym/grok30m</a></p>`}
+      <h2>${isCloudEnvironment() ? "AFK Pilot Cloud" : "AFK Pilot"}</h2>
+      ${isCloudEnvironment() ? "" : `<p class="welcome-byline muted">previously Grok Build (Community)</p>`}
       <p id="welcome-version" class="muted welcome-status-busy"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Starting</span></p>
       <div id="welcome-onboarding"></div>
     </div>

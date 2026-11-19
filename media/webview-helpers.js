@@ -1,11 +1,12 @@
 (function (root) {
   // Kept set-equal to INTERNAL_PROVIDERS by provider-enumerations.test.ts.
   const PROVIDER_ACTIONS = {
-    grok: { label: "Grok", deleteHistory: true, compact: true },
-    codex: { label: "Codex", deleteHistory: true, compact: true },
-    claude: { label: "Claude", deleteHistory: true, compact: true },
-    muse: { label: "Muse Code", deleteHistory: false, compact: false },
-    agy: { label: "Antigravity", deleteHistory: false, compact: false },
+    grok: { label: "Grok", deleteHistory: true, compact: true, clientMcp: true },
+    codex: { label: "Codex", deleteHistory: true, compact: true, clientMcp: true },
+    claude: { label: "Claude", deleteHistory: true, compact: true, clientMcp: true },
+    muse: { label: "Muse Code", deleteHistory: false, compact: false, clientMcp: false },
+    agy: { label: "Antigravity", deleteHistory: false, compact: false, clientMcp: false },
+    deepseek: { label: "DeepSeek", deleteHistory: false, compact: false, clientMcp: false },
   };
   function providerSupports(provider, action) {
     return Object.hasOwn(PROVIDER_ACTIONS, provider || "grok")
@@ -80,7 +81,7 @@
     "subscriptionUsage",
     "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "findInSession", "restoreComposer", "truncateMessages", "uiConfirmRequest", "uiConfirmResolved", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
     "sessionContext", "clearMessages", "onboarding", "error", "hostNotice", "xaiNotification", "subagentUpdate", "childStream", "runProgress", "sessions", "repoSessions", "pinnedSessions", "repos",
-    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "feedbackAvailability", "turnFeedbackAck", "usage", "steerByDefault", "promptNav", "pinLiveWorkflows", "expandDiffCard", "soundNotifications", "processingSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "imageOriginal", "moveComposerCaret",
+    "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "feedbackAvailability", "turnFeedbackAck", "usage", "steerByDefault", "promptNav", "pinLiveWorkflows", "expandDiffCard", "soundNotifications", "processingSound", "inputNeededSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "imageOriginal", "moveComposerCaret",
     "remoteStatus", "remoteHandoff", "showRemoteHandoff", "hostReachable", "hostLink",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
@@ -95,12 +96,12 @@
     "listRoutines", "saveRoutine", "deleteRoutine", "setRoutinePaused", "runRoutineNow",
     "setShowThinking", "setAppPurpose", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
-    "setContextWindow", "setModel", "installCodex", "cancelCodexInstall", "installAgy", "cancelAgyInstall", "agySignIn", "setExperimentalAntigravity", "runInstallCmd", "runMuseInstallCmd", "runGrokLogin", "cancelDeviceLogin", "submitDeviceLoginCode", "logout", "checkGrokUpdate", "updateGrok", "updateCodex", "updateClaude",
-    "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "sessionsReady", "setHideAutoSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "setRepoIcon", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
+    "setContextWindow", "setModel", "installCodex", "cancelCodexInstall", "installAgy", "cancelAgyInstall", "agySignIn", "setExperimentalAntigravity", "setExperimentalDeepSeek", "installDeepSeek", "cancelDeepSeekInstall", "deepseekConnect", "setDeepSeekHarness", "runInstallCmd", "runMuseInstallCmd", "runGrokLogin", "cancelDeviceLogin", "submitDeviceLoginCode", "logout", "checkGrokUpdate", "updateGrok", "updateCodex", "updateClaude",
+    "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "setRepoIcon", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
       "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "gitStatus", "gitFileDiff", "turnFileDiff", "turnFileOpenDiff", "gitRun", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
       "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop", "setVoiceBackend", "configureOpenAiVoice",
     "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "turnFeedback", "forkSession", "setSteerByDefault", "setPromptNav", "setPinLiveWorkflows", "setExpandDiffCard",
-    "setSoundNotifications", "setProcessingSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "setThumbsFeedback", "setDesktopTray", "summarizeSpeech", "requestImageFull", "requestImageOriginal", "composerFocus",
+    "setSoundNotifications", "setProcessingSound", "setInputNeededSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "setThumbsFeedback", "setDesktopTray", "summarizeSpeech", "requestImageFull", "requestImageOriginal", "composerFocus",
     "newWorktreeSession", "applyWorktree", "removeWorktree", "rewindSession", "editLastMessage", "uiConfirmAnswer", "workflowControl", "refreshContextDetails",
     "refreshSubscriptionUsage",
     "remoteSignIn", "remoteSignOut", "unlinkRemoteDevice", "openRemotePortal", "remoteHandoff", "showRemoteHandoff",
@@ -2196,7 +2197,7 @@
       if (known.isRemote && tip.remoteNeedsMcpSettings && !known.mcpSettings) return false;
       // -1 is "the host never told us" — see the doc comment.
       if (tip.id === "routines" && known.routineCount < 0) return false;
-      if (tip.id === "connectors" && known.connectorCount < 0) return false;
+      if (tip.id === "connectors" && (known.connectorCount < 0 || f.clientMcp === false)) return false;
       return tip.eligible(known);
     });
   }

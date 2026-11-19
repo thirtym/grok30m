@@ -1389,7 +1389,7 @@ describe("provider onboarding", () => {
       type: "initialState",
       effort: "", cwd: "/w", useCtrlEnter: false, extVersion: "3.18.0",
       showThinking: false, expandCommandOutputs: false, steerByDefault: false,
-      soundNotifications: false, processingSound: false, readRepliesAloud: false,
+      soundNotifications: false, processingSound: false, inputNeededSound: false, readRepliesAloud: false,
       capabilities: { remoteAgentSignIn: true },
     });
     posted.length = 0;
@@ -1842,14 +1842,14 @@ describe("Grokking… indicator (waiting placeholder)", () => {
     expect(input.placeholder).toBe("Ask Grok…");
   });
 
-  it("uses Opening AI for Codex while keeping the shared live-turn indicator", () => {
+  it("uses Thinking for Codex while keeping the shared live-turn indicator", () => {
     const h = bootWebview();
     dispatch(h.window, {
       type: "session", sessionId: "c1", models: [], currentModelId: "gpt-5.6-sol", provider: "codex",
     });
     dispatch(h.window, { type: "agentStart" });
     const el = grokking(h.doc)!;
-    expect(el.querySelector(".grokking-label")?.textContent).toBe("Opening AI");
+    expect(el.querySelector(".grokking-label")?.textContent).toBe("Thinking");
     expect(el.getAttribute("aria-label")).toBe("Codex is working");
     expect(el.querySelector(".grokking-icon svg")).not.toBeNull();
   });

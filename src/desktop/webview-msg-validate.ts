@@ -169,6 +169,8 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "runMuseInstallCmd":
     case "installCodex":
     case "cancelCodexInstall":
+    case "installDeepSeek":
+    case "cancelDeepSeekInstall":
     case "installAgy":
     case "cancelAgyInstall":
     case "checkGrokUpdate":
@@ -256,9 +258,11 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       } else return null;
       return { type, key: raw.key, value: raw.value } as WebviewMsg;
     case "setShowThinking":
+    case "setExperimentalDeepSeek":
     case "setExperimentalAntigravity":
     case "setSoundNotifications":
     case "setProcessingSound":
+    case "setInputNeededSound":
     case "setReadRepliesAloud":
     case "setSummarizeRepliesAloud":
     case "setExpandCommandOutputs":
@@ -517,6 +521,16 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
       break;
     case "githubLoginWithToken":
       if (!isString(raw.token) || !raw.token || raw.token.length > MAX_GITHUB_TOKEN_CHARS) return null;
+      break;
+    case "setDeepSeekHarness":
+      if (raw.harness !== "default" && raw.harness !== "minimal") return null;
+      if (!isString(raw.sessionId) || !raw.sessionId || !Number.isSafeInteger(raw.generation) || (raw.generation as number) < 0) return null;
+      if (raw.modelId !== undefined && !isString(raw.modelId)) return null;
+      if (raw.newConversation !== undefined) return null;
+      if (raw.draftId !== undefined && (!isString(raw.draftId) || !raw.draftId || raw.draftId.length > 200)) return null;
+      break;
+    case "deepseekConnect":
+      if (raw.key !== undefined && (typeof raw.key !== "string" || !raw.key || raw.key.length > 512 || /\s|[\x00-\x1f\x7f]/.test(raw.key))) return null;
       break;
     case "agySignIn":
       if (raw.method !== "google" && raw.method !== "api-key") return null;

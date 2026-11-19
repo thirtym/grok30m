@@ -205,7 +205,7 @@ describe("projects rail", () => {
       type: "initialState",
       effort: "", cwd: "", useCtrlEnter: false, extVersion: "0",
       showThinking: false, expandCommandOutputs: false, steerByDefault: false,
-      soundNotifications: false, processingSound: false, readRepliesAloud: false,
+      soundNotifications: false, processingSound: false, inputNeededSound: false, readRepliesAloud: false,
       capabilities: { addProjectFolder: true },
     });
     expect(rail(doc).textContent).toContain("Loading…");
@@ -337,6 +337,16 @@ describe("projects rail", () => {
     dispatch(h.window, { type: "sessionDot", id: "c1", dot: "none" });
     expect([...h.doc.querySelectorAll(".rail-session .provider-status-badge")].map((el) => el.className))
       .toEqual(["provider-status-badge dot-none", "provider-status-badge dot-none"]);
+  });
+
+  it("names the advertised DeepSeek glyph in its tooltip and accessible label", () => {
+    const h = boot("/work/alpha");
+    dispatch(h.window, { type: "providerState", providers: [{ id: "grok", connected: true }, { id: "deepseek", connected: true }] });
+    dispatch(h.window, sessionsFrame([{ ...row("d1", "/work/alpha", "DeepSeek session", 9), provider: "deepseek" }]));
+    const glyph = h.doc.querySelector(".rail-session .provider-deepseek") as HTMLElement;
+    expect(glyph).not.toBeNull();
+    expect(glyph.title).toBe("DeepSeek");
+    expect(glyph.getAttribute("aria-label")).toBe("DeepSeek");
   });
 
   it("renders duplicate ids once and selects equal GPT names by id", () => {
@@ -529,7 +539,7 @@ describe("projects rail", () => {
     dispatch(h.window, {
       type: "initialState", effort: "", cwd: "/work/alpha", useCtrlEnter: false, extVersion: "3.19.9",
       showThinking: false, expandCommandOutputs: false, steerByDefault: false, soundNotifications: false,
-      processingSound: false, readRepliesAloud: false, appPurpose: "coding", capabilities: {},
+      processingSound: false, inputNeededSound: false, readRepliesAloud: false, appPurpose: "coding", capabilities: {},
     });
     dispatch(h.window, { type: "repos", entries: repos, selectedCwd: "/work/alpha", activeCwd: "/work/alpha" });
 
@@ -2735,7 +2745,7 @@ describe("rail overflow menus toggle", () => {
       type: "initialState",
       effort: "medium", cwd: "/work/alpha", useCtrlEnter: false, extVersion: "0",
       showThinking: true, expandCommandOutputs: false, steerByDefault: false,
-      soundNotifications: false, processingSound: false, readRepliesAloud: false,
+      soundNotifications: false, processingSound: false, inputNeededSound: false, readRepliesAloud: false,
       capabilities: {
         uploadFile: true, remoteVoice: false,
         addProjectFolder: true, removeProjectFolder: true,

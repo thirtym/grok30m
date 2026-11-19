@@ -413,7 +413,7 @@ export type HostMsg =
       & import("./remote-files").RemoteProjectFileWire)
   | ({ type: "providerConfigWriteResult"; requestId?: string; provider: "grok" | "codex" | "claude"; relPath: string }
       & ({ ok: true; stamp: { mtimeMs: number; size: number } } | { ok: false; reason: string }))
-  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; steerByDefault: boolean; promptNav: boolean; /** Absent on older hosts means pinned. */ pinLiveWorkflows?: boolean; /** Absent on older hosts means collapsed. */ expandDiffCard?: boolean; soundNotifications: boolean; processingSound: boolean; readRepliesAloud: boolean; /** Global "Use this app for" — absent on older hosts means Knowledge work. */ appPurpose?: "knowledge" | "coding";
+  | { type: "initialState"; effort: string; cwd: string; useCtrlEnter: boolean; extVersion: string; showThinking: boolean; expandCommandOutputs: boolean; steerByDefault: boolean; promptNav: boolean; /** Absent on older hosts means pinned. */ pinLiveWorkflows?: boolean; /** Absent on older hosts means collapsed. */ expandDiffCard?: boolean; soundNotifications: boolean; processingSound: boolean; inputNeededSound: boolean; readRepliesAloud: boolean; /** Global "Use this app for" — absent on older hosts means Knowledge work. */ appPurpose?: "knowledge" | "coding";
       /** VS Code language id for command View all, from the host shell dialect.
        *  Absent on older hosts — View all then omits language. */
       commandLanguage?: string;
@@ -550,7 +550,7 @@ export type HostMsg =
   | { type: "providerState"; providers: { id: AcpProvider; connected: boolean; unavailableReason?: string; needsLogin?: boolean; keepsCliSignIn?: boolean; cliVersion?: string; adapterVersion?: string; latestCliVersion?: string; updateAvailable?: boolean; cliUpdate?: { status: "idle" | "running" | "succeeded" | "failed"; message?: string };
       /** Antigravity only: how it is signed in, and which ways have something
        *  stored on the machine. Never the key itself. Additive. */
-      signInMethod?: "google" | "api-key"; savedSignIns?: ("google" | "api-key")[] }[]; checking?: boolean }
+      keySource?: "environment" | "saved"; signInMethod?: "google" | "api-key"; savedSignIns?: ("google" | "api-key")[] }[]; checking?: boolean }
   /** Grok's grok.com + user-level MCP inventory (`_x.ai/mcp/list`; project-file
    *  servers omitted). The desk keeps launch recipes and `configFile`; remotes
    *  receive `projectMcpServerForRemote` (page fields only — no `tag`).
@@ -581,7 +581,7 @@ export type HostMsg =
     }
   | { type: "codexInstallProgress"; phase: "downloading" | "verifying" | "installing" | "idle"; receivedBytes?: number; totalBytes?: number; reason?: string }
   /** Same shape for the managed Antigravity server; desk only. */
-  | { type: "agyInstallProgress"; phase: "downloading" | "verifying" | "installing" | "idle"; receivedBytes?: number; totalBytes?: number; reason?: string }
+  | { type: "agyInstallProgress"; provider?: "agy" | "deepseek"; phase: "downloading" | "verifying" | "installing" | "idle"; receivedBytes?: number; totalBytes?: number; reason?: string }
   /** Plan picker gate. `recheckable` means the version probe failed (not a
    *  verified-old CLI) — the row stays clickable so a later pick re-probes. */
   | { type: "planModeAvailability"; available: boolean; reason?: string; recheckable?: boolean }
@@ -591,6 +591,7 @@ export type HostMsg =
   // grok.soundNotifications — live toggle for the turn-complete/error sound (#59).
   | { type: "soundNotifications"; value: boolean }
   | { type: "processingSound"; value: boolean }
+  | { type: "inputNeededSound"; value: boolean }
   // grok.readRepliesAloud — local VS Code speech-synthesis preference.
   | { type: "readRepliesAloud"; value: boolean }
   | { type: "summarizeRepliesAloud"; value: boolean }
@@ -667,7 +668,7 @@ export type HostMsg =
   // keeps its previous rule (Muse's button hidden, Codex without Plan).
   // Muse's native-id advertisement (three on cloud, four on desk) gates its names and new setMode values;
   // disabledModes adds launch restrictions without removing the choices.
-  | { type: "modeChanged"; modeId: string; modes?: ModeId[]; disabledModes?: Partial<Record<ModeId, string>> }
+  | { type: "modeChanged"; deepseekHarness?: "default" | "minimal"; deepseekShellUnsandboxed?: boolean; deepseekHarnessLocked?: boolean; deepseekHarnessContext?: { sessionId: string; modelId?: string; generation: number }; modeId: string; modes?: ModeId[]; disabledModes?: Partial<Record<ModeId, string>> }
   | { type: "openModePopover" }
   | { type: "voiceState"; status: "listening" | "transcribing" | "idle" }
   | { type: "voiceConfigured"; value: boolean; sendPhrase?: string; keyterms?: string[]; backendState?: VoiceBackendState }
@@ -858,7 +859,10 @@ export type HostMsg =
   | { type: "toolCallUpdate"; call: ToolCallPayload }
   | { type: "permissionRequest"; req: PermissionRequest }
   | { type: "permissionOptions"; requestId: number | string; options: PermissionRequest["options"] }
-  | { type: "permissionResolved"; requestId: number | string; optionId: string }
+  | ({ type: "permissionResolved"; requestId: number | string } & (
+      | { optionId: string; outcome?: never }
+      | { outcome: "closed"; optionId?: never }
+    ))
   | { type: "questionResolved"; requestId: number | string; outcome: "accepted" | "stale" | "closed" }
   | { type: "subscriptionUsage"; windows: SubscriptionWindow[] }
   // The host spreads the plan-review snapshot (planPath/planName) into the bare
@@ -912,7 +916,7 @@ export type HostMsg =
   // itself and a terminal is the better affordance, so nothing changes there.
   | {
       type: "onboarding";
-      state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "missing-muse" | "muse-login" | "missing-agy" | "agy-login" | "provider-connected" | "no-project";
+      state: "connect-agent" | "missing-cli" | "auth-required" | "missing-codex" | "codex-login" | "missing-claude" | "claude-login" | "missing-muse" | "muse-login" | "missing-agy" | "agy-login" | "missing-deepseek" | "deepseek-login" | "provider-connected" | "no-project";
       platform?: string;
       reason?: string;
       provider?: AcpProvider;
@@ -1295,6 +1299,7 @@ export type WebviewMsg =
   // grok.soundNotifications gear switch (#59) — persisted globally by the host.
   | { type: "setSoundNotifications"; value: boolean }
   | { type: "setProcessingSound"; value: boolean }
+  | { type: "setInputNeededSound"; value: boolean }
   | { type: "setReadRepliesAloud"; value: boolean }
   | { type: "setSummarizeRepliesAloud"; value: boolean }
   | { type: "summarizeSpeech"; requestId: number; text: string }
@@ -1355,6 +1360,11 @@ export type WebviewMsg =
    *  key, stored in HostSecrets; absent means the saved one. Host-local. */
   | { type: "agySignIn"; method: "google" | "api-key"; key?: string }
   | { type: "setExperimentalAntigravity"; value: boolean }
+  | { type: "setExperimentalDeepSeek"; value: boolean }
+  | { type: "installDeepSeek" }
+  | { type: "cancelDeepSeekInstall" }
+  | { type: "deepseekConnect"; key?: string }
+  | { type: "setDeepSeekHarness"; harness: "default" | "minimal"; sessionId: string; modelId?: string; generation: number; draftId?: string }
   | { type: "runInstallCmd" }
   | { type: "runMuseInstallCmd" }
   | { type: "runGrokLogin"; provider?: AcpProvider }
@@ -1629,7 +1639,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true, hostNotice: true,
   xaiNotification: true, subagentUpdate: true, childStream: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true, promptNav: true, pinLiveWorkflows: true, expandDiffCard: true,
-  soundNotifications: true, processingSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, showRemoteHandoff: true, remoteHandoff: true, hostReachable: true, hostLink: true,
+  soundNotifications: true, processingSound: true, inputNeededSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, showRemoteHandoff: true, remoteHandoff: true, hostReachable: true, hostLink: true,
   setAllToolDetails: true, focusInput: true, findInSession: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true, uiConfirmResolved: true,
   sessions: true, sessionRemoved: true, sessionOpening: true, projectPrompt: true, repoSessions: true, pinnedSessions: true, recentSessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, feedbackAvailability: true, turnFeedbackAck: true, usage: true,
@@ -1644,9 +1654,9 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   openProjectConfig: true, listMcpServers: true, connectMcpConnector: true, disconnectMcpConnector: true,
   listRoutines: true, saveRoutine: true, deleteRoutine: true, setRoutinePaused: true, runRoutineNow: true, showLogs: true, toggleDevTools: true, openSettings: true, openSettingsSurface: true, closeSettingsSurface: true, dismissWelcomeTip: true, welcomeTipShown: true, moveView: true,
   setShowThinking: true, setAppPurpose: true, setExpandCommandOutputs: true, setSteerByDefault: true, setPromptNav: true, setPinLiveWorkflows: true, setExpandDiffCard: true,
-  setSoundNotifications: true, setProcessingSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, setDesktopTray: true, summarizeSpeech: true, requestImageFull: true, requestImageOriginal: true, composerFocus: true,
+  setSoundNotifications: true, setProcessingSound: true, setInputNeededSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, setDesktopTray: true, summarizeSpeech: true, requestImageFull: true, requestImageOriginal: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
-  questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, installAgy: true, cancelAgyInstall: true, agySignIn: true, setExperimentalAntigravity: true, runInstallCmd: true, runMuseInstallCmd: true, runGrokLogin: true,
+  questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, installAgy: true, cancelAgyInstall: true, agySignIn: true, setExperimentalAntigravity: true, setExperimentalDeepSeek: true, installDeepSeek: true, cancelDeepSeekInstall: true, deepseekConnect: true, setDeepSeekHarness: true, runInstallCmd: true, runMuseInstallCmd: true, runGrokLogin: true,
   cancelDeviceLogin: true, submitDeviceLoginCode: true,
   logout: true, checkGrokUpdate: true, updateGrok: true, updateCodex: true, updateClaude: true, recheckConnection: true, refreshProviders: true, retryProviderSession: true,
   listSessions: true, sessionsReady: true, setHideAutoSessions: true, listRepoSessions: true, selectRepo: true, toggleRepoPin: true, toggleSessionPin: true,

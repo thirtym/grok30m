@@ -5,6 +5,7 @@
   // Antigravity exists only where the host names it in providerState: desk
   // hosts with the experimental setting on. Nothing else draws or sends it.
   let agyAdvertised = false;
+  let deepseekAdvertised = false;
   function namesProvider(value, id) {
     if (!value || typeof value !== "object") return false;
     return Object.entries(value).some(([key, child]) =>
@@ -13,12 +14,13 @@
   const vscode = { getState: () => hostApi.getState(), setState: value => hostApi.setState(value),
     postMessage: message => {
       if (namesProvider(message, "muse") && !museAvailable) return false;
+      if ((namesProvider(message, "deepseek") || ["installDeepSeek", "cancelDeepSeekInstall", "deepseekConnect", "setDeepSeekHarness"].includes(message.type)) && !deepseekAdvertised) return false;
       if (namesProvider(message, "agy") && !agyAdvertised) return false;
       return hostApi.postMessage(message);
     } };
   function offeredProviders() {
     return Object.keys(globalThis.GrokWebviewHelpers.PROVIDER_ACTIONS)
-      .filter(id => (id !== "muse" || museAvailable) && (id !== "agy" || agyAdvertised));
+      .filter(id => (id !== "muse" || museAvailable) && (id !== "agy" || agyAdvertised) && (id !== "deepseek" || deepseekAdvertised));
   }
   const hostWait = window.GrokHostWait.get();
   const pendingPreferences = new Map();
@@ -154,6 +156,7 @@
   const EXPAND_DIFF_CARD_KEY = "grok.remote.expandDiffCard";
   const PIN_LIVE_WORKFLOWS_KEY = IS_REMOTE ? "grok.remote.pinLiveWorkflows" : "grok.pinLiveWorkflows";
   const PROMPT_NAV_KEY = IS_REMOTE ? "grok.remote.promptNav" : "grok.promptNav";
+  const INPUT_NEEDED_SOUND_KEY = "grok.remote.inputNeededSound";
   const REMOTE_TTS_KEY = "grok.remote.tts";
   const REMOTE_TTS_SUMMARY_KEY = "grok.remote.ttsSummary";
   const REMOTE_STORAGE_SUFFIX = (
@@ -520,8 +523,12 @@
   // Canonical low→high ORDER for known effort ids, and the FALLBACK ladder when a
   // model advertises no menu (`max` is not a real grok level — see #3/#4).
   const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"];
+  // Sort order for ADVERTISED levels, wider than the fallback ladder: DeepSeek
+  // offers off/low/high/max and Codex max/ultra, which otherwise trailed the
+  // known ids in arrival order ("Low, High, Off, Max").
+  const EFFORT_ORDER = ["off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
   const GROK_ACTIVITY_VERB = "Grokking";
-  const CODEX_ACTIVITY_VERB = "Opening AI";
+  const THINKING_ACTIVITY_VERB = "Thinking";
   const CLAUDE_ACTIVITY_VERB = "Clauding";
   const COMPOSER_PLACEHOLDER = {
     grok: "Ask Grok\u2026",
@@ -529,6 +536,7 @@
     claude: "Ask Claude\u2026",
     muse: "Ask Muse…",
     agy: "Ask Antigravity…",
+    deepseek: "Ask DeepSeek…",
   };
   // What each level MEANS. The name is prepended from `effortLabel` rather than
   // spelled here, so one level cannot be called two things in one popover — the
@@ -560,8 +568,8 @@
       ? m.reasoningEfforts.filter((v) => typeof v === "string" && v)
       : [];
     if (!adv.length) return EFFORT_LEVELS.slice();
-    const known = EFFORT_LEVELS.filter((id) => adv.includes(id));
-    const extra = adv.filter((id) => !EFFORT_LEVELS.includes(id)); // unknown advertised → keep as given
+    const known = EFFORT_ORDER.filter((id) => adv.includes(id));
+    const extra = adv.filter((id) => !EFFORT_ORDER.includes(id)); // unknown advertised → keep as given
     return [...known, ...extra];
   }
 
@@ -592,6 +600,8 @@
      *  Settings so a connect started there reports where the click happened. */
     deviceLoginByProvider: {},
     codexInstall: { phase: "idle", receivedBytes: 0, totalBytes: 0, reason: "" },
+    deepseekHarness: "default",
+    deepseekInstall: { phase: "idle", receivedBytes: 0, totalBytes: 0, reason: "" },
     agyInstall: { phase: "idle", receivedBytes: 0, totalBytes: 0, reason: "" },
     availableModels: [],
     currentModeId: "agent",
@@ -1031,6 +1041,9 @@
     // grok.processingSound: a quiet repeating cue while a live turn is still
     // running. Separate from the completion/error notification and off by default.
     processingSound: false,
+    // grok.inputNeededSound on a desk; on a phone or browser tab it is this
+    // device's own choice, kept across reloads and never taken from the host.
+    inputNeededSound: IS_REMOTE ? storedBool(INPUT_NEEDED_SOUND_KEY, false) : false,
     // grok.worktree — true when the focused session runs in an isolated git
     // worktree (from the `session` message). Gates the gear Apply/Remove items.
     isWorktree: false,
@@ -1201,7 +1214,8 @@
 
   // ---------- sound notifications (#59) ----------
   // Synth tones via Web Audio — no bundled assets, CSP-safe, offline. Completion
-  // rises, errors fall, and the in-flight reminder is a single soft pulse. The
+  // rises, errors fall, input-needed goes high-low-high, and the in-flight
+  // reminder is a single soft pulse. The
   // AudioContext is created only while a sound setting is on, unlocked on the
   // first user gesture (autoplay starts it "suspended"), and suspended again
   // once the last note ends — a running-but-silent context holds the OS audio
@@ -1212,7 +1226,7 @@
   let audioToneGen = 0;
   let audioSuspendTimer = null;
   function soundFeaturesOn() {
-    return !!(state.soundNotifications || state.processingSound);
+    return !!(state.soundNotifications || state.processingSound || state.inputNeededSound);
   }
   function ensureAudioCtx() {
     if (audioCtx) return audioCtx;
@@ -1275,7 +1289,9 @@
       ? [{ f: 311, s: 0, d: 0.18 }, { f: 233, s: 0.15, d: 0.26 }]
       : kind === "processing"
         ? [{ f: 440, s: 0, d: 0.16 }]
-        : [{ f: 587, s: 0, d: 0.14 }, { f: 880, s: 0.13, d: 0.20 }];
+        : kind === "inputNeeded"
+          ? [{ f: 784, s: 0, d: 0.12 }, { f: 659, s: 0.14, d: 0.12 }, { f: 784, s: 0.28, d: 0.22 }]
+          : [{ f: 587, s: 0, d: 0.14 }, { f: 880, s: 0.13, d: 0.20 }];
     const master = ctx.createGain();
     master.gain.value = kind === "processing" ? 0.035 : 0.08;
     master.connect(ctx.destination);
@@ -1310,6 +1326,40 @@
     const away = document.visibilityState === "hidden" || !document.hasFocus();
     if (!away) return;
     playNotificationTone(kind);
+  }
+
+  // Catalog dots are current-state baselines, never notifications. Only an
+  // observed working → needs-you delta can ring: the first waiting dot on a
+  // fresh page, repeated dots, and pending cards restored AFTER replay stay quiet.
+  // A history replay does NOT reset the baselines: opening another conversation
+  // while a turn runs re-sends no `working` dot, so forgetting it there made the
+  // approval that followed silent. Dots seen during a replay are recorded, never rung.
+  const inputSoundDots = new Map();
+  let inputSoundConnection = null;
+  function observeInputNeededSound(msg) {
+    if (msg.type === "initialState" || msg.type === "hostReachable") {
+      inputSoundDots.clear();
+      return;
+    }
+    if (msg.type === "hostLink" && msg.link) {
+      if (!msg.link.reachable || inputSoundConnection !== msg.link.connection) inputSoundDots.clear();
+      inputSoundConnection = msg.link.connection;
+      return;
+    }
+    if (["sessions", "repoSessions", "pinnedSessions", "recentSessions"].includes(msg.type)) {
+      for (const [id, dot] of Object.entries(msg.dots || {})) inputSoundDots.set(id, dot);
+      return;
+    }
+    if (msg.type === "sessionRemoved") {
+      inputSoundDots.delete(msg.id);
+      return;
+    }
+    if (msg.type !== "sessionDot") return;
+    const previous = inputSoundDots.get(msg.id);
+    inputSoundDots.set(msg.id, msg.dot);
+    if (state.replaying || previous !== "working" || msg.dot !== "needs-you" || !state.inputNeededSound) return;
+    if (document.visibilityState !== "hidden" && document.hasFocus()) return;
+    playNotificationTone("inputNeeded");
   }
 
   function moveComposerCaret(direction) {
@@ -1419,8 +1469,9 @@
 
   // Advertised `modes` wins. Absent (an older host) keeps today's rule.
   function offeredModeIds() {
+    if (state.activeProvider === "deepseek" && !deepseekAdvertised) return [];
     if (Array.isArray(state.offeredModes)) return state.offeredModes;
-    if (state.activeProvider === "muse") return [];
+    if (state.activeProvider === "muse" || state.activeProvider === "deepseek") return [];
     return Object.keys(MODE_META).filter((id) => id !== "auto" && (id !== "plan" || state.activeProvider !== "codex"));
   }
 
@@ -1472,6 +1523,7 @@
 
   function updateModeBtn(modeId) {
     modeBtn.hidden = offeredModeIds().length === 0;
+    renderDeepSeekHarness();
     const meta = modeMeta(modeId);
     modeBtn.innerHTML = `${meta.icon}<span class="btn-label">${escapeHtml(meta.label)}</span>`;
     modeBtn.classList.toggle("plan-active", modeId === "plan");
@@ -2526,7 +2578,7 @@
     // reaching for the size dropdown. So a size control that would be redrawn
     // identically, and still shows what it was drawn with, stays in place while
     // everything around it is rebuilt.
-    const sizeControl = contextWindowControl();
+    const sizeControl = contextWindowControl() || deepseekHarnessControl();
     const prior = contextPopover.querySelector(".context-window-control");
     const priorSelect = prior && prior.querySelector("select");
     const keep = sizeControl && prior && prior.dataset.key === sizeControl.dataset.key
@@ -2632,6 +2684,12 @@
       };
     }
     if (globalThis.GrokWebviewHelpers.providerSupports(state.activeProvider, "compact")) lead.appendChild(act);
+    if (state.activeProvider === "deepseek") {
+      const note = document.createElement("div");
+      note.className = "popover-fineprint";
+      note.textContent = "Manual compaction is unavailable through DeepSeek's ACP connection.";
+      lead.appendChild(note);
+    }
     contextPopover.insertBefore(lead, keep);
     if (!keep && sizeControl) contextPopover.appendChild(sizeControl);
 
@@ -2713,7 +2771,7 @@
     // comment further down records what returning early from here cost last
     // time. Building a handful of detached nodes and dropping them is the
     // cheaper mistake.
-    if (state.subscriptionUsageKnown) contextPopover.appendChild(subscription);
+    if (state.subscriptionUsageKnown && state.activeProvider !== "deepseek") contextPopover.appendChild(subscription);
 
     // KNOWLEDGE WORK STOPS HERE: the numbers and the action on them, nothing
     // else. Context occupancy and account capacity both answer "can I keep
@@ -2826,7 +2884,7 @@
     fine.textContent = turn || sess
       ? "Context is how full the window is. Token counts are billed usage tracked here — each model call re-sends the conversation, so a turn bills far more than the context it holds."
       : "Counted by the CLI at the end of each turn.";
-    contextPopover.appendChild(fine);
+    if (state.activeProvider !== "deepseek" || turn || sess) contextPopover.appendChild(fine);
 
     showContextPopover();
   }
@@ -2848,6 +2906,15 @@
     popover.style.bottom = (unzoomClientPx(composerRect.bottom - btnRect.top, z) + 4) + "px";
     popover.style.left = unzoomClientPx(btnRect.left - composerRect.left, z) + "px";
     popover.style.right = "auto";
+    if (popover === contextPopover) {
+      // Right anchoring remains valid when a locked harness adds wider copy.
+      // Cap against the actual panel (also when the UI is zoomed), not the
+      // browser viewport, which can contain the projects rail as well.
+      popover.style.setProperty("--context-panel-width", Math.max(0, unzoomClientPx(composerRect.width, z) - 12) + "px");
+      popover.style.left = "auto";
+      popover.style.right = "6px";
+      return;
+    }
     // A menu pushed back from the right keeps the gap positionDropdownPopover
     // keeps. On a phone the composer spans the screen, so a clamp to the
     // composer's edge put the menu flush against the glass.
@@ -3575,6 +3642,7 @@
       fontScale: CLIENT_OWNS_FONT_SCALE ? state.remoteFontScale : state.hostFontScale,
       soundNotifications: !!state.soundNotifications,
       processingSound: !!state.processingSound,
+      inputNeededSound: !!state.inputNeededSound,
       readRepliesAloud: IS_REMOTE ? !!state.remoteTts : !!state.readRepliesAloud,
       summarizeRepliesAloud: IS_REMOTE ? !!state.remoteSummarizeRepliesAloud : !!state.summarizeRepliesAloud,
       voiceConfigured: !!state.voiceConfigured,
@@ -3679,6 +3747,14 @@
         state.soundNotifications = !!value;
         unlockAudio();
         break;
+      case "inputNeededSound":
+        state.inputNeededSound = !!value;
+        unlockAudio();
+        // Remote only, like promptNav: the host never stores a remote's choice,
+        // so a reconnect snapshot would otherwise switch it back off.
+        if (!IS_REMOTE) break;
+        storeRemotePref(INPUT_NEEDED_SOUND_KEY, state.inputNeededSound);
+        return;
       case "processingSound":
         state.processingSound = !!value;
         unlockAudio();
@@ -4347,6 +4423,50 @@
    *  `dataset.key` names everything the control draws, so a rebuild of the
    *  popup can keep a control that would come out identical (see
    *  renderContextPopover). */
+  function deepseekHarnessControl() {
+    const identity = state.deepseekHarnessContext;
+    if (!deepseekAdvertised || state.activeProvider !== "deepseek" || !identity
+      || identity.sessionId !== state.contextSelectionSessionId || !identity.modelId || identity.modelId !== state.currentModelId) return null;
+    const value = state.deepseekHarness || "default";
+    const locked = !!state.deepseekHarnessLocked || visibleUserBubbleCount() > 0;
+    const busy = !!(state.busy || state.busyLocked || state.startingPhase || state.deepseekHarnessPending);
+    const wrap = document.createElement("div");
+    wrap.className = "context-window-control deepseek-harness-control";
+    wrap.dataset.key = JSON.stringify([identity, value, locked, busy]);
+    const row = document.createElement("div");
+    row.className = "popover-info context-window-row";
+    const label = document.createElement("label");
+    label.htmlFor = "deepseek-harness"; label.textContent = "Harness";
+    const select = document.createElement("select");
+    select.id = "deepseek-harness"; select.className = "settings-select context-window-select";
+    select.innerHTML = '<option value="default">Default</option><option value="minimal">Minimal</option>';
+    select.value = value; select.disabled = locked || busy;
+    const choose = (harness) => {
+      const now = state.deepseekHarnessContext;
+      if (!deepseekAdvertised || state.activeProvider !== "deepseek" || state.busy || state.busyLocked || state.startingPhase || state.deepseekHarnessPending
+        || !now || now.sessionId !== identity.sessionId || now.generation !== identity.generation || now.modelId !== identity.modelId
+        || state.currentModelId !== identity.modelId || state.deepseekHarnessLocked || visibleUserBubbleCount() > 0) return;
+      state.deepseekHarnessPending = true;
+      // The replacement process still represents this untouched conversation.
+      const draftId = newRemoteTabToken();
+      pendingComposerDrafts.add(draftId);
+      composerSessionId = draftId;
+      composerLoadDraft = null;
+      composerExpectedSessionId = null;
+      syncFocusedRemoteHandoff();
+      vscode.postMessage({ type: "setDeepSeekHarness", ...identity, harness, draftId });
+      renderContextPopover();
+    };
+    select.onchange = () => { const next = select.value; select.value = value; choose(next); };
+    row.append(label, select); wrap.append(row);
+    const note = document.createElement("div"); note.className = "popover-fineprint";
+    note.textContent = locked ? "Start a new session to use a different DeepSeek harness."
+      : busy ? "Waiting for the harness to be ready."
+        : "Choose before your first message.";
+    wrap.append(note);
+    return wrap;
+  }
+
   function contextWindowControl() {
     const selection = sessionContextWindowSelection();
     if (!selection) return null;
@@ -4440,6 +4560,7 @@
     // rows are replaced by the one action that can actually help.
     const signInProviders = offeredProviders().filter(providerNeedsLogin);
     models = models.filter((model) => ((model.provider || state.activeProvider) !== "muse" || museAvailable)
+      && ((model.provider || state.activeProvider) !== "deepseek" || deepseekAdvertised)
       && ((model.provider || state.activeProvider) !== "agy" || agyAdvertised)
       && !signInProviders.includes(model.provider || state.activeProvider));
     if (grouped) {
@@ -5193,6 +5314,7 @@
 
   function refreshModelControls() {
     syncModelChip();
+    renderWelcomeTip(); // A provider change can withdraw the connectors tip.
     if (!gearPopover.hidden && state.gearView === "model") renderModelPicker();
   }
 
@@ -5542,6 +5664,7 @@
     // four with it and the other three render the same either way.
     muse: "M6.897 4c1.915 0 3.516.932 5.43 3.376l.282-.373c.19-.246.383-.484.58-.71l.313-.35C14.588 4.788 15.792 4 17.225 4c1.273 0 2.469.557 3.491 1.516l.218.213c1.73 1.765 2.917 4.71 3.053 8.026l.011.392.002.25c0 1.501-.28 2.759-.818 3.7l-.14.23-.108.153c-.301.42-.664.758-1.086 1.009l-.265.142-.087.04a3.493 3.493 0 01-.302.118 4.117 4.117 0 01-1.33.208c-.524 0-.996-.067-1.438-.215-.614-.204-1.163-.56-1.726-1.116l-.227-.235c-.753-.812-1.534-1.976-2.493-3.586l-1.43-2.41-.544-.895-1.766 3.13-.343.592C7.597 19.156 6.227 20 4.356 20c-1.21 0-2.205-.42-2.936-1.182l-.168-.184c-.484-.573-.837-1.311-1.043-2.189l-.067-.32a8.69 8.69 0 01-.136-1.288L0 14.468c.002-.745.06-1.49.174-2.23l.1-.573c.298-1.53.828-2.958 1.536-4.157l.209-.34c1.177-1.83 2.789-3.053 4.615-3.16L6.897 4zm-.033 2.615l-.201.01c-.83.083-1.606.673-2.252 1.577l-.138.199-.01.018c-.67 1.017-1.185 2.378-1.456 3.845l-.004.022a12.591 12.591 0 00-.207 2.254l.002.188c.004.18.017.36.04.54l.043.291c.092.503.257.908.486 1.208l.117.137c.303.323.698.492 1.17.492 1.1 0 1.796-.676 3.696-3.641l2.175-3.4.454-.701-.139-.198C9.11 7.3 8.084 6.616 6.864 6.616zm10.196-.552l-.176.007c-.635.048-1.223.359-1.82.933l-.196.198c-.439.462-.887 1.064-1.367 1.807l.266.398c.18.274.362.56.55.858l.293.475 1.396 2.335.695 1.114c.583.926 1.03 1.6 1.408 2.082l.213.262c.282.326.529.54.777.673l.102.05c.227.1.457.138.718.138.176.002.35-.023.518-.073.338-.104.61-.32.813-.637l.095-.163.077-.162c.194-.459.29-1.06.29-1.785l-.006-.449c-.08-2.871-.938-5.372-2.2-6.798l-.176-.189c-.67-.683-1.444-1.074-2.27-1.074z",
     // Google Antigravity's mark, from the same Lobe set (1.95.1).
+    deepseek: "M23.44099 4.82299C23.19514 4.70016 23.0892 4.9343 22.94554 5.05334C22.89634 5.09179 22.85486 5.14171 22.8131 5.18765C22.45406 5.57952 22.0343 5.83666 21.48586 5.80594C20.6843 5.76 19.99968 6.01709 19.39478 6.6431C19.2661 5.87131 18.83885 5.41056 18.18845 5.11478C17.84813 4.96123 17.50406 4.80749 17.2657 4.47351C17.09928 4.23539 17.05406 3.97055 16.97088 3.70922C16.91789 3.55195 16.86494 3.3907 16.68725 3.36375C16.49438 3.33305 16.41869 3.49805 16.34299 3.63633C16.04064 4.20094 15.92318 4.82299 15.9347 5.45275C15.96115 6.86976 16.54733 7.99877 17.71195 8.80123C17.84438 8.89334 17.87837 8.98546 17.83666 9.12C17.75741 9.39634 17.66275 9.66514 17.57952 9.94171C17.52658 10.11845 17.44733 10.15666 17.26195 10.08C16.62283 9.80741 16.07088 9.40406 15.58291 8.91634C14.75486 8.09861 14.00602 7.19602 13.07203 6.4896C12.85267 6.32438 12.63326 6.17088 12.40642 6.02486C11.45366 5.08032 12.53131 4.30453 12.78096 4.21242C13.04179 4.11633 12.87163 3.7861 12.02837 3.79008C11.18506 3.79383 10.41374 4.08188 9.43056 4.46578C9.2869 4.52344 9.13546 4.56563 8.98056 4.60031C8.08805 4.42734 7.16155 4.3889 6.19358 4.50047C4.37086 4.70766 2.91492 5.58701 1.84476 7.08869C0.55898 8.89334 0.25641 10.9439 0.62719 13.08283C1.01649 15.33701 2.14359 17.2031 3.87539 18.66235C5.67163 20.17546 7.74024 20.91658 10.09968 20.77454C11.53291 20.68992 13.12877 20.49422 14.92877 18.93893C15.38251 19.16928 15.85901 19.26139 16.64928 19.33056C17.25821 19.38821 17.84438 19.29984 18.29813 19.20374C19.00901 19.05024 18.95976 18.37829 18.70267 18.25546C16.61904 17.26454 17.07658 17.66789 16.6608 17.34139C17.71944 16.06267 19.3153 14.73398 19.9392 10.42944C19.98845 10.08773 19.94674 9.87259 19.9392 9.59602C19.93546 9.42701 19.97318 9.36187 20.16235 9.34267C20.6843 9.28123 21.19099 9.13522 21.65602 8.87414C23.00602 8.12155 23.55072 6.88502 23.67912 5.40283C23.69813 5.17618 23.67538 4.94203 23.44099 4.82299ZM11.67658 18.1631C9.65741 16.54267 8.67797 16.00901 8.27318 16.03195C7.89514 16.05514 7.9631 16.49674 8.04634 16.78454C8.13326 17.06885 8.24698 17.26478 8.40562 17.51414C8.5153 17.67936 8.59099 17.92522 8.29594 18.10944C7.64554 18.52032 6.51494 17.97115 6.46195 17.94422C5.14594 17.15318 4.04555 16.10885 3.27047 14.68032C2.52164 13.30546 2.08688 11.83099 2.01492 10.2565C1.99594 9.87634 2.10563 9.74203 2.47617 9.67291C2.96414 9.5808 3.46711 9.56155 3.95484 9.63446C6.0157 9.94171 7.77048 10.88251 9.24139 12.37243C10.08096 13.22107 10.7161 14.23478 11.37048 15.2257C12.0661 16.27781 12.81494 17.28 13.76789 18.10171C14.10446 18.38976 14.37283 18.60869 14.62992 18.76992C13.85486 18.85829 12.56155 18.87749 11.67658 18.1631ZM12.64478 11.80805C12.64478 11.63904 12.77717 11.50454 12.94358 11.50454C12.98131 11.50454 13.0153 11.51227 13.04554 11.52374C13.08725 11.5392 13.12502 11.56219 13.15522 11.5969C13.20821 11.65056 13.23845 11.72741 13.23845 11.80805C13.23845 11.97701 13.10602 12.11131 12.9396 12.11131C12.77318 12.11131 12.64478 11.97701 12.64478 11.80805ZM15.65107 13.38235C15.45821 13.46299 15.2653 13.53211 15.07992 13.53984C14.79259 13.55506 14.47877 13.43626 14.30861 13.29024C14.04398 13.06358 13.85486 12.93701 13.77538 12.54139C13.74139 12.37243 13.7604 12.11131 13.79064 11.96155C13.85861 11.63904 13.78291 11.43163 13.55976 11.24342C13.37837 11.08992 13.14773 11.04773 12.89438 11.04773C12.79968 11.04773 12.71275 11.0053 12.64853 10.97088C12.54259 10.91717 12.45562 10.78267 12.53885 10.61765C12.5653 10.56374 12.69398 10.43318 12.72422 10.41024C13.06829 10.21056 13.4653 10.2757 13.83211 10.42546C14.17243 10.56773 14.42952 10.82885 14.80032 11.19749C15.17837 11.64283 15.24634 11.76562 15.46195 12.09984C15.63211 12.36096 15.78725 12.62976 15.89299 12.93701C15.95741 13.12901 15.87422 13.2865 15.65107 13.38235Z",
     agy: "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z",
   };
 
@@ -5578,6 +5701,7 @@
     if (provider === "codex") return "Codex";
     if (provider === "claude") return "Claude";
     if (provider === "muse") return "Muse Code";
+    if (provider === "deepseek") return "DeepSeek";
     if (provider === "agy") return "Antigravity";
     return "Grok";
   }
@@ -5591,7 +5715,7 @@
   }
 
   function providerLogoId(provider) {
-    if (provider === "codex" || provider === "claude" || provider === "muse" || provider === "agy") return provider;
+    if (provider === "codex" || provider === "claude" || provider === "muse" || provider === "agy" || provider === "deepseek" && deepseekAdvertised) return provider;
     return "grok";
   }
 
@@ -9972,7 +10096,7 @@
     const host = state.welcomeTips || {};
     const providers = state.providers || [];
     const altConnected = providers.some(
-      (p) => p && (p.id === "codex" || p.id === "claude" || p.id === "muse" && museAdvertised || p.id === "agy" && agyAdvertised) && p.connected,
+      (p) => p && (p.id === "codex" || p.id === "claude" || p.id === "muse" && museAdvertised || p.id === "agy" && agyAdvertised || p.id === "deepseek" && deepseekAdvertised) && p.connected,
     );
     return {
       appPurpose: state.appPurpose === "coding" ? "coding" : "knowledge",
@@ -9997,6 +10121,7 @@
       remoteCanConnectAgents: !!(state.hostCaps && state.hostCaps.remoteAgentSignIn),
       // The same capability Settings gates its Connectors category on.
       mcpSettings: !!(state.hostCaps && state.hostCaps.mcpSettings),
+      clientMcp: globalThis.GrokWebviewHelpers.providerSupports(state.activeProvider, "clientMcp"),
       routineCount: host.routineCount,
       connectorCount: host.connectorCount,
       // A phone's read-aloud is its own client-side preference, not the desk's.
@@ -11089,7 +11214,7 @@
     // The products' own names, everywhere this panel speaks. Not "Grok": that
     // is the model, the extension is Grok Build, and a heading that disagrees
     // with the button beneath it reads as two different things to connect.
-    const NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code", muse: "Muse Code", agy: "Antigravity" };
+    const NAMES = { grok: "Grok Build", codex: "Codex", claude: "Claude Code", muse: "Muse Code", agy: "Antigravity", deepseek: "DeepSeek" };
     const name = NAMES[provider] || "an agent";
     const status = (text) => { if (ver) setWelcomeStatus(text, false); };
 
@@ -11359,6 +11484,9 @@
   function renderConnectWizard() {
     if (!connectWizard) return;
     const provider = connectWizard.provider;
+    if (provider === "deepseek" && deepseekAdvertised) {
+      connectWizard.body.innerHTML = deepseekPanel(connectWizard.deepseekMode || "deepseek-login", state.onboardingInfo); return;
+    }
     if (connectWizard.museOnboarding) {
       connectWizard.body.innerHTML = museOnboardingPanel(connectWizard.museOnboarding.mode, connectWizard.museOnboarding.info);
       return;
@@ -11403,11 +11531,15 @@
     if (!IS_REMOTE && connectWizard && connectWizard.provider === provider) {
       connectWizard.checking = false;
       connectWizard.launched = !!(info && info.launched);
-      if (!device && provider !== "muse" && provider !== "agy") {
+      if (!device && provider !== "muse" && provider !== "agy" && provider !== "deepseek") {
         if (mode === "provider-connected" || !CONNECT_ONBOARDING_MODES[mode]) closeConnectWizard();
         else renderConnectWizard();
         return;
       }
+    }
+    if (provider === "deepseek" && deepseekAdvertised && !IS_REMOTE) {
+      if (mode === "provider-connected") { closeConnectWizard(); return; }
+      openConnectWizard(provider); connectWizard.deepseekMode = mode; renderConnectWizard(); return;
     }
     if (!IS_REMOTE && provider !== "muse" && provider !== "agy") return;
     // Antigravity's install and sign-in panels, at the desk. A missing server
@@ -11503,6 +11635,7 @@
     "claude-login": true,
     "muse-login": true,
     "agy-login": true,
+    "deepseek-login": true,
     "auth-required": true,
   };
 
@@ -11558,32 +11691,69 @@
    * Google sign-in. A remote gets neither -- signing in opens a browser on the
    * desk, so it says where to do it instead.
    */
+  function managedAgentInstallPanel(provider, info) {
+      const name = provider === "deepseek" ? "DeepSeek" : "Antigravity";
+      const suffix = provider === "deepseek" ? "DeepSeek" : "Agy";
+      const install = state[provider === "deepseek" ? "deepseekInstall" : "agyInstall"];
+      const installing = install.phase !== "idle";
+      const percent = install.totalBytes > 0 && (provider !== "deepseek" || install.phase === "downloading")
+        ? Math.min(100, Math.round((install.receivedBytes / install.totalBytes) * 100))
+        : null;
+      const progressLabel = install.phase === "downloading"
+        ? `Downloading ${name}${percent == null ? "" : ` (${percent}%)`}...`
+        : install.phase === "verifying" ? "Verifying the download..."
+        : install.phase === "installing" ? (provider === "agy" ? "Unpacking Antigravity..." : "Installing DeepSeek...") : "";
+      const reason = (info && info.reason) || install.reason;
+      return `<div class="onb"><p class="onb-heading">Install ${name}</p>`
+        + `<p class="onb-desc">${provider === "deepseek" ? "Install the pinned official dsh harness and its private Node runtime into this app's storage. Your system Node is unchanged." : "Download Google's Antigravity agent server into this app's storage. It is a large download: about 125 MB, and more on Linux."}</p>`
+        + (reason ? `<p class="onb-install-error" role="alert">${escapeHtml(reason)}</p>` : "")
+        + (installing
+          ? `<div class="onb-install-progress" role="status"><span>${provider === "deepseek" ? escapeHtml(progressLabel.replace(/\.\.\.$/, "")) + BLINK_DOTS : escapeHtml(progressLabel)}</span>`
+            + (percent == null ? "" : `<progress max="100" value="${percent}">${percent}%</progress>`)
+            + `<button class="onb-action onb-secondary" type="button" data-act="cancel${suffix}Install">Cancel</button></div>`
+          : `<button class="onb-action" type="button" data-act="install${suffix}">Install ${name}</button>`)
+        + `<button class="onb-action onb-secondary" type="button" data-act="recheckProvider" data-provider="${provider}">Re-check</button></div>`;
+    }
+
+  function paintDeepSeekCard(mode, info, onb) {
+    if (mode !== "missing-deepseek" && mode !== "deepseek-login") return false;
+    onb.innerHTML = deepseekPanel(mode, info); return true;
+  }
+  function deepseekPanel(mode, info) {
+    if (IS_REMOTE) return '<div class="onb"><p class="onb-heading">Connect DeepSeek at the computer</p><p class="onb-desc">Install dsh and enter its API key on the computer running this workspace.</p></div>';
+    if (mode === "missing-deepseek") return managedAgentInstallPanel("deepseek", info);
+    const provider = state.providers.find(p => p.id === "deepseek") || {};
+    if (provider.keySource === "environment") {
+      return '<div class="onb"><p class="onb-heading">Connect DeepSeek</p><p class="onb-desc">Uses the key from the DEEPSEEK_API_KEY environment variable.</p><button class="onb-action" data-act="deepseekConnect">Connect</button></div>';
+    }
+    const source = provider.keySource === "environment" ? "DEEPSEEK_API_KEY environment variable" : provider.keySource === "saved" ? "saved key" : "no key configured";
+    return `<div class="onb"><p class="onb-heading">Connect DeepSeek</p><p class="onb-desc">Key source: ${source}. Environment takes precedence. A saved key stays in secure storage on this computer.</p>
+      <input class="onb-code-input onb-deepseek-key" type="password" maxlength="512" autocomplete="off" spellcheck="false" placeholder="Paste API key" aria-label="DeepSeek API key">
+      <button class="onb-action" data-act="deepseekConnect">${provider.keySource ? "Connect (or replace saved key)" : "Save key and connect"}</button></div>`;
+  }
+
+  function renderDeepSeekHarness() {
+    let banner = $("deepseek-full-access");
+    const visible = deepseekAdvertised && state.activeProvider === "deepseek";
+    if (!banner && visible) {
+      banner = document.createElement("p"); banner.id = "deepseek-full-access"; banner.className = "onb-desc";
+      const composer = document.querySelector(".composer"); if (composer) composer.prepend(banner);
+    }
+    if (banner) {
+      // Default's unsandboxed Windows shell is deliberately not announced here
+      // (owner, 2026-11-03); only Minimal's no-approval mode is.
+      banner.textContent = "Minimal runs with full access to files and shell commands, without approval prompts.";
+      banner.hidden = !visible || state.deepseekHarness !== "minimal";
+    }
+    if (!contextPopover.hidden) renderContextPopover();
+  }
+
   function agyOnboardingPanel(mode, info) {
     if (IS_REMOTE) {
       return `<div class="onb"><p class="onb-heading">Connect Antigravity at the computer</p>`
         + `<p class="onb-desc">Antigravity signs in with Google in a browser on the computer running this workspace. Connect it there, then use it from here.</p></div>`;
     }
-    if (mode === "missing-agy") {
-      const install = state.agyInstall;
-      const installing = install.phase !== "idle";
-      const percent = install.totalBytes > 0
-        ? Math.min(100, Math.round((install.receivedBytes / install.totalBytes) * 100))
-        : null;
-      const progressLabel = install.phase === "downloading"
-        ? `Downloading Antigravity${percent == null ? "" : ` (${percent}%)`}...`
-        : install.phase === "verifying" ? "Verifying the download..."
-        : install.phase === "installing" ? "Unpacking Antigravity..." : "";
-      const reason = (info && info.reason) || install.reason;
-      return `<div class="onb"><p class="onb-heading">Install Antigravity</p>`
-        + `<p class="onb-desc">Download Google's Antigravity agent server into this app's storage. It is a large download: about 125 MB, and more on Linux.</p>`
-        + (reason ? `<p class="onb-install-error" role="alert">${escapeHtml(reason)}</p>` : "")
-        + (installing
-          ? `<div class="onb-install-progress" role="status"><span>${escapeHtml(progressLabel)}</span>`
-            + (percent == null ? "" : `<progress max="100" value="${percent}">${percent}%</progress>`)
-            + `<button class="onb-action onb-secondary" type="button" data-act="cancelAgyInstall">Cancel</button></div>`
-          : `<button class="onb-action" type="button" data-act="installAgy">Install Antigravity</button>`)
-        + `<button class="onb-action onb-secondary" type="button" data-act="recheckProvider" data-provider="agy">Re-check</button></div>`;
-    }
+    if (mode === "missing-agy") return managedAgentInstallPanel("agy", info);
     const provider = (state.providers || []).find(p => p.id === "agy");
     const connected = !!(provider && provider.connected);
     const reason = info && info.reason;
@@ -11628,6 +11798,7 @@
   /** A host that did not name Muse or Antigravity gets no card for it. */
   function onboardingAdvertised(mode, info) {
     if ((info.provider === "muse" || mode === "muse-login" || mode === "missing-muse") && !museAdvertised) return false;
+    if ((info.provider === "deepseek" || mode === "deepseek-login" || mode === "missing-deepseek") && !deepseekAdvertised) return false;
     return agyAdvertised || !(info.provider === "agy" || mode === "agy-login" || mode === "missing-agy");
   }
 
@@ -11660,7 +11831,7 @@
     const onb = $("welcome-onboarding");
     const ver = $("welcome-version");
     if (!onb) return;
-    if (paintAgyCard(mode, info, onb, ver)) return;
+    if (paintDeepSeekCard(mode, info, onb) || paintAgyCard(mode, info, onb, ver)) return;
     if ((IS_REMOTE || info.device && (info.provider === "muse" && museAvailable || info.provider === "agy")) && (mode === "connect-agent" || mode === "codex-login" || mode === "claude-login" || mode === "auth-required" || mode === "muse-login" && museAvailable || mode === "agy-login")) {
       // The card is an ENTRY POINT, not a second renderer: a live flow belongs
       // to the wizard, so the card keeps showing the offer underneath it.
@@ -11755,6 +11926,7 @@
             (museAvailable ? `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="muse">` +
               `<span class="onb-agent-mark">${providerLogoMarkup("muse")}</span><span><strong>Muse Code</strong><small>Meta Muse CLI</small></span>` +
             `</button>` : "") +
+            (deepseekAdvertised && !IS_REMOTE ? `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="deepseek"><span class="onb-agent-mark">${providerLogoMarkup("deepseek")}</span><span><strong>DeepSeek</strong><small>Official dsh (experimental)</small></span></button>` : "") +
             (agyAdvertised ? `<button class="onb-agent-tile onb-action" type="button" data-act="connectProvider" data-provider="agy">` +
               `<span class="onb-agent-mark">${providerLogoMarkup("agy")}</span><span><strong>Antigravity</strong><small>Google Antigravity (experimental)</small></span>` +
             `</button>` : "") +
@@ -12617,12 +12789,13 @@
     read_file: "Read", file_read: "Read", view_file: "Read", view: "Read",
     write_file: "Write", file_write: "Write", write: "Write",
     bash: "Run", execute: "Run", run_command: "Run", run_terminal_command: "Run",
-    shell: "Run", run_bash: "Run", powershell: "Run",
+    shell: "Run", run_bash: "Run", powershell: "Run", pwsh: "Run",
     list_dir: "List", list_directory: "List",
     search_files: "Search", grep: "Search", ripgrep: "Search", search: "Search",
     search_replace: "Edit", edit_file: "Edit", str_replace: "Edit",
     web_search: "Web search", search_web: "Web search",
     web_fetch: "Fetch", webfetch: "Fetch",
+    get_command_or_subagent_output: "Wait for output",
   };
 
   // Verb by ACP kind — the fallback when the tool name isn't in TOOL_VERB (a tool
@@ -12632,8 +12805,54 @@
     delete: "Delete", execute: "Run", fetch: "Generate",
   };
 
+  // Tools whose raw name would otherwise be the row (DeepSeek titles every call
+  // with its bare tool name and kind "other"): [settled verb, running label].
+  // A settled verb takes a target where one exists (a skill's name, a goal's
+  // objective); the rest stand alone.
+  const NAMED_TOOL_LABELS = {
+    job_output: ["Check background job", "Checking background job"],
+    job_list: ["List background jobs", "Listing background jobs"],
+    job_kill: ["Stop background job", "Stopping background job"],
+    create_goal: ["Set goal", "Setting goal"],
+    get_goal: ["Check goal", "Checking goal"],
+    update_goal: ["Update goal", "Updating goal"],
+    skill: ["Use skill", "Loading skill"],
+    read_image: ["Read image", "Reading image"],
+    send_message: ["Message agent", "Messaging agent"],
+    interrupt_agent: ["Interrupt agent", "Interrupting agent"],
+    list_subagent_models: ["List models", "Listing models"],
+    terminal_open: ["Open terminal", "Opening terminal"],
+    terminal_send: ["Send to terminal", "Sending to terminal"],
+    terminal_read: ["Read terminal", "Reading terminal"],
+    terminal_signal: ["Signal terminal", "Signalling terminal"],
+    terminal_close: ["Close terminal", "Closing terminal"],
+    terminal_list: ["List terminals", "Listing terminals"],
+    schedule_create: ["Schedule a task", "Scheduling a task"],
+    schedule_list: ["List scheduled tasks", "Listing scheduled tasks"],
+    schedule_update: ["Update scheduled task", "Updating scheduled task"],
+    schedule_delete: ["Delete scheduled task", "Deleting scheduled task"],
+    working_directory: ["Change folder", "Changing folder"],
+  };
+  function namedToolTarget(name, r) {
+    if (name === "skill") return typeof r.name === "string" ? r.name.trim() : "";
+    if (name === "create_goal") return typeof r.objective === "string" ? clampToolTarget(r.objective.trim()) : "";
+    if (name === "read_image") return prettyPath(r.file_path || r.path || "");
+    return "";
+  }
+
   function toolName(call) {
-    return call.tool || call.name || call.title || "";
+    return call._meta?.["x.ai/tool"]?.name || call.tool || call.name || call.title || "";
+  }
+  // The tool's own name, exactly, or Grok's "Web search: …" title. Never a
+  // substring of an arbitrary title: a file search FOR "web_search", or a read
+  // of web_search.ts, is not a web search.
+  const WEB_SEARCH_TOOL = /^(web[ _-]?search|search[ _-]?web)$/i;
+  function isWebSearch(call) {
+    // Grok also titles a grep with its pattern; stable metadata wins over that.
+    const identity = call._meta?.["x.ai/tool"]?.name || call.tool || call.name;
+    if (identity) return WEB_SEARCH_TOOL.test(identity);
+    const title = String(call.title || "").trim();
+    return WEB_SEARCH_TOOL.test(title) || /^web search\b/i.test(title);
   }
   function pathFromToolTitle(call) {
     const title = String(call && call.title || "").trim();
@@ -12784,7 +13003,7 @@
     const t = (call.title || "").trim().toLowerCase();
     if (/^(read|view)\b/.test(t)) return "read";
     if (/^(grep|glob|search|ripgrep)\b/.test(t)) return "search";
-    if (/^(shell|execute|run|bash)\b/.test(t)) return "execute";
+    if (/^(shell|execute|run|bash|pwsh|powershell)\b/.test(t)) return "execute";
     if (/^(write|create)\b/.test(t)) return "write";
     if (/^edit\b/.test(t)) return "edit";
     if (/^delete\b/.test(t)) return "delete";
@@ -12792,7 +13011,7 @@
     return "";
   }
   function toolKind(call) {
-    return call.kind || titleKind(call);
+    return call.kind && call.kind !== "other" ? call.kind : titleKind(call);
   }
   // Coarse bucket for the rollup summary, driven by the ACP kind (then the title,
   // then the legacy name map). Reads and searches (grep/glob) are both read-only
@@ -12804,7 +13023,7 @@
     // Web search/fetch first: grok ships these with a "Web search: …" title and no
     // `kind`, so they'd otherwise fall through to the command catch-all (the exact
     // "ran N commands" miscount the user saw).
-    if (/web.?search|web.?fetch|search_web/i.test(n)) return "web";
+    if (isWebSearch(call) || /^(web[ _-]?fetch|webfetch)\b/i.test(n)) return "web";
     switch (toolKind(call)) {
       case "read": case "search": return "explore";
       case "edit": case "write": return "edit";
@@ -12858,9 +13077,29 @@
    * would repeat this label and the OUT is the match list.
    */
   function searchPatternText(call) {
-    const r = (call && (call.rawInput || call.input)) || {};
-    const p = searchPattern(r);
-    return typeof p === "string" && p.trim() ? clampToolTarget(p.trim()) : "";
+    return clampToolTarget(searchTarget(call).pattern);
+  }
+
+  // Codex puts these two search shapes in the title, without input or locations.
+  function codexSearchTitle(call) {
+    const title = String(call.title || "");
+    const query = title.match(/^Search for '(.+)' in (.+)$/);
+    if (query) return { pattern: query[1], path: query[2] };
+    const folder = title.match(/^Search in '(.+)'$/);
+    return folder ? { pattern: "", path: folder[1] } : {};
+  }
+  function searchTarget(call) {
+    const r = call.rawInput || call.input || {};
+    const output = call.rawOutput?.action || {};
+    const title = codexSearchTitle(call);
+    const candidates = [searchPattern(r), r.action?.query, output.query,
+      Array.isArray(output.queries) ? output.queries.filter((q) => typeof q === "string" && q.trim()).join(", ") : "",
+      title.pattern];
+    const pattern = candidates.find((p) => typeof p === "string" && p.trim());
+    return {
+      pattern: pattern ? pattern.trim() : "",
+      path: r.path || r.target_directory || r.directory || r.dir || (Array.isArray(r.paths) ? r.paths[0] : "") || title.path,
+    };
   }
 
   /**
@@ -12870,7 +13109,9 @@
    */
   const MATCH_ALL = new Set(["", "^", "$", ".", ".*", ".+", "^.*", "^.*$"]);
   function searchPattern(r) {
-    const p = r.glob_pattern || r.pattern || r.query || r.regex || r.search;
+    // DeepSeek's web_search sends a list: `{queries: ["…", "…"]}`.
+    const queries = Array.isArray(r.queries) ? r.queries.filter((q) => typeof q === "string" && q.trim()).join(", ") : "";
+    const p = r.glob_pattern || r.pattern || r.query || queries || r.regex || r.search;
     const globs = (Array.isArray(r.glob) ? r.glob : [r.glob]).filter((g) => typeof g === "string" && g.trim());
     if (globs.length && (typeof p !== "string" || MATCH_ALL.has(p.trim()))) return globs.join(", ");
     return p;
@@ -12883,8 +13124,7 @@
    * the workspace shows its own name, never a machine path.
    */
   function searchDirText(call) {
-    const r = (call && (call.rawInput || call.input)) || {};
-    const p = r.path || r.target_directory || r.directory || r.dir || (Array.isArray(r.paths) ? r.paths[0] : "");
+    const p = searchTarget(call).path;
     if (typeof p !== "string") return "";
     const s = p.trim().replace(/\\/g, "/").replace(/\/+$/, "").replace(/^\.\//, "");
     if (!s || s === ".") return "";
@@ -12907,7 +13147,7 @@
     if (/^(read_file|file_read)$/.test(name) || kind === "read") {
       return filePath ? `Reading ${prettyPath(filePath)}` : "Reading file";
     }
-    if (/^(web_search|search_web)$/.test(name)) {
+    if (isWebSearch(call)) {
       const q = searchPatternText(call);
       return q ? `Searching web for "${q}"` : "Searching web";
     }
@@ -12922,9 +13162,15 @@
       if (renamed) return `Editing ${prettyPath(renamed.from)} → ${prettyPath(renamed.to)}`;
       return filePath ? `Editing ${prettyPath(filePath)}` : "Editing file";
     }
+    if (name === "todo_write") return "Updating tasks";
+    if (name === "get_command_or_subagent_output") return "Waiting for output";
+    if (Object.prototype.hasOwnProperty.call(NAMED_TOOL_LABELS, name)) {
+      const target = namedToolTarget(name, call.rawInput || call.input || {});
+      return NAMED_TOOL_LABELS[name][1] + (target ? ` ${target}` : "");
+    }
     if (kind === "delete") return filePath ? `Deleting ${prettyPath(filePath)}` : "Deleting file";
     if (kind === "fetch") return "Generating";
-    if (/^(bash|execute|run_command|run_terminal_command|shell|run_bash|powershell)$/.test(name) || kind === "execute") {
+    if (/^(bash|execute|run_command|run_terminal_command|shell|run_bash|powershell|pwsh)$/.test(name) || kind === "execute") {
       return "Running command";
     }
     // A tool we didn't predict still shows — but never echo a long title verbatim.
@@ -12934,13 +13180,18 @@
   function toolLabel(call, opts) {
     const name = toolName(call);
     const kind = toolKind(call);
-    const verb = TOOL_VERB[name] || KIND_VERB[kind] || null;
+    const verb = isWebSearch(call) ? "Web search" : TOOL_VERB[name] || KIND_VERB[kind] || null;
     const r = call.rawInput || call.input || {};
     const filePath = toolFilePath(call);
     const command = r.command || r.cmd;
+    if (name === "todo_write") return Array.isArray(r.todos) ? `Update ${r.todos.length} task${r.todos.length === 1 ? "" : "s"}` : "Update tasks";
+    if (Object.prototype.hasOwnProperty.call(NAMED_TOOL_LABELS, name)) {
+      const target = namedToolTarget(name, r);
+      return NAMED_TOOL_LABELS[name][0] + (target ? ` ${target}` : "");
+    }
     const failure = state.toolFailuresById.get(call.toolCallId) || toolFailureText(call);
     if (isMissingPathRead(call, failure)) return `${filePath ? prettyPath(filePath) : isDirectoryListTool(call) ? "Directory" : "File"} — doesn't exist yet`;
-    const pattern = searchPattern(r);
+    const pattern = searchPatternText(call);
     const url = r.url || r.uri;
     // Collapsed rows read as a scannable summary, not a wall of shell — the
     // full command lives one click away in the IN/OUT detail. (CSS still
@@ -12951,21 +13202,23 @@
     // render the unhelpful "root folder"). Match by kind OR name so it still wins
     // when the first tool_call arrives before grok finalizes `kind`.
     const isSearch =
-      kind === "search" || name === "search" || /\b(grep|glob|ripgrep|search_files|web_search|search_web)\b/i.test(name);
+      kind === "search" || isWebSearch(call) || name === "search" || /\b(grep|glob|ripgrep|search_files)\b/i.test(name);
 
     let target = "";
     const renamed = toolRenamePaths(call);
     if (renamed && (kind === "edit" || kind === "write" || kind === "delete" || verb === "Edit" || verb === "Write")) {
       target = `${prettyPath(renamed.from)} → ${prettyPath(renamed.to)}`;
-    } else if (isSearch && pattern) {
+    } else if (isSearch) {
       const dir = searchDirText(call);
-      target = clamp(pattern) + (dir ? ` in ${dir}` : "");
+      target = pattern + (dir ? `${pattern ? " in " : "in "}${dir}` : "");
     } else if (url) {
       target = clamp(url.replace(/^https?:\/\//i, ""));
     } else if (filePath) {
       const isList = /^(list_dir|list_directory)$/.test(name) || verb === "List";
       const isRead = name === "read_file" || name === "file_read" || kind === "read";
-      if (isList) {
+      if (opts && opts.full) {
+        target = filePath;
+      } else if (isList) {
         target = prettyDir(filePath);
       } else if (isRead) {
         target = readTargetLabel(call);
@@ -13632,13 +13885,9 @@ ${fullText}`
     return "";
   }
 
-  function refreshToolRowFromUpdate(update) {
-    const id = update && update.toolCallId;
-    if (!id) return;
-    const item = state.toolItemsByToolCallId.get(id);
-    if (!item || !item._call) return;
-    const merged = { ...item._call };
-    for (const key of ["title", "kind", "status", "locations", "rawOutput"]) {
+  function mergeToolCall(call, update) {
+    const merged = { ...call };
+    for (const key of ["title", "kind", "status", "locations", "rawOutput", "content"]) {
       if (update[key] !== undefined && update[key] !== null) merged[key] = update[key];
     }
     // Arguments accumulate across updates (`{}` → `{file_path}` → `{file_path,
@@ -13646,12 +13895,27 @@ ${fullText}`
     // drop the path.
     for (const key of ["rawInput", "input"]) {
       if (update[key] && typeof update[key] === "object") {
-        merged[key] = { ...(item._call[key] || {}), ...update[key] };
+        merged[key] = { ...(call[key] || {}), ...update[key] };
       }
     }
     if (Object.prototype.hasOwnProperty.call(update, "detailInput")) {
       merged.detailInput = update.detailInput;
     }
+    if (update._meta) {
+      merged._meta = { ...call._meta, ...update._meta };
+      if (update._meta["x.ai/tool"]) {
+        merged._meta["x.ai/tool"] = { ...call._meta?.["x.ai/tool"], ...update._meta["x.ai/tool"] };
+      }
+    }
+    return merged;
+  }
+
+  function refreshToolRowFromUpdate(update) {
+    const id = update && update.toolCallId;
+    if (!id) return;
+    const item = state.toolItemsByToolCallId.get(id);
+    if (!item || !item._call) return;
+    const merged = mergeToolCall(item._call, update);
     item._call = merged;
     if (item.classList.contains("workflow-tool-marker")) syncWorkflowToolMarkers();
     // Flatten / summarize read `_calls`, not `item._call`. Grok's first
@@ -14449,7 +14713,7 @@ ${fullText}`
     // drops `runGrokLogin` silently, and a button that does nothing is worse
     // than the honest dead end. Same rule the connect panel already follows.
     // Antigravity signs in only at the desk: Google's page opens there.
-    const canSignIn = !IS_REMOTE || !!(state.hostCaps && state.hostCaps.remoteAgentSignIn) && provider !== "agy";
+    const canSignIn = !IS_REMOTE || !!(state.hostCaps && state.hostCaps.remoteAgentSignIn) && provider !== "agy" && provider !== "deepseek";
     // A sign-in already running is not an offer to make one. The code entry
     // closes the moment the code is submitted, but verifying it takes a second
     // or two -- and the card underneath went straight back to "Sign in", which
@@ -14813,7 +15077,7 @@ ${fullText}`
   }
 
   function observeSubagentLive(el) {
-    if (state.replaying || el.classList.contains("subagent-done") || el.classList.contains("subagent-background") || el._liveStartedAt != null) return;
+    if (state.replaying || el._deepseekLaunchReceipt || el.classList.contains("subagent-done") || el.classList.contains("subagent-background") || el._liveStartedAt != null) return;
     el._liveStartedAt = Date.now();
     if (!workflowAgeTimer) workflowAgeTimer = setInterval(refreshWorkflowAges, 1000);
   }
@@ -14970,6 +15234,7 @@ ${fullText}`
     closeChildProseSegment(el);
     const row = document.createElement("div");
     row.className = "subagent-tool";
+    row._call = call;
     if (id) row.dataset.toolCallId = id;
     applyToolLabel(row, call);
     paintChildHook(row, call);
@@ -14980,6 +15245,7 @@ ${fullText}`
   function updateChildToolRow(el, stream, call) {
     const id = call && call.toolCallId;
     const row = id && el._childTools && el._childTools.get(id);
+    if (row) call = row._call = mergeToolCall(row._call, call);
     // A subagent's hook that succeeded leaves no line, like the parent's (#215).
     if (call?._meta?.afkPilotHook && call.status === "completed") {
       if (row) { row.remove(); el._childTools.delete(id); }
@@ -15079,6 +15345,26 @@ ${fullText}`
     const output = out && typeof out.output === "string" ? out.output
       : out && typeof out.text === "string" ? out.text
       : toolUpdateText(call);
+    // dsh completes the launch tool while the child is still working. That
+    // receipt is neither a child result nor evidence of its running time.
+    const deepseekReceipt = state.activeProvider === "deepseek" && status === "completed"
+      && /^started subagent\s+([0-9a-f-]+)\s*$/i.exec(String(output || "").trim());
+    if (deepseekReceipt) {
+      el.dataset.subagentId = deepseekReceipt[1];
+      el._deepseekLaunchReceipt = true;
+      el._liveStartedAt = null;
+      // dsh's child reports to its parent agent (send_message), never on this
+      // tool call, so no result will land here. "in background" is the honest
+      // state: no spinner, no timer, no invented finish.
+      el.classList.add("subagent-background");
+      const stream = el.querySelector(".subagent-stream");
+      if (!stream.querySelector(".deepseek-subagent-started")) {
+        workflowText(stream, "subagent-prose deepseek-subagent-started",
+          "Subagent started. DeepSeek doesn't show its work here; the main agent receives its result.");
+      }
+      refreshSubagentCard(el);
+      return;
+    }
     // A background spawn (rawInput.background: true) "completes" immediately
     // with a started-ack while the child keeps running — that's not the
     // result. Keep running; the real output arrives on the
@@ -16788,7 +17074,7 @@ ${fullText}`
   }
 
   function activityVerb() {
-    if (state.activeProvider === "codex") return CODEX_ACTIVITY_VERB;
+    if (state.activeProvider === "codex" || state.activeProvider === "deepseek") return THINKING_ACTIVITY_VERB;
     if (state.activeProvider === "claude") return CLAUDE_ACTIVITY_VERB;
     if (state.activeProvider === "muse" || state.activeProvider === "agy") return "Working";
     return GROK_ACTIVITY_VERB;
@@ -17094,6 +17380,7 @@ ${fullText}`
     allow_always: "Allowed",
     allow_once: "Allowed",
     reject_once: "Rejected",
+    closed: "Closed",
   };
 
   // Replace a permission card with a single muted, non-interactive line once the
@@ -17110,7 +17397,7 @@ ${fullText}`
     // split mislabelled a reject_always as allowed. `/reject|deny/i` is the
     // test resolvePermissionCardEl already uses a few lines below.
     const rejected = /reject|deny/i.test(String(kind || ""));
-    line.className = "perm-resolved-line perm-" + (rejected ? "rejected" : "allowed");
+    line.className = "perm-resolved-line perm-" + (kind === "closed" ? "closed" : rejected ? "rejected" : "allowed");
     const verb = document.createElement("span");
     verb.className = "perm-resolved-verb";
     verb.textContent = PERM_VERB[kind] || (rejected ? "Rejected" : "Allowed");
@@ -17213,7 +17500,9 @@ ${fullText}`
   }
 
   function updatePermissionOptions(requestId, options) {
-    const cards = liveTranscriptQueryAll(".card.permission");
+    const cards = historyPark
+      ? [...historyPark.querySelectorAll(".card.permission")]
+      : liveTranscriptQueryAll(".card.permission");
     const el = cards.find((card) =>
       card.dataset.permReqId === String(requestId) &&
       !card.classList.contains("perm-resolved") &&
@@ -17290,7 +17579,17 @@ ${fullText}`
       addPlanReviewPermissionCard(req);
       return;
     }
-    const cardTitle = req.toolCall?.title || `permission: ${req.toolCall?.kind || "tool"}`;
+    const call = req.toolCall || {};
+    const isCommandCard = toolKind(call) === "execute";
+    const command = commandDetailText(call);
+    // Keep host audit annotations when the title already includes the entire
+    // command (for example, an automatic session grant). A bare tool name
+    // such as pwsh is not a command preview.
+    const cardTitle = state.activeProvider === "deepseek"
+      ? isCommandCard
+        ? command && !call.title?.includes(command) ? command : call.title || command || "Run command"
+        : toolLabel(call, { full: true })
+      : call.title || `permission: ${call.kind || "tool"}`;
     const el = document.createElement("div");
     el.className = "card permission";
     // Tag the card so a buffered `permissionResolved` (replayed when this session
@@ -17301,11 +17600,13 @@ ${fullText}`
     el._permTitle = cardTitle;
     // Only an execute card's title is a shell command; other kinds fall into
     // categorize()'s "command" bucket without being one.
-    const isCommandCard = toolKind(req.toolCall) === "execute";
     appendCommandPreview(el, cardTitle, "card-title command-card-title",
       isCommandCard ? state.commandLanguage : undefined, PERMISSION_COMMAND_PREVIEW_LINES, undefined, isCommandCard, isCommandCard);
 
-    const diff = state.pendingDiffByToolCallId.get(req.toolCall?.toolCallId);
+    // dsh permission requests can carry the diff themselves, without a preceding
+    // tool update. Use the same extraction and preview as the tool row.
+    if (state.activeProvider === "deepseek") applyToolDiffs(call);
+    const diff = state.pendingDiffByToolCallId.get(call.toolCallId);
     if (diff) {
       const subtitle = document.createElement("div");
       subtitle.className = "card-subtitle";
@@ -17315,7 +17616,9 @@ ${fullText}`
       el.appendChild(subtitle);
 
       const openDiff = () => {
-        if (IS_REMOTE) revealToolDiff(req.toolCall?.toolCallId);
+        if (IS_REMOTE) {
+          if (!revealToolDiff(call.toolCallId)) openPreviewOverlay({ kind: "diff", ...diff });
+        }
         else requestDiffPreview(diff, req.id);
       };
       const preview = document.createElement("button");
@@ -18502,9 +18805,11 @@ ${fullText}`
     const seconds = Math.floor(Math.max(0, Date.now() - startup.startedAt) / 1000);
     // A CLI update routinely takes minutes; only a stalled start is "slow".
     // Antigravity's Windows server unpacks itself on every start: 15-25 s is
-    // its ordinary start, not a stall.
-    const slow = seconds >= (startup.provider === "agy" ? 60 : 20) && startup.stage !== "updating";
-    const provider = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse", agy: "Antigravity" }[startup.provider] || "Grok";
+    // its ordinary start, not a stall. DeepSeek's harness boots ~15 s warm and
+    // well past 20 s on a busy machine, so it gets the same latitude.
+    const slowAfter = { agy: 60, deepseek: 45 }[startup.provider] || 20;
+    const slow = seconds >= slowAfter && startup.stage !== "updating";
+    const provider = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse", agy: "Antigravity", deepseek: "DeepSeek" }[startup.provider] || "Grok";
     const count = Number.isInteger(startup.messageCount) && startup.messageCount >= 0 ? startup.messageCount + " " : "";
     const label = { updating: "Updating the " + provider + " CLI", starting: "Starting " + provider,
       opening: "Opening the conversation", loading: "Loading " + count + "messages" }[startup.stage];
@@ -18541,6 +18846,7 @@ ${fullText}`
     // setMode gate is client-side (autoApprove) so it takes effect immediately.
     // Only the session-start window (busyLocked: spawn → session/new → priming) is
     // locked, where a setMode would throw "no session"; that flag always clears.
+    renderDeepSeekHarness();
     modeBtn.disabled = state.busyLocked;
     modeBtn.classList.toggle("disabled", state.busyLocked);
     modeBtn.title = modeButtonTitle(state.currentModeId);
@@ -18562,7 +18868,7 @@ ${fullText}`
       }
     } else if (state.startupStatus) {
       sendBtn.innerHTML = ICON.spinner;
-      const name = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse", agy: "Antigravity" }[state.startupStatus.provider] || "Grok";
+      const name = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse", agy: "Antigravity", deepseek: "DeepSeek" }[state.startupStatus.provider] || "Grok";
       sendBtn.title = name + (state.startupStatus.stage === "updating" ? " is updating" : " is still starting");
       sendBtn.classList.add("initializing");
       sendBtn.disabled = true;
@@ -18601,6 +18907,7 @@ ${fullText}`
     const t = input.value.trim();
     const chips = explicitVisibleChips(state.chips);
     if (!composerHasSendIntent(t, state.chips)) return false;
+    if (refuseUnsupportedComposerImages()) return true;
     // Everything or nothing: an older host would ignore extra chips and queue
     // the text alone. Refuse rather than silently drop attachments.
     if (chips.length && !(state.hostCaps && state.hostCaps.queueSendChips)) {
@@ -18819,6 +19126,12 @@ ${fullText}`
       actualIds.every((id, index) => id === expectedIds[index]);
   }
 
+  function refuseUnsupportedComposerImages() {
+    if (state.activeProvider !== "deepseek" || !state.chips.some(c => !c.hidden && c.imageIndex != null)) return false;
+    addError("DeepSeek does not accept image attachments on this ACP route. Remove the image to send this message.");
+    return true;
+  }
+
   function sendOrStop(event) {
     // A model or effort the picker is still SHOWING belongs to this send. The
     // document's own click listener flushes on the way out, but it sits on the
@@ -18837,7 +19150,7 @@ ${fullText}`
     // the CLI kept the old one. Committed first, the size meets the host's
     // `pickerChange` and is refused with its visible wait message.
     flushPicker();
-    if (/^\/context-window(?:\s|$)/i.test(input.value.trim())) {
+    if (state.activeProvider !== "deepseek" && /^\/context-window(?:\s|$)/i.test(input.value.trim())) {
       sendContextWindowCommand(input.value.trim());
       // A bare command opens the context popup; the Send click that did it
       // must not close it again on its way to the document's closer.
@@ -18879,6 +19192,9 @@ ${fullText}`
     // Sendable = typed text or any visible chip (file or image alike — image
     // chips render as remove-only attachment rows, so they're never hidden).
     if (!text && state.chips.every((c) => c.hidden)) return;
+    // A chip can have been pasted before switching provider. Refuse while the
+    // composer still owns its text and attachments, before setting busy.
+    if (refuseUnsupportedComposerImages()) return;
     stopVoiceForManualSend();
     state.busy = true;
     updateSendButton();
@@ -19378,7 +19694,7 @@ ${fullText}`
   // ("grok send"), whose composer is cleared separately so the mic can keep
   // listening for the next utterance.
   function submitMessage(text) {
-    if (/^\/context-window(?:\s|$)/i.test((text || "").trim())) {
+    if (state.activeProvider !== "deepseek" && /^\/context-window(?:\s|$)/i.test((text || "").trim())) {
       sendContextWindowCommand((text || "").trim());
       return;
     }
@@ -20457,13 +20773,14 @@ ${fullText}`
   const SETTINGS_LIVE_MSGS = new Set([
     "museSettings",
     "cloudHostUpdateState", "initialState", "showThinking", "appPurpose", "expandCommandOutputs",
-    "steerByDefault", "promptNav", "expandDiffCard", "steerUnavailable", "soundNotifications", "processingSound",
+    "steerByDefault", "promptNav", "expandDiffCard", "steerUnavailable", "soundNotifications", "processingSound", "inputNeededSound",
     "readRepliesAloud", "summarizeRepliesAloud", "fontScale", "voiceConfigured",
     "providerState", "githubState", "mcpServers", "mcpConnectors", "remoteStatus", "telemetryEnabled", "thumbsFeedback", "grokUpdateStatus", "initialized",
   ]);
 
   function handleHostMessage(msg) {
     if (!msg || typeof msg !== "object") return;
+    observeInputNeededSound(msg);
     observePreferences(msg);
     if (state.replayHold && msg.type !== "historyReplay" && REPLAY_HOLD_TYPES.has(msg.type)) {
       state.replayHeld.push(msg);
@@ -20528,6 +20845,7 @@ ${fullText}`
         }
         if (typeof msg.soundNotifications === "boolean") state.soundNotifications = msg.soundNotifications;
         if (typeof msg.processingSound === "boolean") state.processingSound = msg.processingSound;
+        if (!IS_REMOTE && typeof msg.inputNeededSound === "boolean") state.inputNeededSound = msg.inputNeededSound;
         releaseAudioIfSilent();
         // Absent appPurpose (older host) → Knowledge work — smaller surface.
         state.appPurpose = msg.appPurpose === "coding" ? "coding" : "knowledge";
@@ -20641,7 +20959,13 @@ ${fullText}`
       case "providerState":
         museAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "muse");
         museAvailable = museAdvertised && msg.providers.some(p => p && p.id === "muse" && !p.unavailableReason);
+        deepseekAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "deepseek");
         agyAdvertised = Array.isArray(msg.providers) && msg.providers.some(p => p && p.id === "agy");
+        if (!deepseekAdvertised) {
+          if (connectWizard && connectWizard.provider === "deepseek") closeConnectWizard();
+          if (state.onboardingInfo && state.onboardingInfo.provider === "deepseek") clearWelcome();
+        }
+        if (state.activeProvider === "deepseek") updateModeBtn(state.currentModeId);
         state.providersKnown = true;
         state.providers = Array.isArray(msg.providers) ? msg.providers.filter((provider) =>
           provider && Object.hasOwn(globalThis.GrokWebviewHelpers.PROVIDER_ACTIONS, provider.id)) : [];
@@ -20741,7 +21065,7 @@ ${fullText}`
         state.routines = Array.isArray(msg.entries) ? msg.entries : [];
         state.routineProjects = Array.isArray(msg.projects) ? msg.projects : [];
         state.routineModels = (Array.isArray(msg.models) ? msg.models : [])
-          .filter(m => (m.provider !== "muse" || museAvailable) && (m.provider !== "agy" || agyAdvertised));
+          .filter(m => (m.provider !== "muse" || museAvailable) && (m.provider !== "agy" || agyAdvertised) && (m.provider !== "deepseek" || deepseekAdvertised));
         state.routineError = msg.error || "";
         state.routineErrorId = msg.errorId || "";
         refreshSettingsOverlay();
@@ -20758,6 +21082,13 @@ ${fullText}`
         }
         break;
       case "agyInstallProgress":
+        if (msg.provider === "deepseek") {
+          if (!deepseekAdvertised || IS_REMOTE) break;
+          state.deepseekInstall = { phase: msg.phase || "idle", receivedBytes: msg.receivedBytes || 0, totalBytes: msg.totalBytes || 0, reason: msg.reason || "" };
+          if (state.onboardingMode === "missing-deepseek") showOnboarding("missing-deepseek", { ...state.onboardingInfo, reason: msg.reason });
+          if (connectWizard && connectWizard.provider === "deepseek") renderConnectWizard();
+          break;
+        }
         state.agyInstall = {
           phase: msg.phase || "idle",
           receivedBytes: Number.isFinite(msg.receivedBytes) ? msg.receivedBytes : 0,
@@ -20855,6 +21186,10 @@ ${fullText}`
           clearTimeout(processingCueTimer);
           processingCueTimer = null;
         }
+        releaseAudioIfSilent();
+        break;
+      case "inputNeededSound":
+        state.inputNeededSound = !!msg.value;
         releaseAudioIfSilent();
         break;
       case "readRepliesAloud": {
@@ -21181,7 +21516,7 @@ ${fullText}`
         state.subscriptionWindows = [];
         state.currentModelId = msg.currentModelId;
         state.activeProvider = msg.provider === "codex" || msg.provider === "claude" || msg.provider === "muse" && museAvailable
-          || msg.provider === "agy" && agyAdvertised ? msg.provider : "grok";
+          || msg.provider === "agy" && agyAdvertised || msg.provider === "deepseek" && deepseekAdvertised ? msg.provider : "grok";
         state.activeProviderNamed = typeof msg.provider === "string" && !!msg.provider;
         // modeChanged is posted before session, so the button was painted for
         // the previous provider. Repaint once this frame names the new one.
@@ -21200,7 +21535,7 @@ ${fullText}`
         // whichever provider a later optimistic model pick happens to select.
         state.availableModels = (msg.models || [])
           .map(m => ({ ...m, provider: m.provider || state.activeProvider }))
-          .filter(m => (m.provider !== "muse" || museAvailable) && (m.provider !== "agy" || agyAdvertised));
+          .filter(m => (m.provider !== "muse" || museAvailable) && (m.provider !== "agy" || agyAdvertised) && (m.provider !== "deepseek" || deepseekAdvertised));
         if (currentModel()?.reasoningEffort) state.effort = currentModel().reasoningEffort;
         refreshModelControls();
         renderProviderSignInCard();
@@ -21256,6 +21591,7 @@ ${fullText}`
       case "modelChanged": {
         const previousEffort = effectiveEffort();
         state.currentModelId = msg.modelId;
+        if (!contextPopover.hidden) renderContextPopover();
         if (!effortLevelsForModel().includes(state.effort)) {
           state.effort = currentModel()?.reasoningEffort || "";
         }
@@ -21270,6 +21606,11 @@ ${fullText}`
         break;
       }
       case "modeChanged":
+        state.deepseekHarness = msg.deepseekHarness;
+        state.deepseekShellUnsandboxed = msg.deepseekShellUnsandboxed;
+        state.deepseekHarnessLocked = msg.deepseekHarnessLocked;
+        state.deepseekHarnessContext = msg.deepseekHarnessContext;
+        state.deepseekHarnessPending = false;
         state.currentModeId = msg.modeId;
         state.offeredModes = Array.isArray(msg.modes)
           ? msg.modes.filter((id) => Object.hasOwn(MODE_META, id) || Object.hasOwn(MUSE_MODE_META, id))
@@ -21884,13 +22225,19 @@ ${fullText}`
         // Replayed (on re-focus) right after the buffered permissionRequest, or
         // live right after the user answers — collapse the matching card if it's
         // still active. Idempotent: a live click already collapsed it.
-        const cards = liveTranscriptQueryAll(".card.permission");
+        const cards = historyPark
+          ? [...historyPark.querySelectorAll(".card.permission")]
+          : liveTranscriptQueryAll(".card.permission");
         const el = cards.find((c) =>
           c.dataset.permReqId === String(msg.requestId) &&
           !c.classList.contains("perm-resolved") &&
           !c.classList.contains("resolved")
         );
         if (el) {
+          if (msg.outcome === "closed") {
+            collapsePermissionCard(el, "closed", el._permTitle);
+            break;
+          }
           const opt = (el._permOptions || []).find((o) => o.optionId === msg.optionId);
           resolvePermissionCardEl(el, opt, el._permTitle);
         }
@@ -23596,6 +23943,14 @@ ${fullText}`
       }
       else if (act === "installCodex") vscode.postMessage({ type: "installCodex" });
       else if (act === "cancelCodexInstall") vscode.postMessage({ type: "cancelCodexInstall" });
+      else if (act === "installDeepSeek" && !IS_REMOTE && deepseekAdvertised) vscode.postMessage({ type: "installDeepSeek" });
+      else if (act === "cancelDeepSeekInstall" && !IS_REMOTE && deepseekAdvertised) vscode.postMessage({ type: "cancelDeepSeekInstall" });
+      else if (act === "deepseekConnect" && !IS_REMOTE && deepseekAdvertised) {
+        const field = onbAction.closest(".onb").querySelector(".onb-deepseek-key");
+        const key = field && field.value.trim();
+        if (field) field.value = "";
+        vscode.postMessage({ type: "deepseekConnect", ...(key ? { key } : {}) });
+      }
       else if (act === "installAgy" && !IS_REMOTE && agyAdvertised) vscode.postMessage({ type: "installAgy" });
       else if (act === "agySignInGoogle" && !IS_REMOTE && agyAdvertised) vscode.postMessage({ type: "agySignIn", method: "google" });
       else if (act === "agySignInSavedKey" && !IS_REMOTE && agyAdvertised) vscode.postMessage({ type: "agySignIn", method: "api-key" });
@@ -23871,6 +24226,10 @@ ${fullText}`
       updateSlash();
       updateMention();
       renderInputHighlight();
+    }
+    if (state.activeProvider === "deepseek") {
+      addError("DeepSeek does not accept image attachments on this ACP route.");
+      return;
     }
     for (const blob of blobs) {
       state.pendingPaste += 1;
