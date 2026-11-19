@@ -16,6 +16,9 @@ permissions:
   contents: write
   issues: write
   actions: write
+  # Community merges add and edit workflow files. Without this scope GitHub
+  # rejects the publish push and the daily sync never ships a vsix.
+  workflows: write
 
 concurrency:
   group: sync-community
