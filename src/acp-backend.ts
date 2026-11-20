@@ -21,13 +21,15 @@ const PROVIDER_ACTIONS: Record<AcpProvider, {
   autoAccept: boolean;
   perCallContext: boolean;
   clientMcp: boolean;
+  /** Implements a conversation fork. Standard ACP also requires negotiation. */
+  fork: boolean;
 }> = {
-  grok: { deleteHistory: true, compact: true, adapterHistory: false, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: true },
-  codex: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true },
-  claude: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true },
-  muse: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: true, autoAccept: true, perCallContext: false, clientMcp: false },
-  agy: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false },
-  deepseek: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false },
+  grok: { deleteHistory: true, compact: true, adapterHistory: false, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: true, fork: true },
+  codex: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true, fork: true },
+  claude: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true, fork: true },
+  muse: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: true, autoAccept: true, perCallContext: false, clientMcp: false, fork: false },
+  agy: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false, fork: false },
+  deepseek: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false, fork: false },
 };
 
 /**
@@ -68,6 +70,26 @@ export function supportsModeSwitching(provider: AcpProvider): boolean {
 
 export function supportsAutoAccept(provider: AcpProvider): boolean {
   return actionsFor(provider).autoAccept;
+}
+
+export function supportsFork(provider: AcpProvider): boolean {
+  return actionsFor(provider).fork;
+}
+
+export function advertisedFork(initializeResult: any): boolean {
+  const fork = initializeResult?.agentCapabilities?.sessionCapabilities?.fork;
+  return fork !== null && typeof fork === "object" && !Array.isArray(fork);
+}
+
+/** Both standard ACP adapters use this optional reply point on their fork request. */
+export function acpForkRequest(sessionId: string, cwd: string, messageId?: string) {
+  return {
+    method: "session/fork",
+    params: {
+      sessionId, cwd, mcpServers: [],
+      ...(messageId === undefined ? {} : { _meta: { jetbrains: { air: { fork: { version: 1, messageId } } } } }),
+    },
+  };
 }
 
 export function supportsApprovalModeSwitching(provider: AcpProvider): boolean {
@@ -113,6 +135,11 @@ export interface BackendConfigState {
   modeId?: string;
 }
 
+export interface SessionGoal {
+  objective: string;
+  status: string;
+}
+
 export interface BackendUpdate {
   update?: any;
   meta?: any;
@@ -120,6 +147,7 @@ export interface BackendUpdate {
   workflowUpdate?: any;
   notice?: string;
   sessionTitle?: string;
+  sessionGoal?: SessionGoal | null;
   contextWindow?: number;
   /** Direct occupancy reported by a backend, including an empty context. */
   contextUsed?: number;
@@ -143,6 +171,19 @@ export interface BackendUpdate {
   /** Already-normalized updates to route before this one (a backend closing
    *  cards at a turn boundary it only sees in the stream). */
   precede?: any[];
+}
+
+export function normalizeSessionInfoUpdate(update: any): BackendUpdate {
+  const title = [update.title, update.sessionTitle, update.name, update.sessionInfo?.title, update._meta?.title]
+    .find((value) => typeof value === "string" && value.trim()) as string | undefined;
+  const result: BackendUpdate = { sessionTitle: title?.trim() };
+  const goal = update._meta?.goal;
+  if (goal === null) result.sessionGoal = null;
+  else if (typeof goal?.objective === "string" && goal.objective.trim()
+      && typeof goal.status === "string" && goal.status.trim()) {
+    result.sessionGoal = { objective: goal.objective.trim(), status: goal.status.trim() };
+  }
+  return result;
 }
 
 export interface BackendSessionListEntry {
@@ -189,6 +230,7 @@ export interface AcpBackend<Provider extends string = AcpProvider> {
   setReasoningEffort(sessionId: string, modelId: string | undefined, level: string): { method: string; params: any } | { local: true } | null;
   setMode(sessionId: string, modeId: string): { method: string; params: any };
   steeringCapabilities(initializeResult: any, options: BackendSteeringOptions): BackendSteeringCapabilities;
+  fork?(sessionId: string, cwd: string, messageId?: string): { method: string; params: object };
   interject(sessionId: string, text: string, content?: readonly PromptContentBlock[]): { method: string; params: any } | null;
   /**
    * Whether a steering RPC that RESOLVED actually delivered the text. Some

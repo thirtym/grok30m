@@ -1,5 +1,6 @@
 import { isInternalProvider } from "./acp-backend";
 import { isModeId } from "./mode-prefs";
+import { isPastedText, isPasteTextId } from "./chips";
 // Extension <-> relay wire contract (Phase 1, topology B — the extension dials
 // OUT to a relay; browsers connect to the same relay; the relay ferries the
 // existing HostMsg/WebviewMsg protocol between them).
@@ -328,6 +329,13 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
     case "newSession":
       if (value.draftId !== undefined && (typeof value.draftId !== "string" || !REMOTE_TAB_TOKEN_RE.test(value.draftId))) return null;
       return { type: "newSession", ...(value.draftId !== undefined ? { draftId: value.draftId } : {}) };
+    case "forkAtReply":
+      return isRemoteSessionId(value.sessionId)
+        && typeof value.messageId === "string" && !!value.messageId.trim()
+        && (value.draft === undefined || typeof value.draft === "string")
+        ? { type: "forkAtReply", sessionId: value.sessionId, messageId: value.messageId,
+          ...(typeof value.draft === "string" ? { draft: value.draft } : {}) }
+        : null;
     case "resumeSession": {
       if (!isRemoteSessionId(value.id)) return null;
       if (value.cwd !== undefined && !isRemoteCwd(value.cwd)) return null;
@@ -396,6 +404,9 @@ function parseRemoteWebviewMsg(msg: unknown): WebviewMsg | null {
     }
     case "uploadFile":
       return isRemoteUploadName(value.name) ? msg as WebviewMsg : null;
+    case "pasteText":
+      return isPastedText(value.text) && isPasteTextId(value.pasteId)
+        ? { type: "pasteText", text: value.text, pasteId: value.pasteId } : null;
     case "pasteImage":
       if (typeof value.mimeType !== "string" || typeof value.data !== "string") return null;
       if (

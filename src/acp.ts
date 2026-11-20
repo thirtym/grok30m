@@ -1,6 +1,7 @@
 import { contextWindowSizes, type ContextWindowSelection } from "./context-selection";
-import { supportsSessionDeletion } from "./acp-backend";
+import { advertisedFork, supportsSessionDeletion, type SessionGoal } from "./acp-backend";
 import { GrokHookCalls } from "./grok-hooks";
+import { appendPastedTextContext } from "./prompt-builder";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface } from "node:readline";
 import { EventEmitter } from "node:events";
@@ -331,12 +332,16 @@ export class AcpClient extends EventEmitter {
   private readonly timeouts: AcpTimeouts;
   private humanWaitActive = false;
   private steering: BackendSteeringCapabilities;
+  private forkAdvertised = false;
+  lastPromptStopReason: string | undefined;
 
   readonly provider: AcpProvider;
   readonly usesClientPlanGate: boolean;
 
   sessionId?: string;
   private loadingChildSessionIds?: Set<string>;
+  private loadingSessionId?: string;
+  currentGoal?: SessionGoal | null;
   currentModelId?: string;
   currentModeId?: string;
   availableModels: ModelInfo[] = [];
@@ -575,6 +580,7 @@ export class AcpClient extends EventEmitter {
       ),
     });
     this.steering = this.backend.steeringCapabilities(init, this.opts);
+    this.forkAdvertised = advertisedFork(init);
     this.emit("initialized", init);
     const auth = this.opts.startupAuth;
     if (auth) await this.authenticate(auth.methodId, this.timeouts.requestTimeoutMs, auth.meta);
@@ -602,6 +608,7 @@ export class AcpClient extends EventEmitter {
 
   async newSession(modelId?: string): Promise<{ sessionId: string }> {
     if (this.contextWindowChanging) throw new Error("Wait for the context-window change to finish.");
+    this.currentGoal = undefined;
     const raw = await this.request("session/new", {
       cwd: this.opts.cwd,
       mcpServers: await this.mcpServersForSession(),
@@ -663,6 +670,7 @@ export class AcpClient extends EventEmitter {
       this.currentModeId = res.modes.currentModeId;
       this.emit("modeChanged", this.currentModeId);
     }
+    this.readCodexMode(res);
     this.emit("session", res);
 
     const wantedModel = modelId || this.backend.defaultModelId?.(this.availableModels.map((m) => m.modelId));
@@ -694,6 +702,8 @@ export class AcpClient extends EventEmitter {
     // Replay precedes the response and may use a different parent wire ID.
     // Only an explicit spawn identifies a child until the load completes.
     this.loadingChildSessionIds = new Set();
+    this.loadingSessionId = sessionId;
+    this.currentGoal = undefined;
     this.hookCalls.reset();
     let raw: any;
     try {
@@ -703,6 +713,7 @@ export class AcpClient extends EventEmitter {
       this.endTurn("completed");
     } finally {
       this.loadingChildSessionIds = undefined;
+      this.loadingSessionId = undefined;
     }
     const res = this.backend.normalizeSessionResponse(raw);
     this.sessionId = sessionId;
@@ -733,6 +744,7 @@ export class AcpClient extends EventEmitter {
       this.currentModeId = res.modes.currentModeId;
       this.emit("modeChanged", this.currentModeId);
     }
+    this.readCodexMode(res);
     this.emit("session", { sessionId, ...(res ?? {}) });
     this.emit("sessionLoaded", { sessionId });
     if (modelId && modelId !== this.currentModelId) {
@@ -744,6 +756,14 @@ export class AcpClient extends EventEmitter {
     }
     await this.refreshContextSelection();
     return { sessionId };
+  }
+
+  private readCodexMode(response: unknown, fallback = this.currentModeId): void {
+    if (this.provider !== "codex") return;
+    const { modeId } = this.backend.configState(response, { modeId: fallback });
+    if (!modeId || modeId === this.currentModeId) return;
+    this.currentModeId = modeId;
+    this.emit("modeChanged", modeId);
   }
 
   async setModel(modelId: string): Promise<void> {
@@ -842,7 +862,8 @@ export class AcpClient extends EventEmitter {
     if (this.contextWindowChanging) throw new Error("Wait for the context-window change to finish.");
     if (!this.sessionId) throw new Error("no session");
     const call = this.backend.setMode(this.sessionId, modeId);
-    const res = await this.request(call.method, call.params, () => {
+    let codexModeRead = false;
+    const res = await this.request(call.method, call.params, (reply) => {
       // The host still raises session chrome after this await. readline can
       // deliver a later ACP line in this same turn, so the Plan-accepted bit
       // has to land here — after a successful reply, before the next onLine.
@@ -851,6 +872,11 @@ export class AcpClient extends EventEmitter {
       // is one). usesClientPlanGate still decides whether writes/terminals
       // are blocked.
       if (modeId === "plan") this.planActive = true;
+      // An approval arriving on the next line must already see the new preset.
+      if (this.provider === "codex") {
+        this.readCodexMode(reply, modeId);
+        codexModeRead = true;
+      }
     });
     const state = this.backend.configState(res, {
       modelId: this.currentModelId,
@@ -858,12 +884,15 @@ export class AcpClient extends EventEmitter {
       modeId,
     });
     if (this.provider !== "grok" && state.modeId) {
+      const emitMode = this.provider !== "codex" || state.modeId !== this.currentModeId;
       this.currentModelId = state.modelId ?? this.currentModelId;
       this.currentReasoningEffort = state.reasoningEffort;
-      this.currentModeId = state.modeId;
       const current = this.availableModels.find((entry) => entry.modelId === this.currentModelId);
       if (current) current.reasoningEffort = this.currentReasoningEffort;
-      this.emit("modeChanged", state.modeId);
+      if (!codexModeRead) {
+        this.currentModeId = state.modeId;
+        if (emitMode) this.emit("modeChanged", state.modeId);
+      }
     }
   }
 
@@ -888,7 +917,7 @@ export class AcpClient extends EventEmitter {
     }
   }
 
-  async prompt(textOrBlocks: string | PromptContentBlock[], authoredTexts?: readonly string[]): Promise<PromptResultMeta> {
+  async prompt(textOrBlocks: string | PromptContentBlock[], authoredTexts?: readonly string[], pastedText = ""): Promise<PromptResultMeta> {
     if (this.contextWindowChanging) throw new Error("Wait for the context-window change to finish.");
     const firstText = typeof textOrBlocks === "string" ? textOrBlocks : textOrBlocks[0]?.type === "text" ? textOrBlocks[0].text : "";
     if (this.provider !== "deepseek" && /^\/context-window(?:\s|$)/i.test(firstText) && !this.availableCommands.some(c => c.name === "context-window"))
@@ -923,6 +952,9 @@ export class AcpClient extends EventEmitter {
         return { ...block, text };
       });
     }
+    if (pastedText && prompt[0]?.type === "text") {
+      prompt = [{ ...prompt[0], text: appendPastedTextContext(prompt[0].text, pastedText) }, ...prompt.slice(1)];
+    }
     let raw: any;
     try {
       raw = await this.request("session/prompt", {
@@ -934,6 +966,7 @@ export class AcpClient extends EventEmitter {
       throw error;
     }
     const result = this.backend.normalizePromptResult(raw);
+    this.lastPromptStopReason = result?.stopReason;
     this.endTurn(result?.stopReason === "cancelled" ? "cancelled" : "completed");
     const meta = extractPromptMeta(result);
     this.lastMeta = meta;
@@ -1086,21 +1119,32 @@ export class AcpClient extends EventEmitter {
     }
   }
 
-  /**
-   * Fork a session (#48) — copies the conversation into a NEW session id, leaving
-   * the source untouched (probe-verified: parent history byte-unchanged after
-   * forking + using the fork). Params are `ForkSessionRequest`'s three required
-   * camelCase fields; `{sessionId}` alone is -32602.
-   *
-   * This branches the CONVERSATION only — grok never touches the workspace here,
-   * so files stay exactly as they are (`/rewind` is the separate feature that
-   * restores file snapshots). We deliberately omit `targetPromptIndex`: it works
-   * on the wire but truncates `chat_history` without truncating `updates.jsonl`,
-   * so a partial fork would replay a conversation the model has forgotten.
-   * Returns the new session id, or `"unsupported"` on an older CLI.
-   */
-  async forkSession(cwd: string): Promise<{ newSessionId: string } | "unsupported"> {
+  supportsTurnFork(): boolean {
+    return this.forkAdvertised && !!this.backend.fork;
+  }
+
+  /** Copy the conversation into a new session ID. Grok's route is whole-session only. */
+  async forkSession(cwd: string, messageId?: string): Promise<{ newSessionId: string } | "unsupported"> {
     if (!this.sessionId) throw new Error("no session");
+    if (messageId !== undefined && !messageId.trim()) throw new Error("Missing fork point.");
+    if (this.provider !== "grok") {
+      if (!this.supportsTurnFork()) return "unsupported";
+      const call = this.backend.fork!(this.sessionId, cwd, messageId);
+      try {
+        const r = await this.request(call.method, call.params);
+        if (typeof r?.sessionId !== "string" || !r.sessionId || r.sessionId === this.sessionId) {
+          throw new Error("The agent did not return a new conversation.");
+        }
+        return { newSessionId: r.sessionId };
+      } catch (e) {
+        if (isMethodNotFoundError(e)) {
+          this.forkAdvertised = false;
+          return "unsupported";
+        }
+        throw e;
+      }
+    }
+    if (messageId !== undefined) return "unsupported";
     try {
       const r = await this.request("_x.ai/session/fork", {
         sourceSessionId: this.sessionId,
@@ -1655,6 +1699,11 @@ export class AcpClient extends EventEmitter {
         this.currentSessionTitle = normalized.sessionTitle;
         this.emit("sessionTitle", normalized.sessionTitle);
       }
+      if (normalized.sessionGoal !== undefined && sessionId
+          && sessionId === (this.loadingSessionId ?? this.sessionId)) {
+        this.currentGoal = normalized.sessionGoal;
+        this.emit("sessionGoal");
+      }
       if (normalized.contextWindow !== undefined) {
         this.lastContextWindow = normalized.contextWindow;
         // Claude's live id is often an alias (`opus[1m]`) that is not the
@@ -1771,16 +1820,16 @@ export class AcpClient extends EventEmitter {
       // Hide config-mutating no-op commands (`/always-approve`) from both the
       // autocomplete and the dispatch gate at the single ingestion point (#31).
       // DeepSeek has no native commands; those names can be real filesystem skills.
-      this.availableCommands = this.provider === "deepseek" ? r.commands : filterAdvertisedCommands(r.commands);
+      this.availableCommands = this.provider === "deepseek" ? r.commands : filterAdvertisedCommands(r.commands, this.provider);
       this.emit("commandsUpdate", this.availableCommands);
       this.publishContextWindowSelection();
       return;
     }
     if (r.event === "taskBackgrounded") { this.emit("taskBackgrounded", r.payload); return; }
     if (r.event === "taskCompleted") { this.emit("taskCompleted", r.payload); return; }
-    if (r.event === "messageChunk") this.emit("messageChunk", r.text, meta);
-    else if (r.event === "userMessageChunk") this.emit("userMessageChunk", r.text, meta);
-    else if (r.event === "thoughtChunk") this.emit("thoughtChunk", r.text);
+    if (r.event === "messageChunk" || r.event === "userMessageChunk") {
+      this.emit(r.event, r.text, meta, r.messageId);
+    } else if (r.event === "thoughtChunk") this.emit("thoughtChunk", r.text);
     else if (r.event === "mediaContent") this.emit("mediaContent", r.media);
     else if (r.event === "toolCall") {
       this.emit("toolCall", r.payload);

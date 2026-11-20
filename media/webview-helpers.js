@@ -1,12 +1,14 @@
 (function (root) {
   // Kept set-equal to INTERNAL_PROVIDERS by provider-enumerations.test.ts.
   const PROVIDER_ACTIONS = {
-    grok: { label: "Grok", deleteHistory: true, compact: true, clientMcp: true },
-    codex: { label: "Codex", deleteHistory: true, compact: true, clientMcp: true },
-    claude: { label: "Claude", deleteHistory: true, compact: true, clientMcp: true },
-    muse: { label: "Muse Code", deleteHistory: false, compact: false, clientMcp: false },
-    agy: { label: "Antigravity", deleteHistory: false, compact: false, clientMcp: false },
-    deepseek: { label: "DeepSeek", deleteHistory: false, compact: false, clientMcp: false },
+    // `fork`: "Continue in a new chat" has something that works. Only Grok's
+    // CLI forks a conversation, and its worktree destination is Grok's too.
+    grok: { label: "Grok", deleteHistory: true, compact: true, clientMcp: true, fork: true },
+    codex: { label: "Codex", deleteHistory: true, compact: true, clientMcp: true, fork: false },
+    claude: { label: "Claude", deleteHistory: true, compact: true, clientMcp: true, fork: false },
+    muse: { label: "Muse Code", deleteHistory: false, compact: false, clientMcp: false, fork: false },
+    agy: { label: "Antigravity", deleteHistory: false, compact: false, clientMcp: false, fork: false },
+    deepseek: { label: "DeepSeek", deleteHistory: false, compact: false, clientMcp: false, fork: false },
   };
   function providerSupports(provider, action) {
     return Object.hasOwn(PROVIDER_ACTIONS, provider || "grok")
@@ -72,17 +74,17 @@
     "cloudHostUpdateState",
     "providerConfigContent", "providerConfigWriteResult",
     "initialState", "moveViewHint", "welcomeTips", "projectSetup", "githubState", "githubRepos", "providerState", "mcpServers", "mcpConnectors", "mcpConnectorAuthorization", "routines", "codexInstallProgress", "agyInstallProgress", "planModeAvailability", "showThinking", "appPurpose", "fontScale", "grokUpdateStatus", "updateAvailable", "updateReady", "telemetryEnabled", "thumbsFeedback", "initialized",
-    "cliUpdating", "startupStatus", "session", "sessionName", "composerDraftSession", "sessionRemoved", "sessionOpening", "recentSessions", "projectPrompt", "contextWindowSelection", "modelChanged", "modeChanged", "openModePopover",
+    "cliUpdating", "startupStatus", "session", "sessionName", "sessionGoal", "composerDraftSession", "sessionRemoved", "sessionOpening", "recentSessions", "projectPrompt", "contextWindowSelection", "modelChanged", "modeChanged", "openModePopover",
     "voiceState", "voiceConfigured", "voicePartial", "voiceSubmit", "voiceTranscript",
-    "voiceError", "chips", "commandsUpdate", "mentionResults", "projectDirListing", "projectFileContent", "projectFileWriteResult", "gitStatusResult", "gitFileDiffResult", "turnFileDiffResult", "turnDiffBaseline", "gitRunResult", "userMessage", "agentStart", "thoughtChunk",
-    "messageChunk", "media", "userMessageChunk", "historyReplay", "historyBatch", "permissionHistoryQueue",
+    "voiceError", "chips", "pasteTextSettled", "commandsUpdate", "mentionResults", "projectDirListing", "projectFileContent", "projectFileWriteResult", "gitStatusResult", "gitFileDiffResult", "turnFileDiffResult", "turnDiffBaseline", "gitRunResult", "userMessage", "agentStart", "thoughtChunk",
+    "messageChunk", "forkPointsCleared", "media", "userMessageChunk", "historyReplay", "historyBatch", "permissionHistoryQueue",
     "planHistoryQueue", "toolCall", "toolCallUpdate", "permissionRequest", "permissionOptions",
     "permissionResolved", "exitPlanRequest", "planResolved", "questionRequest", "questionResolved", "planNotice", "autoCompactNotice", "planBlocked",
     "subscriptionUsage",
     "promptComplete", "contextUsage", "commandOutput", "expandCommandOutputs", "setAllToolDetails", "focusInput", "findInSession", "restoreComposer", "truncateMessages", "uiConfirmRequest", "uiConfirmResolved", "agentReset", "agentError", "agentEnd", "exit", "setBusy", "summarizing",
     "sessionContext", "clearMessages", "onboarding", "error", "hostNotice", "xaiNotification", "subagentUpdate", "childStream", "runProgress", "sessions", "repoSessions", "pinnedSessions", "repos",
     "sessionDot", "queuedSends", "submitQueuedSend", "steerUnavailable", "feedbackAvailability", "turnFeedbackAck", "usage", "steerByDefault", "promptNav", "pinLiveWorkflows", "expandDiffCard", "soundNotifications", "processingSound", "inputNeededSound", "readRepliesAloud", "summarizeRepliesAloud", "speechSummary", "imageFull", "imageOriginal", "moveComposerCaret",
-    "remoteStatus", "remoteHandoff", "showRemoteHandoff", "hostReachable", "hostLink",
+    "remoteStatus", "remoteHandoff", "showRemoteHandoff", "hostReachable", "hostLink", "deskAlerts",
   ];
   const WEBVIEW_MESSAGE_TYPES = [
     "setMuseSetting",
@@ -97,14 +99,14 @@
     "setShowThinking", "setAppPurpose", "setExpandCommandOutputs",
     "dropFile", "permissionAnswer", "exitPlanAnswer", "questionAnswer", "questionCancel",
     "setContextWindow", "setModel", "installCodex", "cancelCodexInstall", "installAgy", "cancelAgyInstall", "agySignIn", "setExperimentalAntigravity", "setExperimentalDeepSeek", "installDeepSeek", "cancelDeepSeekInstall", "deepseekConnect", "disconnectProvider", "setDeepSeekHarness", "runInstallCmd", "runMuseInstallCmd", "runGrokLogin", "cancelDeviceLogin", "submitDeviceLoginCode", "logout", "checkGrokUpdate", "updateGrok", "updateCodex", "updateClaude",
-    "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "sessionsReady", "setHideAutoSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "setRepoIcon", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
-      "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "gitStatus", "gitFileDiff", "turnFileDiff", "turnFileOpenDiff", "gitRun", "pasteImage", "uploadFile", "voiceStart", "voiceStop",
+    "recheckConnection", "refreshProviders", "retryProviderSession", "listSessions", "listRepoSessions", "selectRepo", "toggleRepoPin", "setRepoArchived", "setRepoColor", "setRepoIcon", "toggleSessionPin", "resumeSession", "renameSession", "deleteSession",
+      "clearAllSessions", "pickFile", "mentionQuery", "addMentionFile", "listProjectDir", "readProjectFile", "writeProjectFile", "gitStatus", "gitFileDiff", "turnFileDiff", "turnFileOpenDiff", "gitRun", "pasteImage", "pasteText", "uploadFile", "voiceStart", "voiceStop",
       "remoteVoiceStart", "remoteVoiceChunk", "remoteVoiceStop", "setVoiceBackend", "configureOpenAiVoice",
-    "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "turnFeedback", "forkSession", "setSteerByDefault", "setPromptNav", "setPinLiveWorkflows", "setExpandDiffCard",
+    "queueSend", "dequeueSend", "clearQueuedSends", "steerSend", "turnFeedback", "forkSession", "forkAtReply", "setSteerByDefault", "setPromptNav", "setPinLiveWorkflows", "setExpandDiffCard",
     "setSoundNotifications", "setProcessingSound", "setInputNeededSound", "setReadRepliesAloud", "setSummarizeRepliesAloud", "setVoiceSendPhrase", "setVoiceKeyterms", "setTelemetryEnabled", "setThumbsFeedback", "setDesktopTray", "summarizeSpeech", "requestImageFull", "requestImageOriginal", "composerFocus",
     "newWorktreeSession", "applyWorktree", "removeWorktree", "rewindSession", "editLastMessage", "uiConfirmAnswer", "workflowControl", "refreshContextDetails",
     "refreshSubscriptionUsage",
-    "remoteSignIn", "remoteSignOut", "unlinkRemoteDevice", "openRemotePortal", "remoteHandoff", "showRemoteHandoff",
+    "remoteSignIn", "remoteSignOut", "unlinkRemoteDevice", "openRemotePortal", "remoteHandoff", "showRemoteHandoff", "setDeskAlerts",
     "openUpdateRelease", "restartToUpdate",
   ];
   const HOST_MESSAGE_TYPE_SET = new Set(HOST_MESSAGE_TYPES);
@@ -1049,9 +1051,33 @@
   // there's no block (a plain message) files is empty and body is the input.
   function parseAttachmentContext(text) {
     if (typeof text !== "string") return { files: [], body: text || "" };
+    const pasted = [];
+    const header = /(?:^|\n\n)<afk-pasted-text length="([0-9]{1,7})" name="Pasted text\.txt">\n/g;
+    const close = "\n</afk-pasted-text>";
+    let rest = "";
+    let cursor = 0;
+    for (let match; (match = header.exec(text));) {
+      rest += text.slice(cursor, match.index);
+      pasted.push("Pasted text.txt");
+      const end = header.lastIndex + Number(match[1]);
+      if (end + close.length > text.length) {
+        // Replay can deliver an attachment in chunks. Keep its partial data
+        // out of the bubble while the rest is arriving.
+        cursor = text.length;
+        break;
+      }
+      if (!text.startsWith(close, end)) {
+        pasted.pop();
+        rest += match[0];
+        cursor = header.lastIndex;
+        continue;
+      }
+      cursor = header.lastIndex = end + close.length;
+    }
+    text = rest + text.slice(cursor);
     const m = text.match(/<vscode-context[^>]*>\n?([\s\S]*?)\n?<\/vscode-context>\s*/);
-    if (!m) return { files: [], body: text };
-    const files = [];
+    if (!m) return { files: pasted, body: text };
+    const files = [...pasted];
     for (const raw of m[1].split("\n")) {
       const line = raw.trim();
       let mm;
@@ -1561,7 +1587,7 @@
         const start = i;
         let text = String(ev.text || "");
         i += 1;
-        while (i < flat.length && flat[i].type === "userMessageChunk") {
+        while (i < flat.length && flat[i].type === "userMessageChunk" && !flat[i].startsMessage) {
           text += String(flat[i].text || "");
           i += 1;
         }
@@ -1626,7 +1652,7 @@
       if (ev.type === "userMessageChunk") {
         let text = String(ev.text || "");
         i += 1;
-        while (i < flat.length && flat[i].type === "userMessageChunk") {
+        while (i < flat.length && flat[i].type === "userMessageChunk" && !flat[i].startsMessage) {
           text += String(flat[i].text || "");
           i += 1;
         }
@@ -1749,7 +1775,7 @@
           while (
             i + group.length < list.length &&
             list[i + group.length] &&
-            list[i + group.length].type === "userMessageChunk"
+            list[i + group.length].type === "userMessageChunk" && !list[i + group.length].startsMessage
           ) {
             group.push(list[i + group.length]);
           }
@@ -1927,6 +1953,7 @@
           break;
         case "userMessageChunk":
           flushAgent();
+          if (ev.startsMessage) flushUser();
           userText += ev.text || "";
           if (Array.isArray(ev.images)) userImages = userImages.concat(ev.images);
           break;

@@ -88,6 +88,7 @@ describe("remembered mode preference (#25)", () => {
     expect(modeToRemember("plan")).toBeNull();
     expect(modeToRemember("onRequest")).toBeNull();
     expect(modeToRemember("denyUnmatched")).toBeNull();
+    expect(modeToRemember("askApproval")).toBeNull(); // Codex remembers it in provider state.
   });
 
   it("starts a NEW session in Auto accept only when that's the remembered mode", () => {
@@ -119,10 +120,10 @@ describe("remembered mode preference (#25)", () => {
     expect(startsInYolo("auto", false)).toBe(false);
   });
 
-  it("offers Plan to Grok and Claude only", () => {
+  it("offers the native picker choices for each provider", () => {
     expect(sessionModes("grok")).toEqual(["agent", "plan", "yolo"]);
     expect(sessionModes("claude")).toEqual(["agent", "auto", "plan", "yolo"]);
-    expect(sessionModes("codex")).toEqual(["agent", "yolo"]);
+    expect(sessionModes("codex")).toEqual(["agent", "askApproval", "plan", "yolo"]);
     expect(sessionModes("muse")).toEqual(["yolo", "agent", "onRequest"]);
     expect(sessionModes("muse", true)).toEqual(["yolo", "agent"]);
     for (const provider of ["grok", "codex", "claude"]) expect(sessionModes(provider, true)).toEqual(sessionModes(provider));
@@ -225,12 +226,35 @@ describe("effort picker persistence", () => {
   it("remembers a Muse picker change before restarting an empty session", async () => {
     const { sidebar, session } = picker("muse");
     session.hasHistory = false;
+    (session.client as any).currentModelSupportsEffort = () => false;
     sidebar.startSession.mockImplementation(async () => {
       expect(sidebar.defaultEffortForProvider("muse")).toBe("max");
     });
     await sidebar.onMessage({ type: "setEffort", level: "max" }, "local");
     expect(sidebar.startSession).toHaveBeenCalledWith(undefined, session);
     expect(session.client!.setReasoningEffort).not.toHaveBeenCalled();
+  });
+
+  // A restart starts in the default mode, so restarting an empty Codex chat
+  // dropped a Plan picked before its first prompt to the remembered Auto accept.
+  it("switches an empty chat's effort live when the agent can, keeping its mode", async () => {
+    const { sidebar, session, values } = picker("codex");
+    session.hasHistory = false;
+    await sidebar.onMessage({ type: "setEffort", level: "low" }, "local");
+    expect(session.client!.setReasoningEffort).toHaveBeenCalledWith("low");
+    expect(values["grok.defaultEffortByProvider"]).toEqual({ codex: "low" });
+    expect(sidebar.startSession).not.toHaveBeenCalled();
+    expect(sidebar.restartSession).not.toHaveBeenCalled();
+    expect(sidebar.discardAdapterEmptySession).not.toHaveBeenCalled();
+  });
+
+  it("restarts an empty chat when the live switch is refused", async () => {
+    const { sidebar, session } = picker("codex");
+    session.hasHistory = false;
+    (session.client as any).setReasoningEffort = vi.fn(async () => false);
+    await sidebar.onMessage({ type: "setEffort", level: "low" }, "local");
+    expect(sidebar.startSession).toHaveBeenCalledWith(undefined, session);
+    expect(sidebar.pickRestartMode).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("remembers an adapter reset for the restart path (empty=%s)", async (empty) => {

@@ -1,7 +1,7 @@
 import type { ContextWindowSelection } from "./context-selection";
 export type RemoteHandoffSource = "topbar" | "rail" | "projects" | "settings" | "palette";
 
-import type { AcpProvider } from "./acp-backend";
+import type { AcpProvider, SessionGoal } from "./acp-backend";
 // Single source of truth for the host <-> webview message contract.
 //
 // Two directions, two discriminated unions:
@@ -21,12 +21,11 @@ import type { AcpProvider } from "./acp-backend";
 // that chat.js actually handles every HostMsg type — closing the loop across the
 // TS/JS boundary that tsc can't see.
 //
-// All payload-shape imports are `import type` so this module carries no runtime
-// dependency on vscode/acp/etc. — it compiles to just the two arrays, and the
-// test can import it without a VS Code environment.
+// Payload-shape imports are `import type` so the wire contract can be imported
+// without a VS Code environment.
 
 import type { ModelInfo, PromptResultMeta, PromptUsage, PermissionRequest, ExitPlanRequest, QuestionRequest } from "./acp";
-import type { FileChip } from "./chips";
+import { MAX_PASTED_TEXT_BYTES, type FileChip } from "./chips";
 import type { SttPreference, VoiceBackendState } from "./voice";
 import type { RepoListEntry, SessionListEntry } from "./sessions";
 import type { Dot } from "./session-pool";
@@ -85,6 +84,7 @@ export const HOST_CAPABILITIES = {
   // A distinct message: old runInstallCmd hosts always install Grok.
   installMuse: true,
   uploadFile: true,
+  pasteTextMaxBytes: MAX_PASTED_TEXT_BYTES,
   remoteVoice: true,
   // Whether `deleteSession` can take the conversation the requester is READING.
   // Older hosts refuse it — the live CLI re-persisted the files the moment they
@@ -207,6 +207,7 @@ export type HostUiCapabilities = {
   /** Desk-only fixed Muse installer. Absent/false hides the install button. */
   installMuse?: boolean;
   uploadFile: boolean;
+  pasteTextMaxBytes?: number;
   remoteVoice: boolean;
   deleteActiveSession?: boolean;
   /**
@@ -417,6 +418,8 @@ export type HostMsg =
       /** VS Code language id for command View all, from the host shell dialect.
        *  Absent on older hosts — View all then omits language. */
       commandLanguage?: string;
+      /** Present when this host can show desk alerts. */
+      deskAlerts?: boolean;
       museSettings?: MuseSettings;
       museSandboxUnavailable?: boolean;
       /** Which GUI is on the other end. A phone is looking at neither the
@@ -598,6 +601,7 @@ export type HostMsg =
   | { type: "soundNotifications"; value: boolean }
   | { type: "processingSound"; value: boolean }
   | { type: "inputNeededSound"; value: boolean }
+  | { type: "deskAlerts"; value: boolean }
   // grok.readRepliesAloud — local VS Code speech-synthesis preference.
   | { type: "readRepliesAloud"; value: boolean }
   | { type: "summarizeRepliesAloud"; value: boolean }
@@ -666,7 +670,8 @@ export type HostMsg =
   // alone falls back to that directory's leaf — and if the leaf happens to match
   // another project's name, it presents one project's conversation as another's.
   // Optional and additive: a client that never sees it keeps its old fallback.
-  | { type: "sessionName"; sessionId: string; name: string; cwd: string; repoCwd?: string }
+  | { type: "sessionName"; sessionId: string; name: string; cwd: string; repoCwd?: string; turnForkSupported?: boolean }
+  | { type: "sessionGoal"; sessionId: string; goal: SessionGoal | null }
   | { type: "composerDraftSession"; draftId: string; sessionId: string }
   | { type: "contextWindowSelection"; selection: ContextWindowSelection }
   | { type: "modelChanged"; modelId: string }
@@ -687,6 +692,7 @@ export type HostMsg =
   | { type: "voiceTranscript"; text: string; send?: boolean }
   | { type: "voiceError" }
   | { type: "chips"; chips: FileChip[] }
+  | { type: "pasteTextSettled"; pasteId: string }
   | { type: "commandsUpdate"; commands: unknown[] }
   // Reply to the webview's `mentionQuery` (the composer's `@` file popover):
   // workspace-relative paths (forward slashes), ranked by src/mention.ts. The
@@ -837,14 +843,17 @@ export type HostMsg =
   /** `steer` marks a mid-turn interjection (#52). It paints a user bubble but is
    *  NOT a prompt and gets no rewind point, so the bubble must not consume a
    *  rewind index — see refreshUserRewindButtons. */
-  | { type: "userMessage"; text: string; chips?: FileChip[]; steer?: boolean; submissionId?: string }
+  | { type: "userMessage"; text: string; chips?: FileChip[]; steer?: boolean; submissionId?: string; forkBefore?: string }
   | { type: "agentStart" }
   | { type: "thoughtChunk"; text: string }
-  | { type: "messageChunk"; text: string }
+  | { type: "messageChunk"; text: string; messageId?: string; forkPoint?: string }
+  | { type: "forkPointsCleared" }
   | { type: "media"; media: string; src?: string; url?: string; mimeType?: string; path?: string; fullId?: string }
   | {
       type: "userMessageChunk";
       text: string;
+      startsMessage?: true;
+      forkBefore?: string;
       timestampMs?: number;
       images?: Array<{ imageIndex: number; path?: string; previewSrc?: string; fullId?: string }>;
     }
@@ -897,7 +906,7 @@ export type HostMsg =
     }
   | { type: "agentReset" }
   | { type: "agentError"; text: string }
-  | { type: "agentEnd"; meta?: PromptResultMeta }
+  | { type: "agentEnd"; meta?: PromptResultMeta; forkPoint?: string }
   | { type: "exit"; code: number | null }
   | { type: "setBusy"; value: boolean; locked?: boolean }
   | { type: "summarizing" }
@@ -1025,7 +1034,7 @@ export type HostMsg =
   // Move keyboard focus into the composer input (#43) — posted after Send
   // Selection / Send File / @-mention so the user can type a prompt right away.
   // Ephemeral UI action, not session-scoped (goes via `post`, never buffered).
-  | { type: "focusInput" }
+  | { type: "focusInput"; closeSettings?: true }
   /** Open the in-webview find bar (#99). Command Palette + Ctrl/Cmd+F fallback
    *  when the workbench swallows the keystroke inside a WebviewView. Ephemeral
    *  (`post`, never buffered). Host-local — remotes open find from their own ⋯. */
@@ -1306,6 +1315,7 @@ export type WebviewMsg =
   | { type: "setSoundNotifications"; value: boolean }
   | { type: "setProcessingSound"; value: boolean }
   | { type: "setInputNeededSound"; value: boolean }
+  | { type: "setDeskAlerts"; value: boolean }
   | { type: "setReadRepliesAloud"; value: boolean }
   | { type: "setSummarizeRepliesAloud"; value: boolean }
   | { type: "summarizeSpeech"; requestId: number; text: string }
@@ -1549,6 +1559,7 @@ export type WebviewMsg =
   // Remote browser upload: an untrusted basename plus base64 bytes. The host
   // allowlists/sanitizes/stages it, then routes it through addDroppedFile.
   | { type: "uploadFile"; name: string; data: string }
+  | { type: "pasteText"; text: string; pasteId: string }
   | { type: "voiceStart" }
   /** Stop voice input. Manual Send/Queue sets discard so late transcription
    * cannot refill the composer that was just sent. */
@@ -1588,6 +1599,7 @@ export type WebviewMsg =
   // `sessionId` is additive: old clients omit it and keep today's path; a
   // present id that is not the dispatch-resolved session is refused.
   | { type: "forkSession"; sessionId?: string }
+  | { type: "forkAtReply"; sessionId: string; messageId: string; draft?: string }
   // Worktree UI (P2-8): new isolated session / merge back / remove worktree.
   | { type: "newWorktreeSession" }
   | { type: "applyWorktree"; sessionId?: string }
@@ -1636,12 +1648,12 @@ export type WebviewMsg =
 const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   museSettings: true,
   cloudHostUpdateState: true, initialState: true, moveViewHint: true, welcomeTips: true, projectSetup: true, githubState: true, githubRepos: true, providerState: true, mcpServers: true, mcpConnectors: true, mcpConnectorAuthorization: true, routines: true, codexInstallProgress: true, agyInstallProgress: true, planModeAvailability: true, showThinking: true, appPurpose: true, fontScale: true, grokUpdateStatus: true, updateAvailable: true, updateReady: true, telemetryEnabled: true, thumbsFeedback: true,
-  contextWindowSelection: true, initialized: true, cliUpdating: true, startupStatus: true, session: true, sessionName: true, composerDraftSession: true, modelChanged: true,
+  contextWindowSelection: true, initialized: true, cliUpdating: true, startupStatus: true, session: true, sessionName: true, sessionGoal: true, composerDraftSession: true, modelChanged: true,
   modeChanged: true, openModePopover: true, voiceState: true, voiceConfigured: true,
   voicePartial: true, voiceSubmit: true, voiceTranscript: true, voiceError: true,
-  chips: true, commandsUpdate: true, mentionResults: true, projectDirListing: true, projectFileContent: true, projectFileWriteResult: true, gitStatusResult: true, gitFileDiffResult: true, turnFileDiffResult: true, turnDiffBaseline: true, gitRunResult: true, userMessage: true, agentStart: true,
+  chips: true, pasteTextSettled: true, commandsUpdate: true, mentionResults: true, projectDirListing: true, projectFileContent: true, projectFileWriteResult: true, gitStatusResult: true, gitFileDiffResult: true, turnFileDiffResult: true, turnDiffBaseline: true, gitRunResult: true, userMessage: true, agentStart: true,
   providerConfigContent: true, providerConfigWriteResult: true,
-  thoughtChunk: true, messageChunk: true, media: true, userMessageChunk: true,
+  thoughtChunk: true, messageChunk: true, forkPointsCleared: true, media: true, userMessageChunk: true,
   historyReplay: true, historyBatch: true, permissionHistoryQueue: true, planHistoryQueue: true,
   toolCall: true, toolCallUpdate: true, permissionRequest: true, permissionOptions: true,
   permissionResolved: true, exitPlanRequest: true, planResolved: true, questionRequest: true, questionResolved: true,
@@ -1650,7 +1662,7 @@ const HOST_MESSAGE_TYPE_MAP: Record<HostMsg["type"], true> = {
   agentError: true, agentEnd: true, exit: true, setBusy: true, summarizing: true,
   sessionContext: true, clearMessages: true, onboarding: true, error: true, hostNotice: true,
   xaiNotification: true, subagentUpdate: true, childStream: true, runProgress: true, commandOutput: true, expandCommandOutputs: true, steerByDefault: true, promptNav: true, pinLiveWorkflows: true, expandDiffCard: true,
-  soundNotifications: true, processingSound: true, inputNeededSound: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, showRemoteHandoff: true, remoteHandoff: true, hostReachable: true, hostLink: true,
+  soundNotifications: true, processingSound: true, inputNeededSound: true, deskAlerts: true, readRepliesAloud: true, summarizeRepliesAloud: true, speechSummary: true, imageFull: true, imageOriginal: true, moveComposerCaret: true, remoteStatus: true, showRemoteHandoff: true, remoteHandoff: true, hostReachable: true, hostLink: true,
   setAllToolDetails: true, focusInput: true, findInSession: true, restoreComposer: true, truncateMessages: true, uiConfirmRequest: true, uiConfirmResolved: true,
   sessions: true, sessionRemoved: true, sessionOpening: true, projectPrompt: true, repoSessions: true, pinnedSessions: true, recentSessions: true, repos: true, sessionDot: true, queuedSends: true, submitQueuedSend: true,
   steerUnavailable: true, feedbackAvailability: true, turnFeedbackAck: true, usage: true,
@@ -1665,7 +1677,7 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   openProjectConfig: true, listMcpServers: true, connectMcpConnector: true, disconnectMcpConnector: true,
   listRoutines: true, saveRoutine: true, deleteRoutine: true, setRoutinePaused: true, runRoutineNow: true, showLogs: true, toggleDevTools: true, openSettings: true, openSettingsSurface: true, closeSettingsSurface: true, dismissWelcomeTip: true, welcomeTipShown: true, moveView: true,
   setShowThinking: true, setAppPurpose: true, setExpandCommandOutputs: true, setSteerByDefault: true, setPromptNav: true, setPinLiveWorkflows: true, setExpandDiffCard: true,
-  setSoundNotifications: true, setProcessingSound: true, setInputNeededSound: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, setDesktopTray: true, summarizeSpeech: true, requestImageFull: true, requestImageOriginal: true, composerFocus: true,
+  setSoundNotifications: true, setProcessingSound: true, setInputNeededSound: true, setDeskAlerts: true, setReadRepliesAloud: true, setSummarizeRepliesAloud: true, setVoiceSendPhrase: true, setVoiceKeyterms: true, setTelemetryEnabled: true, setThumbsFeedback: true, setDesktopTray: true, summarizeSpeech: true, requestImageFull: true, requestImageOriginal: true, composerFocus: true,
   dropFile: true, permissionAnswer: true, exitPlanAnswer: true, questionAnswer: true,
   questionCancel: true, setModel: true, installCodex: true, cancelCodexInstall: true, installAgy: true, cancelAgyInstall: true, agySignIn: true, setExperimentalAntigravity: true, setExperimentalDeepSeek: true, installDeepSeek: true, cancelDeepSeekInstall: true, deepseekConnect: true, disconnectProvider: true, setDeepSeekHarness: true, runInstallCmd: true, runMuseInstallCmd: true, runGrokLogin: true,
   cancelDeviceLogin: true, submitDeviceLoginCode: true,
@@ -1677,10 +1689,10 @@ const WEBVIEW_MESSAGE_TYPE_MAP: Record<WebviewMsg["type"], true> = {
   listProjectDir: true, readProjectFile: true, writeProjectFile: true,
   readProviderConfig: true, writeProviderConfig: true, restartProviderSession: true,
   gitStatus: true, gitFileDiff: true, turnFileDiff: true, turnFileOpenDiff: true, gitRun: true,
-  pasteImage: true, uploadFile: true, voiceStart: true,
+  pasteImage: true, pasteText: true, uploadFile: true, voiceStart: true,
   voiceStop: true, setVoiceBackend: true, configureOpenAiVoice: true, remoteVoiceStart: true, remoteVoiceChunk: true,
   remoteVoiceStop: true, queueSend: true, dequeueSend: true, clearQueuedSends: true,
-  steerSend: true, turnFeedback: true, forkSession: true,
+  steerSend: true, turnFeedback: true, forkSession: true, forkAtReply: true,
   newWorktreeSession: true, applyWorktree: true, removeWorktree: true,
   rewindSession: true, editLastMessage: true, uiConfirmAnswer: true, workflowControl: true,
   refreshContextDetails: true,

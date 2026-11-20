@@ -2,6 +2,7 @@ import { AcpClient } from "./acp";
 import type { HostEditorWebview } from "./host";
 import type { HostMsg } from "./protocol";
 import type { FileChip } from "./chips";
+import { ForkPoints } from "./fork-points";
 import { permissionOptionsForPlan } from "./plan-gate";
 import type { AcpProvider } from "./acp-backend";
 import { deepseekShellUnsandboxed } from "./deepseek-backend";
@@ -77,10 +78,13 @@ type AutoAcceptOption = {
 };
 
 /**
- * The allow Auto accept may send. Grok, Codex and Claude prefer `allow_always`.
+ * The allow Auto accept may send. Grok and Codex prefer `allow_always`.
  * Muse must not: `allow_always` is a permanent config grant, and a session-scoped
  * choice is advertised as `allow_once`, so kind alone would outlive Agent.
  * Antigravity's `allow_always` is likewise saved with the conversation.
+ * Claude's `allow_always` writes a "don't ask again" rule into the project's
+ * `.claude/settings.local.json`, which outlives Auto accept and also applies to
+ * Claude Code in a terminal, so Claude answers once too.
  */
 export function pickAutoAcceptOption<T extends AutoAcceptOption>(
   options: readonly T[],
@@ -93,7 +97,9 @@ export function pickAutoAcceptOption<T extends AutoAcceptOption>(
   if (provider === "muse") {
     return usable.find((option) => option.kind === "allow_once" && option._meta?.scope === "once");
   }
-  if (provider === "agy" || provider === "deepseek") return usable.find((option) => option.kind === "allow_once");
+  if (provider === "agy" || provider === "deepseek" || provider === "claude") {
+    return usable.find((option) => option.kind === "allow_once");
+  }
   return usable.find((option) => option.kind === "allow_always")
     ?? usable.find((option) => option.kind === "allow_once");
 }
@@ -109,6 +115,10 @@ export function preferredPermissionAllowOption(
   return pickAutoAcceptOption(options, provider, pending.commandGrant?.optionId);
 }
 
+export interface SessionTurnToken {
+  stopRequested?: boolean;
+}
+
 /**
  * All state that belongs to a single grok session — extracted from GrokSidebar so
  * the sidebar can hold a *pool* of these (one live `grok agent stdio` process per
@@ -121,6 +131,7 @@ export function preferredPermissionAllowOption(
  * singletons it replaces 1:1).
  */
 export class Session {
+  codexModeChange?: Promise<boolean>;
   /** Provider is fixed once the first user turn enters history. */
   provider: AcpProvider = "grok";
   /** Host-owned composer attachments for this session/view. */
@@ -297,6 +308,8 @@ export class Session {
    * only increment userMessageCount once per user message during replay.
    */
   inUserMessage = false;
+  readonly forkPoints = new ForkPoints();
+  forkInFlight = false;
 
   /**
    * True only while replaying a resumed session (session/load). grok ≥0.2.33
@@ -396,7 +409,7 @@ export class Session {
    * nothing on disk to show for it and only a window reload as a cure. Status
    * now describes the dot; this describes the turn.
    */
-  turnToken: object | undefined = undefined;
+  turnToken: SessionTurnToken | undefined = undefined;
 
   /**
    * ms-epoch of the last time this session was made the focus, created, or put to
@@ -486,8 +499,8 @@ export class Session {
 
 /** Mark a prompt as in flight. The returned token is the only thing that can
  *  later end THIS turn. */
-export function beginTurn(session: Session): object {
-  const token = {};
+export function beginTurn(session: Session): SessionTurnToken {
+  const token: SessionTurnToken = {};
   session.turnToken = token;
   session.staleSendReported = false;
   return token;
@@ -696,6 +709,14 @@ export function sessionModeMessage(session: Session, modeId: string): Extract<Ho
   };
 }
 
+/** Goal state lives with the adapter connection and is kept out of the history buffer. */
+export function sessionGoalMessage(session: Session): Extract<HostMsg, { type: "sessionGoal" }> | undefined {
+  const client = session.client;
+  if (client?.sessionId && session.activeSessionId === client.sessionId && client.currentGoal !== undefined) {
+    return { type: "sessionGoal", sessionId: client.sessionId, goal: client.currentGoal };
+  }
+}
+
 /** Current non-chat UI state for rebuilding a view of this live session. */
 export function sessionUiSnapshot(
   session: Session,
@@ -705,6 +726,8 @@ export function sessionUiSnapshot(
   const messages: HostMsg[] = [];
   messages.push(startupStatusMessage(session));
   messages.push({ type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] });
+  const goal = sessionGoalMessage(session);
+  if (goal) messages.push(goal);
   if (session.client?.currentModelId) {
     messages.push({ type: "modelChanged", modelId: session.client.currentModelId });
   }

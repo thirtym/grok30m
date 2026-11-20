@@ -6,8 +6,10 @@ import type { DefaultModeCohort } from "./default-mode-cohort";
 
 export type MuseModeId = "agent" | "yolo" | "onRequest" | "denyUnmatched";
 /** `auto` is a provider's own Auto mode, offered only where one exists. */
-export type ModeId = MuseModeId | "plan" | "auto";
+export type ModeId = MuseModeId | "plan" | "auto" | "askApproval";
 export const MUSE_MODE_PREF_KEY = "grok.defaultMuseMode";
+export const CODEX_ASK_APPROVAL_PREF_KEY = "grok.codexAskApproval";
+export const CODEX_MODE_WAITS_FOR_PLAN = "Answer the plan first. Codex implements it with the access it had when planning began. To implement it with approvals, choose No on the plan, switch modes, then ask Codex to implement the plan.";
 export const MUSE_CLOUD_ON_REQUEST_UNAVAILABLE = "Muse On request is unavailable on cloud machines. Open this conversation on a desktop to change its mode, or start a new cloud conversation in Prompt unmatched.";
 export const MUSE_WINDOWS_ON_REQUEST_UNAVAILABLE = "Muse On request is unavailable on Windows because Muse's shell sandbox cannot run there. Use Prompt unmatched or Allow all.";
 export type MuseSandboxUnavailable = "cloud" | "windows" | undefined;
@@ -32,7 +34,7 @@ export function isMuseModeId(value: unknown): value is MuseModeId {
 }
 
 export function isModeId(value: unknown): value is ModeId {
-  return value === "plan" || value === "auto" || isMuseModeId(value);
+  return value === "plan" || value === "auto" || value === "askApproval" || isMuseModeId(value);
 }
 
 /**
@@ -100,12 +102,13 @@ export function startsInYolo(defaultMode: string | undefined, isResume: boolean)
   return !isResume && defaultMode === "yolo";
 }
 
-/** Modes this session's picker offers. Codex's plan review is outside this menu; Muse and Antigravity have no Plan. */
+/** Modes this session's picker offers. */
 export function sessionModes(provider: string, sandboxUnavailable = false): ModeId[] {
   // Deny unmatched stalls Muse's end-of-turn reminder agent; see research/muse-modes.md.
   if (provider === "muse") return sandboxUnavailable ? ["yolo", "agent"] : ["yolo", "agent", "onRequest"];
   if (hasNativeAutoMode(provider)) return ["agent", "auto", "plan", "yolo"];
-  return provider === "codex" || provider === "agy" || provider === "deepseek"
+  if (provider === "codex") return ["agent", "askApproval", "plan", "yolo"];
+  return provider === "agy" || provider === "deepseek"
     ? ["agent", "yolo"]
     : ["agent", "plan", "yolo"];
 }

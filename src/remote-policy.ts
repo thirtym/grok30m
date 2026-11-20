@@ -35,6 +35,7 @@ function remoteUserMessageIndexes(buffer: readonly HostMsg[]): number[] {
   };
   buffer.forEach((msg, index) => {
     if (msg.type === "userMessageChunk") {
+      if (msg.startsMessage) finishChunks();
       if (chunkStart < 0) chunkStart = index;
       chunkText += msg.text;
       return;
@@ -317,6 +318,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   // (`client_type` is extension/desktop even when a phone clicked).
   turnFeedback: "propose",
   forkSession: "propose",
+  forkAtReply: "propose",
   // Worktree create/apply/remove: REVERTED to host-local 2026-08-07, hours
   // after being widened to "propose" the same day. The widening was safe in
   // itself — the authorization underneath (git-list, path containment) never
@@ -367,6 +369,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   refreshContextDetails: "view",
   refreshSubscriptionUsage: "view",
   pasteImage: "propose",
+  pasteText: "propose",
   // Host validates the extension/name/bytes before staging under globalStorage.
   uploadFile: "propose",
   // Workspace file mutation — same propose tier as upload/send, NOT view. A
@@ -529,6 +532,7 @@ export const INBOUND_DISPOSITION: Record<WebviewMsg["type"], InboundDisposition>
   setSoundNotifications: "host-local",
   setProcessingSound: "host-local",
   setInputNeededSound: "host-local",
+  setDeskAlerts: "host-local",
   setReadRepliesAloud: "host-local",
   setSummarizeRepliesAloud: "host-local",
   // Phone dictation is first-class: the send phrase and dictionary are the
@@ -647,6 +651,7 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   steerSend: true,
   turnFeedback: true,
   forkSession: true,
+  forkAtReply: true,
   newWorktreeSession: false,
   applyWorktree: true,
   removeWorktree: true,
@@ -657,6 +662,7 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   refreshContextDetails: true,
   refreshSubscriptionUsage: true,
   pasteImage: true,
+  pasteText: true,
   uploadFile: true,
   writeProjectFile: false,
   removeChip: true,
@@ -729,6 +735,7 @@ export const REMOTE_REQUIRES_BOUND_SESSION: Record<WebviewMsg["type"], boolean> 
   setSoundNotifications: false,
   setProcessingSound: false,
   setInputNeededSound: false,
+  setDeskAlerts: false,
   setReadRepliesAloud: false,
   setSummarizeRepliesAloud: false,
   setVoiceSendPhrase: false,
@@ -1041,6 +1048,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   // Conversation names are already exposed in the remote history list, so
   // the focused-name update has the same display-only sensitivity.
   sessionName: "mirror",
+  sessionGoal: "mirror",
   composerDraftSession: "mirror",
   sessionRemoved: "mirror",
   contextWindowSelection: "mirror",
@@ -1049,6 +1057,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   planModeAvailability: "mirror",
   openModePopover: "mirror",
   chips: "mirror",
+  pasteTextSettled: "mirror",
   commandsUpdate: "mirror",
   mentionResults: "mirror",
   // Targeted answers to a phone's list/read/write. absPath on content is
@@ -1067,6 +1076,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   agentStart: "mirror",
   thoughtChunk: "mirror",
   messageChunk: "mirror",
+  forkPointsCleared: "mirror",
   userMessageChunk: "mirror",
   historyReplay: "mirror",
   historyBatch: "mirror",
@@ -1115,6 +1125,7 @@ export const OUTBOUND_DISPOSITION: Record<HostMsg["type"], OutboundDisposition> 
   soundNotifications: "mirror",
   processingSound: "host-local",
   inputNeededSound: "host-local",
+  deskAlerts: "host-local",
   readRepliesAloud: "host-local",
   summarizeRepliesAloud: "host-local",
   // Only the shortened text is returned; sidebar targets it to the requester.
@@ -1219,6 +1230,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   soundNotifications: "none",
   processingSound: "none",
   inputNeededSound: "none",
+  deskAlerts: "none",
   readRepliesAloud: "none",
   summarizeRepliesAloud: "none",
   moveComposerCaret: "none",
@@ -1260,12 +1272,14 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   projectPrompt: "scope",
   repoSessions: "message-cwd",
   sessionName: "message-cwd",
+  sessionGoal: "scope",
   composerDraftSession: "scope",
   sessionRemoved: "message-cwd",
   // Session-scoped live + restore payload — requires authorized session/repo cwd.
   session: "scope",
   sessionDot: "scope",
   chips: "scope",
+  pasteTextSettled: "none",
   contextWindowSelection: "scope",
   modelChanged: "scope",
   modeChanged: "scope",
@@ -1289,6 +1303,7 @@ export const OUTBOUND_PROJECT_AUTH: Record<HostMsg["type"], OutboundProjectAuth>
   agentStart: "scope",
   thoughtChunk: "scope",
   messageChunk: "scope",
+  forkPointsCleared: "scope",
   userMessageChunk: "scope",
   media: "scope",
   imageFull: "scope",
@@ -1619,6 +1634,10 @@ function inlineHistoryImageForRemote(image: HistoryImage, deps: MediaInlineDeps)
 /** The single outbound choke point: what (if anything) crosses to a remote for
  *  this HostMsg. Returns the message to send, or null to suppress. */
 export function transformHostMsgForRemote(msg: HostMsg, deps: MediaInlineDeps): HostMsg | null {
+  if (msg.type === "initialState" && msg.deskAlerts !== undefined) {
+    const { deskAlerts, ...rest } = msg;
+    return rest;
+  }
   if (msg.type === "historyBatch") {
     return {
       ...msg,

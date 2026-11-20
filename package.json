@@ -1,21 +1,21 @@
 {
-  "name": "grok30m",
-  "displayName": "Grok30m",
-  "description": "Grok30m — fork of the community Grok Build VS Code client with Claude-style editor tabs, dedicated Sessions sidebar, and auto-hide for automated sessions. Requires the Grok Build CLI plus SuperGrok, X Premium+, or an xAI API key. Based on Pawel Huryn's grok-build-vscode. Not affiliated with or endorsed by xAI.",
-  "version": "2.1.30",
-  "publisher": "grok30m",
+  "name": "grok-vscode-phuryn",
+  "displayName": "AFK Pilot: Grok Build, Muse Code, DeepSeek, Claude, Codex & more in one place",
+  "description": "One place for Grok Build (Grok 4.7), Muse Code (Muse Wonder) and DeepSeek (V4 Pro), plus Codex (GPT-6 Astra), Claude Code (Opus 5.5) and Google Antigravity (Gemini 4 Argon). Previously Grok Build (Community). Remote Control from your phone, voice control, multiple sessions, images and videos, Mermaid diagrams, and LaTeX. Works with SuperGrok, X Premium+, and xAI API key. Fair Source (FSL-1.1-MIT). Not affiliated with or endorsed by SpaceXAI (formerly xAI), Meta, OpenAI, Anthropic or Google.",
+  "version": "4.16.0",
+  "publisher": "PawelHuryn",
   "author": {
-    "name": "Grok30m contributors",
-    "url": "https://github.com/thirtym/grok30m"
+    "name": "Paweł Huryn",
+    "url": "https://www.productcompass.pm"
   },
   "license": "FSL-1.1-MIT",
-  "homepage": "https://github.com/thirtym/grok30m",
+  "homepage": "https://afkpilot.com",
   "bugs": {
-    "url": "https://github.com/thirtym/grok30m/issues"
+    "url": "https://github.com/phuryn/grok-build-vscode/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/thirtym/grok30m.git"
+    "url": "https://github.com/phuryn/grok-build-vscode"
   },
   "engines": {
     "vscode": "^1.106.0"
@@ -59,38 +59,33 @@
   "icon": "resources/grok-icon.png",
   "main": "./out/extension.js",
   "activationEvents": [
-    "onStartupFinished",
-    "onView:grok.sessions",
-    "onWebviewPanel:grok.panel",
-    "onCommand:grok.panel.open",
-    "onCommand:grok.sidebar.open",
-    "onCommand:grok.checkForUpdates"
+    "onStartupFinished"
   ],
   "contributes": {
     "viewsContainers": {
       "secondarySidebar": [
         {
           "id": "grokSidebar",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         }
       ],
       "activitybar": [
         {
           "id": "grokPrimary",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         },
         {
           "id": "grokProjects",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         }
       ],
       "panel": [
         {
           "id": "grokPanel",
-          "title": "Grok30m",
+          "title": "AFK Pilot",
           "icon": "resources/grok-icon.svg"
         }
       ]
@@ -100,24 +95,14 @@
         {
           "type": "webview",
           "id": "grok.chat",
-          "name": "Chat",
-          "when": "config.grok.preferredLocation == 'sidebar' || !config.grok.sessionsSidebar"
+          "name": "AFK Pilot"
         }
       ],
       "grokProjects": [
         {
           "type": "webview",
           "id": "grok.projects",
-          "name": "Projects",
-          "when": "!config.grok.sessionsSidebar"
-        }
-      ],
-      "grokPrimary": [
-        {
-          "type": "webview",
-          "id": "grok.sessions",
-          "name": "Sessions",
-          "when": "config.grok.sessionsSidebar"
+          "name": "Projects"
         }
       ]
     },
@@ -250,18 +235,6 @@
         "command": "grok.composerPreviousLine",
         "title": "Composer — Move to Previous Line",
         "category": "AFK Pilot"
-      },
-      {
-        "command": "grok.panel.open",
-        "title": "Grok30m: Open in Editor Tab"
-      },
-      {
-        "command": "grok.sidebar.open",
-        "title": "Grok30m: Open in Sidebar"
-      },
-      {
-        "command": "grok.checkForUpdates",
-        "title": "Grok30m: Check for Updates"
       }
     ],
     "keybindings": [
@@ -337,7 +310,7 @@
       ]
     },
     "configuration": {
-      "title": "Grok30m",
+      "title": "AFK Pilot",
       "properties": {
         "grok.homeDirectory": {
           "type": "string",
@@ -505,7 +478,7 @@
         "grok.steerByDefault": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Send straight into the running turn instead of queueing it. Off (default): a message you send while the agent is working waits, and is sent as one prompt when the turn ends — you can still steer it on demand with the **Steer** button on the pending message. On: sending while it works **skips the queue** and injects the message into the turn immediately, so the agent changes course mid-answer. Steering never cancels the turn and never discards in-flight tool work — it is not a Stop. It carries your text and the files you attached to that message, but not the ambient editor selection. **Grok** and **OpenAI Codex** take a mid-turn correction; **Claude Code** does not, and there a message always falls back to the queue. Images are the one thing that can still be refused: an older Grok Build CLI ignores them, so a message carrying pictures is queued whole rather than arriving without them. Also toggleable live from Settings → **General → Steer by default**."
+          "markdownDescription": "Send straight into the running turn instead of queueing it. Off (default): a message you send while the agent is working waits, and is sent as one prompt when the turn ends — you can still steer it on demand with the **Steer** button on the pending message. On: sending while it works **skips the queue** and injects the message into the turn immediately, so the agent changes course mid-answer. Steering never cancels the turn and never discards in-flight tool work — it is not a Stop. It carries your text and the files you attached to that message, but not the ambient editor selection. **Grok**, **OpenAI Codex** and **Claude Code** take a mid-turn correction; **Muse Code** does not, and there a message always falls back to the queue. Images are the one thing that can still be refused: an older Grok Build CLI ignores them, so a message carrying pictures is queued whole rather than arriving without them. Also toggleable live from Settings → **General → Steer by default**."
         },
         "grok.pinLiveWorkflows": {
           "type": "boolean",
@@ -516,6 +489,12 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show a **Previous prompt** button above the message box: it jumps back to the prompt before the one you are reading and highlights it, so you can find what you asked without scrolling. On a phone or browser this is a per-device preference and this setting does not apply."
+        },
+        "grok.deskAlerts": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Show alerts when a turn finishes, fails, or needs your input while you’re away from the conversation."
         },
         "grok.soundNotifications": {
           "type": "boolean",
@@ -632,34 +611,6 @@
           "type": "string",
           "default": "",
           "description": "Optional DeepSeek installation directory (node/ and runtime/). Overrides the managed pinned install; PATH is not searched. Restart DeepSeek conversations after changing."
-        },
-        "grok.autoUpdate": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Keep Grok30m current from the public GitHub Releases feed ([thirtym/grok30m](https://github.com/thirtym/grok30m/releases/latest)). Checks on this computer *and* on SSH remotes (each host has its own install). Turn off to only update when you run **Grok30m: Check for Updates**."
-        },
-        "grok.preferredLocation": {
-          "type": "string",
-          "enum": [
-            "panel",
-            "sidebar"
-          ],
-          "enumDescriptions": [
-            "Editor tab — chat stays open while you edit files (Claude Code style)",
-            "Sidebar — original Grok layout with chat in the side panel"
-          ],
-          "default": "panel",
-          "description": "Where Grok chat opens by default."
-        },
-        "grok.sessionsSidebar": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show session history in a dedicated Sessions sidebar view instead of the in-chat history dropdown."
-        },
-        "grok.hideAutoSessions": {
-          "type": "boolean",
-          "default": true,
-          "description": "Hide automated sessions tagged [Auto:review], [Auto:deploy], or [Auto:robot] from session history. Toggle live in the Sessions sidebar."
         }
       }
     }
@@ -751,8 +702,5 @@
     "electron-updater": {
       "builder-util-runtime": "9.7.0"
     }
-  },
-  "extensionKind": [
-    "workspace"
-  ]
+  }
 }

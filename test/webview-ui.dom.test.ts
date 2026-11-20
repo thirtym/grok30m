@@ -894,8 +894,8 @@ describe("mode picker (the plan-gate entry path)", () => {
       .map((label) => label.textContent);
     expect(labels).toEqual(["Agent mode", "Auto accept"]);
     expect([...$(doc, "mode-popover").querySelectorAll(".mode-item-desc")].map((label) => label.textContent)).toEqual([
-      "Codex acts directly, asking approval only for changes it judges sensitive",
-      "Codex automatically approves all permission requests (Full access)",
+      "Codex reviews requests to act outside the sandbox and asks you about potentially unsafe actions",
+      "Codex has full access to files and the internet and runs without asking",
     ]);
   });
 
@@ -2796,6 +2796,24 @@ describe("VS Code session overflow + gear worktree gating", () => {
     expect(has(doc, "Continue in a new chat")).toBe(false);
     expect(has(doc, "Apply worktree")).toBe(true);
     expect(has(doc, "Remove worktree")).toBe(true);
+  });
+
+  it.each(["claude", "codex"])("requires the host's fork advertisement for Continue in a new chat on %s", (provider) => {
+    const { window, doc, posted } = bootWebview({ vscode: true });
+    dispatch(window, { type: "session", sessionId: "s1", provider, models: [], currentModelId: "m" });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Session one", cwd: "/work/repo" });
+    const labels = openOverflow(window, doc);
+    expect(labels.some((text) => text.includes("Continue in a new chat"))).toBe(false);
+    expect(labels.some((text) => text.includes("Export conversation as Markdown"))).toBe(true);
+    expect(posted.some((message) => message.type === "forkSession")).toBe(false);
+  });
+
+  it("follows the agent of the conversation when the menu opens", () => {
+    const { window, doc } = bootWebview({ vscode: true });
+    dispatch(window, { type: "session", sessionId: "s1", provider: "claude", models: [], currentModelId: "m" });
+    dispatch(window, { type: "sessionName", sessionId: "s1", name: "Session one", cwd: "/work/repo" });
+    dispatch(window, { type: "session", sessionId: "s1", provider: "grok", models: [], currentModelId: "grok-build" });
+    expect(openOverflow(window, doc).some((text) => text.includes("Continue in a new chat"))).toBe(true);
   });
 
   it("never shows gear Rewind — rewind is per-message only", () => {

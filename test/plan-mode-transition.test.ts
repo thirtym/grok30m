@@ -5,6 +5,8 @@ import { AcpClient } from "../src/acp";
 import type { AcpBackend } from "../src/acp-backend";
 import { ClaudeBackend } from "../src/claude-backend";
 import { CodexBackend } from "../src/codex-backend";
+import { CODEX_MODE_WAITS_FOR_PLAN } from "../src/mode-prefs";
+import { applyAgentModeToHostPlan } from "../src/plan-gate";
 import { GrokSidebar } from "../src/sidebar";
 import { Session } from "../src/session";
 
@@ -107,6 +109,9 @@ async function dispatchSetModeThenPermission(
 
   try {
     const pending = sidebar.setMode("plan", session);
+    // Codex mode changes are serialized behind the previous one, so its RPC is
+    // written a tick later than Grok's and Claude's.
+    await vi.waitFor(() => expect(written.length).toBeGreaterThan(0));
     const req = JSON.parse(written[0]);
     expect(["session/set_mode", "session/set_config_option"]).toContain(req.method);
 
@@ -270,7 +275,12 @@ function planningAdapterSession(
   opts: { backend: AcpBackend; provider: "codex" | "claude"; setMode?: () => Promise<void> },
 ): { client: AcpClient; written: string[]; session: Session } {
   const { client, written } = clientWithFakeProc({ backend: opts.backend });
-  client.setMode = opts.setMode ?? (async () => {});
+  // Codex reports the preset it switched to in its reply, and AcpClient reads
+  // it back (readCodexMode) and emits modeChanged. That readback is what turns
+  // Auto accept on, so the stub keeps it.
+  client.setMode = opts.setMode ?? (async (modeId: string) => {
+    if (opts.provider === "codex") (client as any).readCodexMode({}, modeId);
+  });
   const session = liveSession({
     autoApprove: false,
     planActive: true,
@@ -279,6 +289,17 @@ function planningAdapterSession(
   });
   client.planActive = true;
   return { client, written, session };
+}
+
+/** The host's modeChanged handler for an adapter without the client plan gate
+ *  (startSessionBody in sidebar.ts): the adapter's mode is the authority. */
+function followAdapterMode(sidebar: any, session: Session, client: AcpClient): void {
+  client.on("modeChanged", (id: string) => {
+    const next = applyAgentModeToHostPlan(id, client.usesClientPlanGate);
+    if (!next) return;
+    session.autoApprove = next.autoApprove;
+    sidebar.setPlanActive(session, next.planActive);
+  });
 }
 
 function showPermission(sidebar: any, session: Session, client: AcpClient, id: number, permission: object): void {
@@ -292,6 +313,7 @@ describe("Auto accept does not implement a pending plan review", () => {
       provider: "codex",
     });
     const sidebar = makeSidebar(session);
+    followAdapterMode(sidebar, session, client);
     showPermission(sidebar, session, client, 99, CODEX_PLAN_REVIEW);
 
     await sidebar.setMode("yolo", session);
@@ -321,6 +343,34 @@ describe("Auto accept does not implement a pending plan review", () => {
     await sidebar.onMessage({ type: "permissionAnswer", requestId: 77, optionId: "acceptEdits" }, "local");
     expect(permissionReply(written, 77)?.result?.outcome?.optionId).toBe("acceptEdits");
   });
+
+  it.each(["askApproval", "agent"] as const)(
+    "keeps the mode while a Codex plan review waits when %s is picked, and says why",
+    async (modeId) => {
+      // The adapter implements an approved plan with the access its planning
+      // turn started with, so a stricter mode now would not reach the work.
+      const setMode = vi.fn(async () => {});
+      const { client, written, session } = planningAdapterSession({
+        backend: new CodexBackend(),
+        provider: "codex",
+        setMode,
+      });
+      const sidebar = makeSidebar(session);
+      showPermission(sidebar, session, client, 99, CODEX_PLAN_REVIEW);
+
+      await sidebar.setMode(modeId, session);
+
+      expect(setMode).not.toHaveBeenCalled();
+      expect(sidebar.host.showWarningMessage).toHaveBeenCalledWith(CODEX_MODE_WAITS_FOR_PLAN);
+      expect(session.pendingPermissions.has(99)).toBe(true);
+      expect(permissionReply(written, 99)).toBeUndefined();
+
+      // Once the plan is answered, the switch goes through.
+      await sidebar.onMessage({ type: "permissionAnswer", requestId: 99, optionId: "revise_plan" }, "local");
+      await sidebar.setMode(modeId, session);
+      expect(setMode).toHaveBeenCalledWith(modeId);
+    },
+  );
 
   it("does not approve a pending Codex plan review when the mode-change RPC then fails", async () => {
     const { client, written, session } = planningAdapterSession({
@@ -366,6 +416,7 @@ describe("Auto accept does not implement a pending plan review", () => {
       provider: "codex",
     });
     const sidebar = makeSidebar(session);
+    followAdapterMode(sidebar, session, client);
     showPermission(sidebar, session, client, 42, EDIT_PERMISSION);
 
     await sidebar.setMode("yolo", session);
@@ -380,6 +431,7 @@ describe("Auto accept does not implement a pending plan review", () => {
       provider: "codex",
     });
     const sidebar = makeSidebar(session);
+    followAdapterMode(sidebar, session, client);
     showPermission(sidebar, session, client, 42, EDIT_PERMISSION);
     showPermission(sidebar, session, client, 99, CODEX_PLAN_REVIEW);
 

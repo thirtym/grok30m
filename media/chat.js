@@ -526,6 +526,8 @@
   const addBtn = $("add-btn");
   const chipsEl = $("chips");
   const attachmentsEl = $("attachments");
+  const pendingTextPastes = new Map();
+  let recalledPrompt = null;
   const donutEl = $("donut");
   const donutArc = $("donut-arc");
   const donutLabel = $("donut-label");
@@ -1201,12 +1203,13 @@
     agent: { icon: ICON.bot, label: "Agent mode" },
     // A provider's own Auto mode; only a host that advertises it offers it.
     auto: { icon: ICON.shield, label: "Auto mode" },
+    askApproval: { icon: ICON.shieldQuestion, label: "Ask for approval" },
     plan: { icon: ICON.listTree, label: "Plan mode" },
     yolo: { icon: ICON.zap, label: "Auto accept" },
   };
   // Each provider's own name for what Auto accept runs it in. Antigravity's
   // is not named here: the host answers its requests itself.
-  const AUTO_ACCEPT_NATIVE_NAMES = { grok: "YOLO", claude: "Bypass permissions", codex: "Full access" };
+  const AUTO_ACCEPT_NATIVE_NAMES = { grok: "YOLO", claude: "Bypass permissions" };
   const MUSE_MODE_META = {
     yolo: { icon: ICON.zap, label: "Allow all", description: "No prompts; everything runs." },
     agent: { icon: ICON.shieldQuestion, label: "Prompt unmatched", description: "Prompt for anything no rule matches (the interactive default)." },
@@ -1491,7 +1494,7 @@
     if (state.activeProvider === "deepseek" && !deepseekAdvertised) return [];
     if (Array.isArray(state.offeredModes)) return state.offeredModes;
     if (state.activeProvider === "muse" || state.activeProvider === "deepseek") return [];
-    return Object.keys(MODE_META).filter((id) => id !== "auto" && (id !== "plan" || state.activeProvider !== "codex"));
+    return state.activeProvider === "codex" ? ["agent", "yolo"] : ["agent", "plan", "yolo"];
   }
 
   function offersMuseModes() {
@@ -1518,6 +1521,12 @@
       if (id === "yolo") return `Answers every approval ${name} raises. This may look the same as Agent, because ${name} asks rarely by default`;
     }
     if (id === "auto") return `${name} decides which actions are safe to run and asks you about the rest`;
+    if (state.activeProvider === "codex") {
+      if (id === "agent") return "Codex reviews requests to act outside the sandbox and asks you about potentially unsafe actions";
+      if (id === "askApproval") return "You decide every request to act outside the sandbox, such as editing external files or using the internet";
+      if (id === "plan") return "Codex explores and proposes a plan for you to review before implementation";
+      if (id === "yolo") return "Codex has full access to files and the internet and runs without asking";
+    }
     if (id === "plan") return `${name} explores and proposes a plan; file writes and commands are blocked until you approve it`;
     // "YOLO" is Grok Build's own word for it; elsewhere the provider's name
     // for the mode this runs in, or none.
@@ -2077,8 +2086,55 @@
     return { url, trailing };
   }
 
-  function renderMarkdown(raw) {
-    // Normalise line endings FIRST. Everything below splits on a newline and
+  function renderCodeBlock(lang, code, syntax) {
+    const isDiff = lang === "diff";
+    // A diff's alignment IS its content, so it never wraps and gets no toggle.
+    const wraps = !isDiff && PROSE_FENCES.has(lang || "");
+    const inner = isDiff ? renderDiffCode(code)
+      : syntax ? `<code class="reply-code">${syntax.html}</code>`
+      : `<code>${escapeHtml(code.trimEnd())}</code>`;
+    return `<div class="code-block${isDiff ? " diff" : ""}${wraps ? " wrap" : ""}${syntax ? " has-language" : ""}">` +
+      (syntax ? `<div class="code-language">${escapeHtml(syntax.label)}</div>` : "") +
+      (isDiff ? "" :
+        `<button class="code-wrap-btn" type="button" title="Toggle word wrap" aria-label="Toggle word wrap" aria-pressed="${wraps}">` +
+          `<span class="code-wrap-glyph">${ICON.cornerDownRight}</span>` +
+        `</button>`) +
+      `<button class="code-copy-btn" type="button" title="Copy code" aria-label="Copy code">` +
+        `<span class="code-copy-glyph">${ICON.copy}</span>` +
+      `</button>` +
+      `<pre>${inner}</pre>` +
+    `</div>`;
+  }
+
+  function renderReplyMarkdown(el, raw) {
+    const previous = el._replyCodeBlocks || [];
+    const blocks = [];
+    const api = globalThis.GrokSyntaxHighlight;
+    el.innerHTML = renderMarkdown(raw, (lang, code, source) => {
+      // The parser only emits closed fences. Reuse their DOM across stream
+      // repaints so even a long block is tokenized and parsed just once.
+      let block = previous[blocks.length];
+      if (block?.lang !== lang || block?.source !== source) {
+        const id = api?.languageForId(lang) || (lang && api?.languageForPath("code." + lang));
+        const label = id === "ts" ? "TypeScript" : id === "js" ? "JavaScript" : lang;
+        const syntax = id ? { label, html: api.highlightCode(code.trimEnd(), id) } : undefined;
+        const template = document.createElement("template");
+        template.innerHTML = renderCodeBlock(lang, code, syntax);
+        const element = template.content.firstElementChild;
+        element._codeSource = source;
+        block = { lang, source, element };
+      }
+      const index = blocks.push(block) - 1;
+      return `<div data-reply-code-slot="${index}"></div>`;
+    });
+    for (const slot of el.querySelectorAll("[data-reply-code-slot]")) {
+      slot.replaceWith(blocks[Number(slot.dataset.replyCodeSlot)].element);
+    }
+    el._replyCodeBlocks = blocks;
+  }
+
+  function renderMarkdown(raw, replyCode) {
+    // Normalise line endings before parsing the prose. It splits on a newline and
     // then tests each line with $-anchored patterns -- and a carriage return
     // is a line terminator in JS regex, so `.` cannot match one. On a CRLF
     // file every $-anchored rule therefore failed at the final character:
@@ -2089,14 +2145,15 @@
     //
     // Surfaced in the desktop file panel because it renders whole files off
     // disk and most files on Windows are CRLF -- but it was never panel-only.
-    raw = String(raw == null ? "" : raw).replace(/\r\n?/g, "\n");
+    raw = String(raw == null ? "" : raw);
     const codeBlocks = [];
     // Fence is 3+ backticks; the closing fence must be the SAME length (\1
     // backreference). This lets an outer block fenced by 4/5 backticks wrap an
     // inner ``` block — the shorter inner fences can't close the longer outer one
     // (CommonMark nested code blocks, issue #20). A plain ``` block is the N=3 case.
-    let s = raw.replace(/(`{3,})(\w*)\n?([\s\S]*?)\1`*/g, (_, _fence, lang, code) => {
+    let s = raw.replace(/(`{3,})([\w+#-]*)(?:\r\n?|\n)?([\s\S]*?)\1`*/g, (_, _fence, lang, source) => {
       const i = codeBlocks.length;
+      const code = source.replace(/\r\n?/g, "\n");
       // Mermaid: keep the source as a normal-looking code block (so it shows as
       // readable text if mermaid never loads or the diagram is malformed), but
       // tag it so the post-render pass can swap in the rendered SVG. The closing
@@ -2125,26 +2182,11 @@
         codeBlocks.push(renderMath(tex, true));
         return `\x00B${i}\x00`;
       }
-      const isDiff = lang === "diff";
-      // A diff's alignment IS its content, so it never wraps and gets no toggle.
-      const wraps = !isDiff && PROSE_FENCES.has(lang || "");
-      const inner = isDiff
-        ? renderDiffCode(code)
-        : `<code>${escapeHtml(code).trimEnd()}</code>`;
-      codeBlocks.push(
-        `<div class="code-block${isDiff ? " diff" : ""}${wraps ? " wrap" : ""}">` +
-          (isDiff ? "" :
-            `<button class="code-wrap-btn" type="button" title="Toggle word wrap" aria-label="Toggle word wrap" aria-pressed="${wraps}">` +
-              `<span class="code-wrap-glyph">${ICON.cornerDownRight}</span>` +
-            `</button>`) +
-          `<button class="code-copy-btn" type="button" title="Copy code" aria-label="Copy code">` +
-            `<span class="code-copy-glyph">${ICON.copy}</span>` +
-          `</button>` +
-          `<pre>${inner}</pre>` +
-        `</div>`
-      );
+      codeBlocks.push(replyCode && lang !== "diff"
+        ? replyCode(lang, code, source)
+        : renderCodeBlock(lang, code));
       return `\x00B${i}\x00`;
-    });
+    }).replace(/\r\n?/g, "\n");
 
     // Pull LaTeX out before any HTML-escaping or inline-markdown — math is full
     // of \ { } & < > * _ that the inline() pass would mangle. Display math gets a
@@ -3660,6 +3702,7 @@
       steerByDefault: !!state.steerByDefault,
       fontScale: CLIENT_OWNS_FONT_SCALE ? state.remoteFontScale : state.hostFontScale,
       soundNotifications: !!state.soundNotifications,
+      deskAlerts: state.deskAlerts,
       processingSound: !!state.processingSound,
       inputNeededSound: !!state.inputNeededSound,
       readRepliesAloud: IS_REMOTE ? !!state.remoteTts : !!state.readRepliesAloud,
@@ -3765,6 +3808,9 @@
       case "soundNotifications":
         state.soundNotifications = !!value;
         unlockAudio();
+        break;
+      case "deskAlerts":
+        state.deskAlerts = !!value;
         break;
       case "inputNeededSound":
         state.inputNeededSound = !!value;
@@ -4291,11 +4337,14 @@
       provider.id === id && provider.connected && provider.needsLogin === true);
   }
 
-  /**
-   * Destinations under "Continue in a new chat".
-   * Knowledge work / unsupported worktrees / already-in-worktree → workspace only.
-   */
+  function turnForkAvailable() {
+    return !!state.activeSessionId && state.turnForkSessionId === state.activeSessionId;
+  }
+
+  /** Destinations under "Continue in a new chat". */
   function continueChatDestinations() {
+    const legacyFork = globalThis.GrokWebviewHelpers.providerSupports(state.activeProvider, "fork");
+    if (!legacyFork && !turnForkAvailable()) return [];
     const dests = [
       {
         id: "workspace",
@@ -4307,7 +4356,7 @@
     // rather than the session that asked, so a remote tab working in another
     // repo would get a checkout somewhere it never chose. Offering the option
     // here would promise a placement the host does not honour.
-    if (isCodingPurpose() && state.worktreeSupported && !state.isWorktree && !IS_REMOTE) {
+    if (legacyFork && isCodingPurpose() && state.worktreeSupported && !state.isWorktree && !IS_REMOTE) {
       dests.push({
         id: "worktree",
         label: "Use a new worktree",
@@ -4317,11 +4366,16 @@
     return dests;
   }
 
-  /** One destination → go straight there; several → destination picker. */
+  /** One destination → go straight there; several → destination picker;
+   *  none → nothing, never a fork the agent cannot do. */
   function beginContinueInNewChat(sessionId) {
     const dests = continueChatDestinations();
-    if (dests.length <= 1) {
-      runContinueDestination(dests[0] ? dests[0].id : "workspace", sessionId);
+    if (!dests.length) {
+      closePopovers();
+      return;
+    }
+    if (dests.length === 1) {
+      runContinueDestination(dests[0].id, sessionId);
       return;
     }
     renderContinueDestinationPicker(dests, sessionId);
@@ -7464,6 +7518,7 @@
 
   function switchComposerDraft(sessionId, completingLoad = false) {
     if (composerSessionId === sessionId) return;
+    recalledPrompt = null;
     // Keystrokes during a load belong to the conversation being opened, even
     // when its identity arrives after the transcript. They are kept, merged after
     // any saved draft, and never replaced. Only a load that began on an empty
@@ -8970,14 +9025,16 @@
     if (!menuSlot) return;
     menuSlot.innerHTML = "";
     if (!state.activeSessionId) return;
+    // Built when the menu opens, so it follows the agent of the conversation
+    // on screen rather than the one at the last repaint.
     menuSlot.appendChild(railMenuButton(
       "Session actions",
-      [
-        {
+      () => [
+        ...(continueChatDestinations().length ? [{
           label: "Continue in a new chat",
           icon: ICON.gitFork,
           onSelect: () => beginContinueInNewChat(state.activeSessionId),
-        },
+        }] : []),
         {
           label: "Export conversation as Markdown",
           icon: ICON.download,
@@ -9720,7 +9777,7 @@
       const waiting = pending
         ? { disabled: true, title: "Available once the conversation has finished opening" }
         : null;
-      items.push({
+      if (continueChatDestinations().length) items.push({
         label: "Continue in a new chat",
         icon: ICON.gitFork,
         ...waiting,
@@ -10739,6 +10796,7 @@
 
   const REPLAY_HOLD_TYPES = new Set([
     "userMessage", "agentStart", "turnDiffBaseline", "thoughtChunk", "messageChunk", "media",
+    "forkPointsCleared",
     "userMessageChunk", "historyBatch", "toolCall", "toolCallUpdate",
     "permissionRequest", "permissionOptions", "permissionResolved",
     "exitPlanRequest", "planResolved", "questionRequest", "questionResolved", "planNotice",
@@ -10757,6 +10815,12 @@
 
   function applyHistoryWindow(held) {
     const split = splitHistoryWindow(held, historyWindowTurns());
+    if (split.suffix.some((m) => m.type === "forkPointsCleared")) {
+      split.prefix = stripForkActions(split.prefix);
+    } else {
+      const reset = split.prefix.findLastIndex((m) => m.type === "forkPointsCleared");
+      if (reset >= 0) split.prefix = stripForkActions(split.prefix, reset);
+    }
     state.historyPrefix = split.prefix;
     state.historyPrefixUserCount = split.prefixUserCount;
     if (split.prefixUserCount > 0) {
@@ -10898,6 +10962,7 @@
     state.planHistoryQueue = plans.inChunk;
     state.permissionHistoryQueue = perms.inChunk;
     for (const m of chunk) handleHostMessage(m);
+    if (state.turnAgentActionsEl?.querySelector(".msg-fork-btn")) revealTurnFooter();
     flushPlanHistory();
     flushPermissionHistory();
     if (!state.historyPrefix.length) {
@@ -10980,6 +11045,8 @@
 
   function resetForNewSession() {
     beginComposerLoad();
+    goalSessionId = undefined;
+    renderSessionGoal(null);
     state.startupStatus = null;
     renderStartupStatus();
     clearSessionSuperseded();
@@ -11063,6 +11130,8 @@
     state.turnRating = 0;
     state.steerSupported = false;
     state.steeringProvider = null;
+    state.turnForkSessionId = null;
+    document.body.classList.remove("turn-fork-supported");
     state.interjectionCount = 0;
     state.historyEventCount = 0;
     state.lastTurnUsage = null;
@@ -12180,6 +12249,7 @@
       const actions = document.createElement("div");
       actions.className = "msg-actions";
       actions.appendChild(makeMessageCopyButton());
+      if (role === "user" && opts?.forkBefore && !opts.steer) addForkAction(actions, opts.forkBefore, true);
       // Rewind sits next to Copy on user bubbles only (P2-9). Latest message
       // has nothing after it to discard — hidden via refreshUserRewindButtons.
       //
@@ -12253,6 +12323,26 @@
       });
     }
     return body;
+  }
+
+  function addForkAction(actions, messageId, edit = false) {
+    if (!actions || typeof messageId !== "string" || !messageId) return;
+    let btn = actions.querySelector(".msg-fork-btn");
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "msg-action-btn msg-fork-btn";
+      btn.title = edit ? "Edit in a new chat" : "Go back to here in a new chat";
+      btn.setAttribute("aria-label", btn.title);
+      btn.innerHTML = `<span class="msg-action-glyph">${edit ? ICON.pencil : ICON.gitBranch}</span>`;
+      actions.insertBefore(btn, actions.querySelector(".msg-timestamp"));
+    }
+    btn.dataset.messageId = messageId;
+  }
+
+  function stripForkActions(frames, before = frames.length) {
+    return frames.map((m, i) => i < before && (m.forkBefore || m.forkPoint)
+      ? { ...m, forkBefore: undefined, forkPoint: undefined } : m);
   }
 
   /**
@@ -15031,7 +15121,7 @@ ${fullText}`
     el._copyText = text;
     el.replaceChildren();
     const body = workflowText(el, bodyClass, "");
-    body.innerHTML = renderMarkdown(text);
+    renderReplyMarkdown(body, text);
     applyAutoDir(body);
     renderMermaidIn(body);
     workflowText(el, "msg-actions", "").appendChild(makeMessageCopyButton());
@@ -15206,7 +15296,7 @@ ${fullText}`
     el._childRenderScheduled = false;
     el._childRenderGen = (el._childRenderGen || 0) + 1;
     if (el._childProseEl) {
-      el._childProseEl.innerHTML = renderMarkdown(el._childProse || "");
+      renderReplyMarkdown(el._childProseEl, el._childProse || "");
       applyAutoDir(el._childProseEl);
     }
     if (el._childThoughtEl) el._childThoughtEl.textContent = el._childThought || "";
@@ -16568,7 +16658,7 @@ ${fullText}`
   function flushAgent() {
     state.agentRenderScheduled = false;
     if (!state.activeAgentEl) return;
-    state.activeAgentEl.innerHTML = renderMarkdown(state.activeAgentRaw);
+    renderReplyMarkdown(state.activeAgentEl, state.activeAgentRaw);
     applyAutoDir(state.activeAgentEl);
     renderMermaidIn(state.activeAgentEl);
     const wrapper = state.activeAgentEl.parentElement;
@@ -16799,12 +16889,13 @@ ${fullText}`
 
   // Replayed user prompts (session/load) arrive as user_message_chunk updates.
   // Commit any in-flight agent turn first, then accumulate into one user bubble.
-  function appendUserChunk(text, timestampMs, images) {
+  function appendUserChunk(text, timestampMs, images, startsMessage, forkBefore) {
     // Replay-only: live user bubbles come from the optimistic `userMessage`
     // post. grok ≥0.2.33 echoes the live prompt back as a user_message_chunk;
     // the host already drops those, but guard here too so a stray live echo
     // can never double the bubble.
     if (!state.replaying) return;
+    if (startsMessage) state.activeUserEl = null;
     if (state.activeAgentEl || state.activeThoughtEl || state.activeToolGroupEl) {
       commitAgentTurn();
     }
@@ -16853,7 +16944,7 @@ ${fullText}`
       pinTurnDiffSummary();
       startTurnDiffTracking();
       state.userMsgCount += 1;
-      state.activeUserEl = addMessage("user", "", undefined, { timestampMs });
+      state.activeUserEl = addMessage("user", "", undefined, { timestampMs, forkBefore });
       state.activeUserRaw = "";
     }
     if (state.skipUserBubble) return; // marker-only verdict: no user bubble
@@ -16868,6 +16959,7 @@ ${fullText}`
         state.userMsgCount = Math.max(0, state.userMsgCount - 1);
         state.interjectionCount += 1;
         steerEl.dataset.steer = "1";
+        steerEl.querySelector(".msg-fork-btn")?.remove();
         refreshUserRewindButtons();
       }
     }
@@ -18817,6 +18909,29 @@ ${fullText}`
 
   // ---------- send ----------
 
+  let goalSessionId;
+  const goalStatuses = new Map([
+    ["active", "Active"], ["paused", "Paused"], ["blocked", "Blocked"],
+    ["complete", "Complete"], ["limited", "Limited"],
+  ]);
+  function renderSessionGoal(goal) {
+    let strip = $("session-goal");
+    if (!goal) {
+      strip?.remove();
+      return;
+    }
+    if (!strip) {
+      strip = document.createElement("div");
+      strip.id = "session-goal";
+      strip.className = "session-goal";
+      strip.setAttribute("role", "status");
+      strip.innerHTML = '<span class="session-goal-label">Goal</span><span class="session-goal-objective" dir="auto"></span><span class="session-goal-status"></span>';
+      document.querySelector(".composer-card").prepend(strip);
+    }
+    strip.querySelector(".session-goal-objective").textContent = goal.objective;
+    strip.querySelector(".session-goal-status").textContent = goalStatuses.get(goal.status) || "Unknown status";
+  }
+
   let startupTimer = null;
   function renderStartupStatus() {
     if (startupTimer !== null) clearTimeout(startupTimer);
@@ -18902,6 +19017,11 @@ ${fullText}`
       sendBtn.innerHTML = ICON.spinner;
       const name = { grok: "Grok", codex: "Codex", claude: "Claude", muse: "Muse", agy: "Antigravity", deepseek: "DeepSeek" }[state.startupStatus.provider] || "Grok";
       sendBtn.title = name + (state.startupStatus.stage === "updating" ? " is updating" : " is still starting");
+      sendBtn.classList.add("initializing");
+      sendBtn.disabled = true;
+    } else if (pendingTextPastes.size) {
+      sendBtn.innerHTML = ICON.spinner;
+      sendBtn.title = "Attaching pasted text…";
       sendBtn.classList.add("initializing");
       sendBtn.disabled = true;
     } else if (!state.busy) {
@@ -19679,6 +19799,7 @@ ${fullText}`
   }
 
   function renderInputHighlight() {
+    if (recalledPrompt && input.value !== recalledPrompt.value) recalledPrompt = null;
     // The busy button's face reads the composer too (text = queue-send arrow,
     // empty = Stop) — refresh it on every input change; this function's call
     // sites are exactly those.
@@ -20059,36 +20180,12 @@ ${fullText}`
    * searchable, so "find the command I ran" and "find that file path" still
    * work — it is only the payload bodies that drop out.
    */
-  const FIND_SKIP_SEL = ".tool-item-details, .tool-diff-region";
+  const FIND_SKIP_SEL = ".tool-item-details, .tool-diff-region, .code-language";
 
   function findCollectNodes() {
     const nodes = [];
     const root = messagesEl;
     if (!root) return nodes;
-    const SHOW_TEXT = (typeof NodeFilter !== "undefined" && NodeFilter.SHOW_TEXT) || 4;
-    const REJECT = (typeof NodeFilter !== "undefined" && NodeFilter.FILTER_REJECT) || 2;
-    const ACCEPT = (typeof NodeFilter !== "undefined" && NodeFilter.FILTER_ACCEPT) || 1;
-    if (typeof document.createTreeWalker === "function") {
-      const walker = document.createTreeWalker(root, SHOW_TEXT, {
-        acceptNode(node) {
-          if (!node || !node.data) return REJECT;
-          const parent = node.parentElement;
-          if (!parent) return REJECT;
-          const tag = parent.tagName;
-          if (tag === "SCRIPT" || tag === "STYLE") return REJECT;
-          if (parent.closest("#welcome, .welcome")) return REJECT;
-          if (parent.closest("[" + PENDING_CLEAR_ATTR + "]")) return REJECT;
-          if (parent.closest(FIND_SKIP_SEL)) return REJECT;
-          return ACCEPT;
-        },
-      });
-      let n = walker.nextNode();
-      while (n) {
-        nodes.push(n);
-        n = walker.nextNode();
-      }
-      return nodes;
-    }
     const stack = [root];
     while (stack.length) {
       const el = stack.pop();
@@ -20103,6 +20200,10 @@ ${fullText}`
       if (el.id === "welcome" || el.classList.contains("welcome")) continue;
       if (el.getAttribute && el.getAttribute(PENDING_CLEAR_ATTR) === "1") continue;
       if (typeof el.matches === "function" && el.matches(FIND_SKIP_SEL)) continue;
+      if (el.matches("code.reply-code")) {
+        nodes.push(el);
+        continue;
+      }
       for (let i = el.childNodes.length - 1; i >= 0; i--) stack.push(el.childNodes[i]);
     }
     return nodes;
@@ -20130,8 +20231,10 @@ ${fullText}`
     }
   }
 
+  const findNodeText = (node) => node.data ?? node.textContent;
+
   function searchNodeLiteral(node, query, caseSensitive, into) {
-    const raw = node.data;
+    const raw = findNodeText(node);
     const text = caseSensitive ? raw : raw.toLowerCase();
     const q = caseSensitive ? query : query.toLowerCase();
     if (!q) return;
@@ -20146,7 +20249,7 @@ ${fullText}`
   }
 
   function searchNodeRegex(node, re, into) {
-    const text = node.data;
+    const text = findNodeText(node);
     re.lastIndex = 0;
     let m = re.exec(text);
     while (m) {
@@ -20174,13 +20277,38 @@ ${fullText}`
     return (find.caseSensitive ? "c" : "") + (find.regex ? "r" : "") + (find.includeHidden ? "h" : "");
   }
 
+  // A syntax-colored fence is one search target. Index its text leaves once
+  // so each match can start and end inside different token spans.
+  const findCodeOffsets = new WeakMap();
+  function findTextPoint(node, offset) {
+    if (node.nodeType === 3) return [node, Math.min(offset, node.length)];
+    let leaves = findCodeOffsets.get(node);
+    if (!leaves) {
+      leaves = [];
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+      let end = 0;
+      for (let leaf = walker.nextNode(); leaf; leaf = walker.nextNode()) {
+        end += leaf.length;
+        leaves.push({ leaf, end });
+      }
+      findCodeOffsets.set(node, leaves);
+    }
+    let low = 0, high = leaves.length - 1;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (offset > leaves[mid].end) low = mid + 1;
+      else high = mid;
+    }
+    const { leaf, end } = leaves[low];
+    return [leaf, leaf.length - Math.max(0, end - offset)];
+  }
+
   function rangeForFindMatch(m) {
     if (!m || !m.node || !m.node.parentNode) return null;
     try {
       const r = document.createRange();
-      const len = m.node.data ? m.node.data.length : 0;
-      r.setStart(m.node, Math.max(0, Math.min(m.start, len)));
-      r.setEnd(m.node, Math.max(0, Math.min(m.end, len)));
+      r.setStart(...findTextPoint(m.node, m.start));
+      r.setEnd(...findTextPoint(m.node, m.end));
       return r;
     } catch {
       return null;
@@ -20433,7 +20561,7 @@ ${fullText}`
       const q = find.caseSensitive ? query : query.toLowerCase();
       for (const m of find.matches) {
         if (!m.node || !m.node.parentNode) continue;
-        const slice = m.node.data.slice(m.start, m.start + q.length);
+        const slice = findNodeText(m.node).slice(m.start, m.start + q.length);
         const have = find.caseSensitive ? slice : slice.toLowerCase();
         if (have === q) next.push({ node: m.node, start: m.start, end: m.start + q.length });
       }
@@ -20805,7 +20933,7 @@ ${fullText}`
   const SETTINGS_LIVE_MSGS = new Set([
     "museSettings",
     "cloudHostUpdateState", "initialState", "showThinking", "appPurpose", "expandCommandOutputs",
-    "steerByDefault", "promptNav", "expandDiffCard", "steerUnavailable", "soundNotifications", "processingSound", "inputNeededSound",
+    "steerByDefault", "promptNav", "expandDiffCard", "steerUnavailable", "soundNotifications", "processingSound", "inputNeededSound", "deskAlerts",
     "readRepliesAloud", "summarizeRepliesAloud", "fontScale", "voiceConfigured",
     "providerState", "githubState", "mcpServers", "mcpConnectors", "remoteStatus", "telemetryEnabled", "thumbsFeedback", "grokUpdateStatus", "initialized",
   ]);
@@ -20878,6 +21006,7 @@ ${fullText}`
         if (typeof msg.soundNotifications === "boolean") state.soundNotifications = msg.soundNotifications;
         if (typeof msg.processingSound === "boolean") state.processingSound = msg.processingSound;
         if (!IS_REMOTE && typeof msg.inputNeededSound === "boolean") state.inputNeededSound = msg.inputNeededSound;
+        if (!IS_REMOTE) state.deskAlerts = msg.deskAlerts;
         releaseAudioIfSilent();
         // Absent appPurpose (older host) → Knowledge work — smaller surface.
         state.appPurpose = msg.appPurpose === "coding" ? "coding" : "knowledge";
@@ -21224,6 +21353,9 @@ ${fullText}`
         state.inputNeededSound = !!msg.value;
         releaseAudioIfSilent();
         break;
+      case "deskAlerts":
+        if (!IS_REMOTE) state.deskAlerts = msg.value;
+        break;
       case "readRepliesAloud": {
         const wasEnabled = state.readRepliesAloud;
         state.readRepliesAloud = !!msg.value;
@@ -21292,6 +21424,7 @@ ${fullText}`
         if (!CLIENT_OWNS_FONT_SCALE) applyChatZoom();
         break;
       case "focusInput":
+        if (!IS_REMOTE && msg.closeSettings) closeSettingsOverlay();
         // Send Selection / Send File / @-mention (#43): the host revealed the
         // panel taking focus; land the caret in the composer so the user can
         // type a prompt immediately. preventScroll: the composer lives in the
@@ -21544,6 +21677,8 @@ ${fullText}`
         projectPromptView = msg.sessionId || "";
         if (state.contextSelectionSessionId !== msg.sessionId) state.contextWindowSelection = undefined;
         state.contextSelectionSessionId = msg.sessionId;
+        if (goalSessionId !== msg.sessionId) renderSessionGoal(null);
+        goalSessionId = msg.sessionId;
 
         state.subscriptionWindows = [];
         state.currentModelId = msg.currentModelId;
@@ -21579,6 +21714,9 @@ ${fullText}`
         reportRemotePreferences();
         break;
       }
+      case "sessionGoal":
+        if (goalSessionId && msg.sessionId === goalSessionId) renderSessionGoal(msg.goal);
+        break;
       case "sessionName": {
         const prev = state.sessionName;
         const next = {
@@ -21599,6 +21737,8 @@ ${fullText}`
         // Host-confirmed identity only. Optimistic rail clicks never write here.
         confirmComposerSession(msg.sessionId);
         state.activeSessionId = msg.sessionId;
+        state.turnForkSessionId = msg.turnForkSupported === true ? msg.sessionId : null;
+        document.body.classList.toggle("turn-fork-supported", turnForkAvailable());
         // May complete a resume (id match) or bind a new-session resolved id.
         noteRailTransitionSessionName(msg);
         // AFTER the note: a surviving transition means this frame was about a
@@ -21775,6 +21915,9 @@ ${fullText}`
         renderChips();
         updateSendButton();
         break;
+      case "pasteTextSettled":
+        settleTextPaste(msg.pasteId);
+        break;
       case "commandsUpdate":
         state.commands = msg.commands || [];
         break;
@@ -21838,6 +21981,11 @@ ${fullText}`
           drainPlanHistory(state.userMsgCount);
           state.interjectionCount += 1;
         } else {
+          // A new prompt ends any reply still open. Live, the previous turn is
+          // already committed; on a re-focus rebuild a history-opened chat's
+          // replay ends inside the outer bracket, which commits nothing, so the
+          // live reply would join the last history reply.
+          if (state.activeAgentEl || state.activeThoughtEl || state.activeToolGroupEl) commitAgentTurn();
           drainPlanHistory(state.userMsgCount);
           drainPermissionHistory(state.userMsgCount);
           state.userMsgCount += 1;
@@ -21847,7 +21995,7 @@ ${fullText}`
           pinTurnDiffSummary();
           startTurnDiffTracking();
         }
-        addMessage("user", msg.text, msg.chips || [], { steer: msg.steer });
+        addMessage("user", msg.text, msg.chips || [], { steer: msg.steer, forkBefore: msg.forkBefore });
         forceScrollToBottom(); // jump back to the bottom on the user's own send (#16)
         break;
       case "turnDiffBaseline":
@@ -21888,12 +22036,22 @@ ${fullText}`
       case "messageChunk":
         advanceHistoryEvent();
         appendAgent(msg.text);
+        if (state.activeAgentEl && !state.suppressReplayTurn) {
+          const actions = state.turnAgentActionsEl;
+          const button = actions?.querySelector(".msg-fork-btn");
+          if (button && button.dataset.messageId !== msg.messageId) button.remove();
+          if (msg.forkPoint) addForkAction(actions, msg.forkPoint);
+        }
+        break;
+      case "forkPointsCleared":
+        for (const btn of liveTranscriptQueryAll(".msg-fork-btn")) btn.remove();
+        state.historyPrefix = stripForkActions(state.historyPrefix);
         break;
       case "media":
         addGeneratedMedia(msg);
         break;
       case "userMessageChunk":
-        appendUserChunk(msg.text, msg.timestampMs, msg.images);
+        appendUserChunk(msg.text, msg.timestampMs, msg.images, msg.startsMessage, msg.forkBefore);
         break;
       case "imageFull": {
         // Ignore an answer for a picture the overlay has moved on from, so a
@@ -22462,6 +22620,7 @@ ${fullText}`
         // A turn that ends with NO content (grok's [Plan cancelled] ack can be
         // empty) would otherwise orphan the dots forever — content-based
         // clearing never fires.
+        if (msg.forkPoint) addForkAction(state.turnAgentActionsEl, msg.forkPoint);
         revealTurnFooter();
         markLiveTurnFeedback();
         state.busy = false;
@@ -22471,6 +22630,8 @@ ${fullText}`
         speakCompletedTurn();
         break;
       case "exit":
+        state.turnForkSessionId = null;
+        document.body.classList.remove("turn-fork-supported");
         if (state.modelCatalogPending) setModelCatalogPending(false);
         stopProcessingCue();
         hideGrokking();
@@ -22658,6 +22819,7 @@ ${fullText}`
         addSessionContextBanner();
         break;
       case "clearMessages":
+        recalledPrompt = null;
         removeProjectPrompt();
         for (const el of document.querySelectorAll(".confirm-overlay[data-confirm-req-id]")) {
           el._resolveConfirm();
@@ -23937,7 +24099,7 @@ ${fullText}`
       const codeEl = copyBtn.parentElement && copyBtn.parentElement.querySelector("pre code");
       // innerText (not textContent) so diff blocks, whose lines are block-level
       // spans with no literal newlines, still copy as one line per row.
-      const text = codeEl ? codeEl.innerText : "";
+      const text = copyBtn.parentElement?._codeSource ?? (codeEl ? codeEl.innerText : "");
       navigator.clipboard.writeText(text).then(() => {
         const glyph = copyBtn.querySelector(".code-copy-glyph");
         const prevGlyph = glyph ? glyph.innerHTML : "";
@@ -24103,6 +24265,18 @@ ${fullText}`
       });
       return;
     }
+    const forkBtn = e.target.closest(".msg-fork-btn");
+    if (forkBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const bubble = forkBtn.closest(".msg");
+      if (!turnForkAvailable() || state.sessionSuperseded || state.replaying || isPendingClearNode(bubble)) return;
+      vscode.postMessage({
+        type: "forkAtReply", sessionId: state.activeSessionId, messageId: forkBtn.dataset.messageId,
+        ...(bubble?.classList.contains("user") ? { draft: bubble._copyText || "" } : {}),
+      });
+      return;
+    }
     const msgEditBtn = e.target.closest(".msg-edit-btn");
     if (msgEditBtn) {
       e.preventDefault();
@@ -24155,7 +24329,18 @@ ${fullText}`
       // dropped there, which is why the gear's repository link already opens
       // its own window. Same rule for a link in the transcript.
       if (IS_REMOTE) window.open(href, "_blank", "noopener");
-      else vscode.postMessage({ type: "openUrl", url: href });
+      else {
+        // VS Code's webview script also listens for this click, on the window,
+        // ignores preventDefault, and opens the link itself as coming from the
+        // workspace, which in a trusted workspace skips "Do you want Code to
+        // open the external website?". Our openUrl goes through
+        // env.openExternal, which asks for any untrusted domain, so the
+        // question appeared while the page had already opened (#231). Keep the
+        // click from reaching the window so ours, and its question, is the
+        // only opener. The desktop app has no such script.
+        e.stopPropagation();
+        vscode.postMessage({ type: "openUrl", url: href });
+      }
     } else if (/^[a-zA-Z]:[\\/]/.test(href) || href.startsWith("\\\\") || !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
       vscode.postMessage({ type: "openFile", path: href });
     }
@@ -24235,24 +24420,55 @@ ${fullText}`
     openRailMenu(a, items, "chat-copy-link", { x: e.clientX, y: e.clientY });
   });
 
+  function settleTextPaste(pasteId) {
+    if (!pendingTextPastes.has(pasteId)) return;
+    clearTimeout(pendingTextPastes.get(pasteId));
+    pendingTextPastes.delete(pasteId);
+    state.pendingPaste -= 1;
+    updateSendButton();
+  }
+
   input.addEventListener("paste", (e) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
+    const clipboard = e.clipboardData;
+    if (!clipboard) return;
+    const pastedText = clipboard.getData("text/plain");
+    const max = state.hostCaps?.pasteTextMaxBytes;
+    // 32 KiB leaves ordinary snippets editable and keeps large logs out of
+    // the textarea. Measure the same UTF-8 bytes the host stages.
+    let bytes = 0;
+    if (max && pastedText.length > 8192) {
+      bytes = pastedText.length > max ? pastedText.length : new TextEncoder().encode(pastedText).byteLength;
+    }
+    if (bytes > max) {
+      e.preventDefault();
+      addError("This paste is larger than 1 MiB. Paste it in smaller pieces.");
+      return;
+    }
+    const pasteId = bytes > 32 * 1024 ? newRemoteTabToken() : null;
     // Collect image FILES synchronously (getAsFile is sync) so the decision to
     // suppress the default paste is made before any async work. Raster types
     // only — the host re-checks, this is just the first gate.
     const blobs = [];
-    for (const item of items) {
+    for (const item of clipboard.items || []) {
       if (item.kind !== "file" || !/^image\/(png|jpeg|gif|webp)$/i.test(item.type)) continue;
       const blob = item.getAsFile();
       if (blob) blobs.push(blob);
     }
-    if (blobs.length === 0) return; // plain text (or unsupported) — default paste
+    if (!pasteId && blobs.length === 0) return;
     e.preventDefault();
+    if (pasteId) {
+      state.pendingPaste += 1;
+      pendingTextPastes.set(pasteId, setTimeout(() => {
+        settleTextPaste(pasteId);
+        addError("Could not attach pasted text. Try pasting it again.");
+      }, 15_000));
+      updateSendButton();
+      vscode.postMessage({ type: "pasteText", text: pastedText, pasteId });
+    }
     // A mixed clipboard (copy from a web page / Word) carries text alongside
     // the image; preventDefault killed the text half, so re-insert it manually.
-    const pastedText = e.clipboardData.getData("text/plain");
-    if (pastedText) {
+    if (!pasteId && pastedText) {
+      recalledPrompt = null;
       const start = input.selectionStart ?? input.value.length;
       const end = input.selectionEnd ?? start;
       input.setRangeText(pastedText, start, end, "end");
@@ -24260,7 +24476,7 @@ ${fullText}`
       updateMention();
       renderInputHighlight();
     }
-    if (state.activeProvider === "deepseek") {
+    if (blobs.length && state.activeProvider === "deepseek") {
       addError("DeepSeek does not accept image attachments on this ACP route.");
       return;
     }
@@ -24292,6 +24508,7 @@ ${fullText}`
   });
   input.addEventListener("pointerdown", () => { composerPreferredColumn = null; });
   input.addEventListener("input", () => {
+    recalledPrompt = null;
     if (composerLoadDraft) composerLoadDraft.edited = true;
     composerPreferredColumn = null;
     updateSlash();
@@ -24309,6 +24526,28 @@ ${fullText}`
   // composer is NOT proof the user has nothing in flight.
   input.addEventListener("compositionstart", () => { state.composingIME = true; });
   input.addEventListener("compositionend", () => { state.composingIME = false; });
+
+  function recallComposerPrompt(e) {
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return false;
+    if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || state.replaying || state.repoSwitchPending) return false;
+    if (recalledPrompt && input.value !== recalledPrompt.value) recalledPrompt = null;
+    if (input.value && !recalledPrompt) return false;
+    if (!recalledPrompt && e.key === "ArrowDown") return false;
+    const prompts = liveTranscriptQueryAll(".msg.user:not(.queued):not([data-optimistic])").filter((el) => el._copyText?.trim());
+    const current = recalledPrompt ? prompts.indexOf(recalledPrompt.el) : prompts.length;
+    if (current < 0 || !prompts.length) return false;
+    e.preventDefault();
+    const next = Math.max(0, current + (e.key === "ArrowUp" ? -1 : 1));
+    const el = prompts[next];
+    input.value = el?._copyText || "";
+    recalledPrompt = el ? { el, value: input.value } : null;
+    input.setSelectionRange(input.value.length, input.value.length);
+    slashPopover.hidden = true;
+    hideMention();
+    renderInputHighlight();
+    return true;
+  }
+
   input.addEventListener("keydown", (e) => {
     // IME composition (#38): while a CJK IME is composing (preedit underline /
     // candidate window open), Enter confirms the candidate and arrows navigate
@@ -24316,7 +24555,7 @@ ${fullText}`
     // fragment gets sent (or queued, #37). `isComposing` is the standard
     // signal; keyCode 229 is the legacy "IME processing" code some engines
     // still report on the confirming keydown itself.
-    if (e.isComposing || e.keyCode === 229) return;
+    if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || state.composingIME) return;
     if (!(e.ctrlKey && String(e.key).toLowerCase() === "p")) composerPreferredColumn = null;
     if (!slashPopover.hidden && state.slashFiltered.length) {
       if (e.key === "ArrowDown") {
@@ -24354,6 +24593,7 @@ ${fullText}`
       }
       if (e.key === "Escape") { hideMention(); return; }
     }
+    if (recallComposerPrompt(e)) return;
     const sendKey = state.useCtrlEnter
       ? e.key === "Enter" && (e.metaKey || e.ctrlKey)
       : !remoteUsesTouchComposer() && e.key === "Enter" && !e.shiftKey;

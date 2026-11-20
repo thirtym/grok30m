@@ -821,6 +821,17 @@
       visible: (s, env) => !!(env && env.ttsAvailable === false),
     },
     {
+      id: "deskAlerts",
+      category: "notifications",
+      title: "Desk alerts",
+      description: "Show alerts when a turn finishes, fails, or needs your input while you’re away from the conversation.",
+      kind: "toggle",
+      defaultValue: true,
+      get: (s) => s.deskAlerts,
+      visible: (s, env) => !env.isRemote && typeof s.deskAlerts === "boolean",
+      message: (value) => ({ type: "setDeskAlerts", value }),
+    },
+    {
       id: "soundNotifications",
       category: "notifications",
       title: "Sound notifications",
@@ -1795,6 +1806,9 @@
         break;
       case "soundNotifications":
         next.soundNotifications = !!value;
+        break;
+      case "deskAlerts":
+        next.deskAlerts = !!value;
         break;
       case "processingSound":
         next.processingSound = !!value;
@@ -4366,6 +4380,9 @@
       body.querySelectorAll(".settings-connector-oauth-link").forEach((link) => {
         link.addEventListener("click", (e) => {
           e.preventDefault();
+          // Keep VS Code's own webview link handler (on the window) from
+          // opening it a second time, as the key-docs link above does (#231).
+          e.stopPropagation();
           openExternalHref(link.href);
         });
       });

@@ -1,4 +1,5 @@
 import { isModeId } from "../mode-prefs";
+import { isPastedText, isPasteTextId } from "../chips";
 
 /**
  * Runtime schema validation for renderer → host messages.
@@ -189,6 +190,11 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "remoteSignOut":
     case "unlinkRemoteDevice":
       break;
+    case "forkAtReply":
+      if (!isString(raw.sessionId) || !raw.sessionId.trim()
+        || !isString(raw.messageId) || !raw.messageId.trim()
+        || !opt(raw.draft, isString)) return null;
+      break;
     case "runGrokLogin":
     case "logout":
     case "recheckConnection":
@@ -263,6 +269,7 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "setSoundNotifications":
     case "setProcessingSound":
     case "setInputNeededSound":
+    case "setDeskAlerts":
     case "setReadRepliesAloud":
     case "setSummarizeRepliesAloud":
     case "setExpandCommandOutputs":
@@ -462,6 +469,9 @@ export function parseWebviewMsg(raw: unknown): WebviewMsg | null {
     case "uploadFile":
       if (!isString(raw.name) || !isString(raw.data)) return null;
       break;
+    case "pasteText":
+      return isPastedText(raw.text) && isPasteTextId(raw.pasteId)
+        ? { type: "pasteText", text: raw.text, pasteId: raw.pasteId } : null;
     case "voiceStop":
       if (!opt(raw.discard, isBoolean)) return null;
       break;
