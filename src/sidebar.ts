@@ -270,6 +270,7 @@ import {
 } from "./chips";
 import { appendPastedTextContext, buildPastedTextContext, buildPromptWithImages, buildQueuedPromptWithImages, type PromptImageInput, type QueuedPromptContribution } from "./prompt-builder";
 import {
+  allQueuedChips,
   chipsForQueueSend,
   claimQueuedSendDispatch,
   cloneChipForQueue,
@@ -5838,6 +5839,8 @@ Only continue if you trust this code.`,
     }
   }
 
+  private pendingForkDrafts?: Set<string>;
+
   private async forkFocusedSession(
     session: Session = this.focused,
     requester?: RemoteRequester,
@@ -5879,6 +5882,8 @@ Only continue if you trust this code.`,
     const parentName = this.sessionDisplayName(session);
     const forkName = forkDisplayName(parentName);
     if (turnFork) session.forkInFlight = true;
+    let codexForkId: string | undefined;
+    let releasedSource = false;
     try {
       // Fork keeps the same cwd as the source, worktree-isolated ones included.
       const cwd = this.sessionCwd(session);
@@ -5896,6 +5901,12 @@ Only continue if you trust this code.`,
         return;
       }
       this.host.appendLine(`[fork] ${parentId} → ${r.newSessionId} ("${forkName}")`);
+      if (turnFork && provider === "codex") {
+        // The copy may restore its edit draft during open. Hold it until the
+        // source queue can be appended, so the composer receives both together.
+        codexForkId = r.newSessionId;
+        (this.pendingForkDrafts ??= new Set()).add(codexForkId);
+      }
       // Record the adapter's identity before the ordinary history-open route
       // resolves the provider and checkout for this new conversation ID.
       const worktree = session.worktree;
@@ -5929,10 +5940,12 @@ Only continue if you trust this code.`,
       if (requester) {
         const currentClientId = this.resolveRemoteRequester(requester);
         if (!currentClientId || (turnFork && this.remoteClients.active(currentClientId) !== session)) return;
+        releasedSource = codexForkId !== undefined;
         await this.releaseForkSource(session, client, parentId);
         await this.openRemoteSession(currentClientId, r.newSessionId, cwd);
       } else {
         if (turnFork && this.focused !== session) return;
+        releasedSource = codexForkId !== undefined;
         await this.releaseForkSource(session, client, parentId);
         await this.openSession(r.newSessionId, cwd);
       }
@@ -5953,6 +5966,25 @@ Only continue if you trust this code.`,
     } finally {
       if (turnFork) {
         session.forkInFlight = false;
+        if (codexForkId) {
+          try {
+            if (releasedSource && session.queuedSends.length) {
+              // The source can still receive sends while the copy opens.
+              // Take its queue now, without yielding after clearing the guard.
+              const items = session.queuedSends;
+              session.queuedSends = [];
+              session.queuedSendDispatch = undefined;
+              session.queuedSendCommit = undefined;
+              session.queuedSendRequiresRelay = false;
+              this.emitQueuedSends(session);
+              await this.rememberQueuedDraft(codexForkId, queuedSendsText(items), allQueuedChips(items), true);
+            }
+          } finally {
+            this.pendingForkDrafts?.delete(codexForkId);
+            const copy = this.liveSessionById(codexForkId);
+            if (copy) this.restorePersistedDraft(copy, requester ?? "local");
+          }
+        }
         if (session.queuedSends.length) void this.maybeFlushQueuedSends(session);
       }
     }
@@ -9587,6 +9619,7 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     const id = session.activeSessionId;
     if (!id) return;
     void this.updateSessionMeta((current) => {
+      if (this.pendingForkDrafts?.has(id)) return null;
       const hasComposer =
         (session === this.focused && this.view !== undefined) ||
         this.remoteClients.isActiveValueVisible(session);
@@ -12192,6 +12225,8 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
       if (gen !== session.gen) return;
       this.emit(session, { type: "modelChanged", modelId: id });
       if (session.provider === "deepseek") this.emit(session, sessionModeMessage(session, this.displayMode(session)));
+      // Antigravity's meter shows the quota of the model in use; another model may draw on the other one.
+      if (session.provider === "agy") this.publishSubscriptionUsage(session);
     });
     client.on("modeChanged", (id) => {
       if (gen !== session.gen) return;
@@ -19378,6 +19413,11 @@ ${many ? `${working.length} conversations are` : "A conversation is"} still work
     // turn ended while another was focused). Only the focused session may spawn
     // a client on demand; a background target without one has nothing to talk to.
     const session = target ?? this.focused;
+    // Claim a send on the fork source before any preflight await can outlast the fork.
+    if (session.forkInFlight && session.provider === "codex") {
+      if (!queuedSendCommit) this.divertRacingSend(session, text, bare, this.composerChipsForSend(session, requestedChips));
+      return;
+    }
     // A model or effort change committed when the picker closed has started
     // handling (message ordering), but its RPC or its restart can still be
     // mid-flight. Settle the in-flight set BEFORE anything reads this session's

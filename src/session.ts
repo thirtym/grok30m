@@ -1,5 +1,5 @@
 import { AcpClient } from "./acp";
-import type { HostEditorWebview } from "./host";
+import { agyWindowsForModel } from "./agy-usage";
 import type { HostMsg } from "./protocol";
 import type { FileChip } from "./chips";
 import { ForkPoints } from "./fork-points";
@@ -347,9 +347,6 @@ export class Session {
 
   /** grok's id for this session (set on session/new or session/load). */
   activeSessionId?: string;
-
-  /** Editor-tab host for this session when `grok.preferredLocation` is panel. */
-  panel?: HostEditorWebview;
 
   /**
    * Effective working directory for this session's `grok agent stdio` process.
@@ -716,7 +713,9 @@ export function sessionModeMessage(session: Session, modeId: string): Extract<Ho
 }
 
 export function subscriptionUsageMessage(session: Session): Extract<HostMsg, { type: "subscriptionUsage" }> & { hideWhenEmpty?: true } {
-  return { type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [],
+  const windows = session.subscriptionUsage?.snapshot() ?? [];
+  return { type: "subscriptionUsage",
+    windows: session.provider === "agy" ? agyWindowsForModel(windows, session.client?.currentModelId) : windows,
     ...(session.provider === "agy" ? { hideWhenEmpty: true } : {}) };
 }
 
