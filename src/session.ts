@@ -1,4 +1,5 @@
 import { AcpClient } from "./acp";
+import type { HostEditorWebview } from "./host";
 import { agyWindowsForModel } from "./agy-usage";
 import type { HostMsg } from "./protocol";
 import type { FileChip } from "./chips";
@@ -347,6 +348,9 @@ export class Session {
 
   /** grok's id for this session (set on session/new or session/load). */
   activeSessionId?: string;
+
+  /** Editor-tab host for this session when `grok.preferredLocation` is panel. */
+  panel?: HostEditorWebview;
 
   /**
    * Effective working directory for this session's `grok agent stdio` process.
