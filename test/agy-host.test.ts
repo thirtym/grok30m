@@ -13,8 +13,10 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GrokSidebar } from "../src/sidebar";
 import { Session } from "../src/session";
-import { CLOUD_ENVIRONMENT_ENV } from "../src/remote-frames";
+import { CLOUD_ENVIRONMENT_ENV, parseRelayFrame } from "../src/remote-frames";
 import { AGY_PASTE_ADDRESS_ERROR } from "../src/agy-auth";
+import { parseWebviewMsg } from "../src/desktop/webview-msg-validate";
+import * as installer from "../src/agy-managed-installer";
 
 const FAKE = path.join(__dirname, "fixtures", "fake-agy-acp.cjs");
 const KEY = "AIza-host-test-key";
@@ -48,9 +50,10 @@ function host(opts: { connected?: boolean; experimental?: boolean; method?: "goo
   sidebar.sendRemoteClient = vi.fn();
   sidebar.remoteClients = { active: () => session, cwd: () => home, detachedActiveValues: () => [], clients: () => [], tabToken: () => undefined, cwdIfPresent: () => undefined };
   sidebar.locateProvider = vi.fn(() => FAKE);
+  sidebar.installedAgyCli = vi.fn(() => undefined);
   sidebar.locatedProviders = () => ({ agy: true });
   sidebar.workspaceRoot = vi.fn(() => home);
-  const config = { update: vi.fn(async () => {}) };
+  const config = { inspect: () => undefined, update: vi.fn(async () => {}) };
   sidebar.host = {
     appendLine: vi.fn(),
     createTerminal: vi.fn(),
@@ -104,6 +107,59 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+describe("Antigravity approval and installation", () => {
+  it("accepts the existing desk and phone mode action only for an advertising session", async () => {
+    const sidebar = host();
+    const session = sidebar.focused;
+    const client = { sessionId: "s", nativeApprovalModes: false, currentModeId: "agent", setMode: vi.fn(async mode => { client.currentModeId = mode; }) };
+    session.client = client;
+    sidebar.sendRemoteSession = vi.fn();
+    const message = { type: "setMode", modeId: "acceptEdits" };
+    expect(parseWebviewMsg(message)).toEqual(message);
+    expect(parseRelayFrame(JSON.stringify({ t: "msg", clientId: "phone", msg: message }))).toMatchObject({ msg: message });
+    await sidebar.setMode(message.modeId, session);
+    expect(client.setMode).not.toHaveBeenCalled();
+    client.nativeApprovalModes = true;
+    await sidebar.setMode(message.modeId, session);
+    expect(client.setMode).toHaveBeenCalledWith("acceptEdits");
+    expect(sidebar.defaultModeForProvider("agy")).toBe("acceptEdits");
+    expect(sidebar.sendRemoteSession).toHaveBeenLastCalledWith(session, { type: "modeChanged", modeId: "acceptEdits", modes: ["agent", "acceptEdits", "yolo"] });
+    await sidebar.setMode("yolo", session);
+    expect(session.autoApprove).toBe(false);
+    expect(sidebar.displayMode(session)).toBe("yolo");
+    expect(sidebar.memento["grok.agyAcceptEdits"]).toBeUndefined();
+    expect(sidebar.configUpdate).toHaveBeenCalledWith("defaultMode", "yolo", "global");
+  });
+
+  it("answers the approval already on screen when a native session switches to Auto accept", async () => {
+    const sidebar = host();
+    const session = sidebar.focused;
+    const client = { sessionId: "s", nativeApprovalModes: true, currentModeId: "agent", setMode: vi.fn(async mode => { client.currentModeId = mode; }) };
+    session.client = client;
+    sidebar.sendRemoteSession = vi.fn();
+    sidebar.autoApprovePendingPermissions = vi.fn();
+    await sidebar.setMode("acceptEdits", session);
+    expect(sidebar.autoApprovePendingPermissions).not.toHaveBeenCalled();
+    await sidebar.setMode("yolo", session);
+    expect(session.autoApprove).toBe(false);
+    expect(sidebar.autoApprovePendingPermissions).toHaveBeenCalledOnce();
+    expect(sidebar.autoApprovePendingPermissions).toHaveBeenCalledWith(session);
+  });
+
+  it("shares one pinned upgrade attempt and keeps a custom server path outside the upgrader", async () => {
+    const sidebar = host();
+    const binary = installer.agyManagedBinaryPath(home);
+    const old = path.join(installer.agyManagedRoot(home), "1.4.0", installer.agyManagedFileNames().server);
+    const upgrade = vi.spyOn(installer, "installManagedAgy").mockResolvedValue(binary);
+    try {
+      expect(sidebar.upgradeManagedAgy(FAKE)).toBeUndefined();
+      expect(sidebar.upgradeManagedAgy(binary)).toBeUndefined();
+      await expect(Promise.all([sidebar.upgradeManagedAgy(old), sidebar.upgradeManagedAgy(old)])).resolves.toEqual([binary, binary]);
+      expect(upgrade).toHaveBeenCalledOnce();
+    } finally { upgrade.mockRestore(); }
+  });
 });
 
 describe("Antigravity in providerState", () => {
@@ -444,6 +500,19 @@ describe("Disconnect and Sign out", () => {
     expect(sidebar.host.showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("clears the Google sign-in"), { modal: true }, "Sign Out");
     expect(fs.existsSync(token())).toBe(false);
     expect(sidebar.secrets.get("grok.agy.geminiApiKey")).toBe(KEY);
+    expect(sidebar.providerConnectionState.agy).toBe(false);
+  });
+
+  it("Sign out with Google also signs out the installed agy CLI, whose sign-in new chats would otherwise keep", async () => {
+    signIn();
+    const sidebar = host({ connected: true, method: "google" });
+    sidebar.installedAgyCli = vi.fn(() => path.join(__dirname, "fixtures", "fake-agy-cli.cjs"));
+    sidebar.persistProviderConnections = vi.fn(async () => {});
+    await sidebar.logout("agy", { signOutCli: true });
+    expect(sidebar.host.showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("including the agy CLI's"), { modal: true }, "Sign Out");
+    expect(fs.existsSync(token())).toBe(false);
+    expect(fs.existsSync(path.join(home, "antigravity-cli", "signed-out"))).toBe(true);
+    expect(sidebar.host.showErrorMessage).not.toHaveBeenCalled();
     expect(sidebar.providerConnectionState.agy).toBe(false);
   });
 

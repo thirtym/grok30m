@@ -1,4 +1,6 @@
 import type { EffortLevel, PromptContentBlock, SlashCommand } from "./acp";
+import type { SubscriptionWindow } from "./subscription-usage";
+import type { ModeId } from "./mode-prefs";
 
 export const ACP_PROVIDERS = ["grok", "codex", "claude"] as const;
 // The legacy wire vocabulary above stays frozen for older receivers.
@@ -27,8 +29,8 @@ const PROVIDER_ACTIONS: Record<AcpProvider, {
   grok: { deleteHistory: true, compact: true, adapterHistory: false, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: true, fork: true },
   codex: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true, fork: true },
   claude: { deleteHistory: true, compact: true, adapterHistory: true, modeSwitching: true, approvalModeSwitching: false, autoAccept: true, perCallContext: true, clientMcp: true, fork: true },
-  muse: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: true, autoAccept: true, perCallContext: false, clientMcp: false, fork: false },
-  agy: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false, fork: false },
+  muse: { deleteHistory: false, compact: true, adapterHistory: true, modeSwitching: false, approvalModeSwitching: true, autoAccept: true, perCallContext: false, clientMcp: false, fork: true },
+  agy: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: true, autoAccept: true, perCallContext: false, clientMcp: false, fork: false },
   deepseek: { deleteHistory: false, compact: false, adapterHistory: true, modeSwitching: false, approvalModeSwitching: false, autoAccept: true, perCallContext: false, clientMcp: false, fork: false },
 };
 
@@ -189,6 +191,7 @@ export function normalizeSessionInfoUpdate(update: any): BackendUpdate {
 export interface BackendSessionListEntry {
   sessionId: string;
   cwd: string;
+  agyProgram?: "cli" | "server";
   title?: string;
   updatedAt?: string | number;
   createdAt?: string | number;
@@ -213,6 +216,9 @@ export interface BackendSteeringOptions {
   grokVersionVerified?: boolean;
 }
 
+export type ChildHistoryReplay = (toolCallId: string) => Iterable<unknown>;
+export type DelegatedWorkKind = "workflow" | "subagent";
+
 export interface AcpBackend<Provider extends string = AcpProvider> {
   readonly provider: Provider;
   readonly processName: string;
@@ -220,10 +226,22 @@ export interface AcpBackend<Provider extends string = AcpProvider> {
   spawn(options: BackendSpawnOptions): BackendSpawnSpec;
   normalizeSessionResponse(response: any): any;
   normalizePromptResult(result: any): any;
-  /** Host-supplied instruction shortcuts for a bridge without native commands. */
+  /** Host-discovered instruction shortcuts, optionally merged with native commands. */
   availableCommands?(cwd: string, log: (message: string) => void): Promise<SlashCommand[]>;
+  /** Discover on open/reopen without blocking session or prompt admission. */
+  readonly backgroundCommands?: boolean;
   rewritePrompt?(text: string, commands: readonly SlashCommand[]): string;
-  normalizeUpdate(update: any, meta: any): BackendUpdate;
+  readonly nativeApprovalModes?: boolean;
+  readonly pickerModes?: readonly ModeId[];
+  readonly nativeCompactCommand?: boolean;
+  /** A new prompt can take over the response that closes the same turn. */
+  readonly ownsSteeringQueue?: boolean;
+  subscriptionCredentialContext?(authMethod: string | undefined): string | undefined;
+  readSubscriptionUsage?(authMethod: string | undefined): Promise<SubscriptionWindow[]>;
+  normalizeUpdate(update: any, meta: any, foreignSessionId?: string): BackendUpdate;
+  stopDelegatedWork?(sessionId: string, kind: DelegatedWorkKind, id: string): { method: string; params: object } | undefined;
+  /** Supply child history at the position of its card in the parent replay. */
+  prepareChildReplay?(sessionId: string, cwd: string): Promise<ChildHistoryReplay>;
   normalizePermissionParams(params: any): any;
   setModel(sessionId: string, modelId: string, reasoningEffort?: string): { method: string; params: any };
   /** A relay-backed provider can apply effort locally without an ACP call. */

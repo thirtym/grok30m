@@ -700,13 +700,24 @@ export function finishQueuedSendCommit(
 }
 
 /** The same choices and restrictions feed live UI updates and reconnects. */
+export function sessionPickerModes(session: Session) {
+  if (session.client?.pickerModes) return [...session.client.pickerModes];
+  if (session.provider === "deepseek" && session.deepseekHarness === "minimal") return [];
+  return sessionModes(session.provider, !!session.museSandboxUnavailable, session.client?.nativeApprovalModes);
+}
+
 export function sessionModeMessage(session: Session, modeId: string): Extract<HostMsg, { type: "modeChanged" }> {
-  return { type: "modeChanged", modeId, modes: session.provider === "deepseek" && session.deepseekHarness === "minimal" ? [] : sessionModes(session.provider, !!session.museSandboxUnavailable),
+  return { type: "modeChanged", modeId, modes: sessionPickerModes(session),
     ...(session.provider === "deepseek" ? { deepseekHarness: session.deepseekHarness ?? "default", deepseekShellUnsandboxed: deepseekShellUnsandboxed(session.deepseekHarness), deepseekHarnessLocked: session.hasHistory || session.userMessageCount > 0,
       ...(session.client?.sessionId ? { deepseekHarnessContext: { sessionId: session.client.sessionId, modelId: session.client.currentModelId, generation: session.gen } } : {}) } : {}),
     ...(session.provider === "muse" && !session.museSandboxUnavailable && session.museShellSandbox !== true
       ? { disabledModes: { onRequest: MUSE_ON_REQUEST_UNAVAILABLE } } : {}),
   };
+}
+
+export function subscriptionUsageMessage(session: Session): Extract<HostMsg, { type: "subscriptionUsage" }> & { hideWhenEmpty?: true } {
+  return { type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [],
+    ...(session.provider === "agy" ? { hideWhenEmpty: true } : {}) };
 }
 
 /** Goal state lives with the adapter connection and is kept out of the history buffer. */
@@ -717,6 +728,16 @@ export function sessionGoalMessage(session: Session): Extract<HostMsg, { type: "
   }
 }
 
+/** Muse's catalog and queue capability describe the live connection. */
+export function museCommandSnapshot(session: Session) {
+  if (session.provider !== "muse") return [];
+  return [{
+    type: "commandsUpdate" as const,
+    commands: session.client?.availableCommands ?? [],
+    ...(session.client?.supportsInterject?.() ? { steeringOwner: session.provider } : {}),
+  }];
+}
+
 /** Current non-chat UI state for rebuilding a view of this live session. */
 export function sessionUiSnapshot(
   session: Session,
@@ -725,7 +746,8 @@ export function sessionUiSnapshot(
 ): HostMsg[] {
   const messages: HostMsg[] = [];
   messages.push(startupStatusMessage(session));
-  messages.push({ type: "subscriptionUsage", windows: session.subscriptionUsage?.snapshot() ?? [] });
+  messages.push(subscriptionUsageMessage(session));
+  messages.push(...museCommandSnapshot(session));
   const goal = sessionGoalMessage(session);
   if (goal) messages.push(goal);
   if (session.client?.currentModelId) {

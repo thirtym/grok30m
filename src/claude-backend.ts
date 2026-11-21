@@ -1,5 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import { compileFunction, constants as vmConstants } from "node:vm";
+import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { AcpClient as AdapterClient, ToolUseCache } from "@agentclientprotocol/claude-agent-acp/dist/acp-agent.js";
 import packageManifest from "../package.json";
 import { grokCliNeedsShell } from "./cli-process";
 import type { PromptContentBlock } from "./acp";
@@ -12,6 +17,8 @@ import type {
   BackendSpawnOptions,
   BackendSpawnSpec,
   BackendUpdate,
+  ChildHistoryReplay,
+  DelegatedWorkKind,
 } from "./acp-backend";
 import { adapterContextOccupancy } from "./acp-dispatch";
 import { ClaudeWorkflows } from "./claude-workflows";
@@ -205,14 +212,64 @@ function claudeWorkflowName(output: string, runId: string): string {
 const claudeText = (raw: any): string | undefined => typeof raw === "string" ? raw
   : Array.isArray(raw) ? raw.filter(c => c?.type === "text").map(c => c.text).join("\n") : undefined;
 const taskTerminal = (state: string | undefined) => !!state && /^(completed|failed|stopped|cancelled)$/.test(state);
+interface ClaudeSubagentTask {
+  toolCallId?: string;
+  taskType?: string;
+  state?: string;
+  canStop?: boolean;
+  output?: string;
+  durationMs?: number;
+  tokens?: number;
+}
 const taskTag = (text: string, tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text)?.[1]?.trim();
 const cleanClaudeError = (text: string) => text.replace(/^\s*<tool_use_error>([\s\S]*)<\/tool_use_error>\s*$/, "$1").trim();
 
 /** Receipts and task edges arrive separately, sometimes in the opposite order. */
 class ClaudeSubagents {
-  private readonly calls = new Set<string>();
+  readonly calls = new Set<string>();
+  private readonly childCalls = new Map<string, string>();
+  private readonly transcriptCalls = new Set<string>();
   private readonly agents = new Map<string, string>();
-  private readonly tasks = new Map<string, { toolCallId?: string; taskType?: string; state?: string; output?: string; durationMs?: number; tokens?: number }>();
+  private readonly tasks = new Map<string, ClaudeSubagentTask>();
+
+  stopTaskId(toolCallId: string): string | undefined {
+    let found: string | undefined;
+    for (const [id, task] of this.tasks) {
+      if ((!task.toolCallId || task.toolCallId === toolCallId) && this.agents.get(id) === toolCallId
+          && task.canStop && !taskTerminal(task.state)) {
+        if (found) return;
+        found = id;
+      }
+    }
+    return found;
+  }
+
+  isStoppableTask(id: string | undefined): boolean {
+    return id !== undefined && this.agents.has(id) && this.tasks.get(id)?.canStop === true;
+  }
+
+  agentCall(agentId: string): string | undefined { return this.agents.get(agentId); }
+
+  childStreamId(update: any): string | undefined {
+    const owner = update._meta?.claudeCode?.parentToolUseId;
+    const callId = update.toolCallId;
+    const known = this.childCalls.get(callId);
+    if (known) return known;
+    if (this.transcriptCalls.has(callId)) return;
+    if (typeof owner !== "string" || !owner || (owner === callId && this.calls.has(callId))) return;
+    // Only a subagent has a card. A forked skill tags its tools with the Skill
+    // call, and those stay in the transcript as they did in 4.16.0.
+    const root = this.childCalls.get(owner) ?? (this.calls.has(owner) ? owner : undefined);
+    if (!root) return;
+    // A file edit keeps the transcript route too: its diff, the approval card's
+    // preview and the turn's changed files all come from there.
+    if (update.kind === "edit") {
+      if (typeof callId === "string") this.transcriptCalls.add(callId);
+      return;
+    }
+    if (typeof callId === "string" && owner !== callId) this.childCalls.set(callId, root);
+    return root;
+  }
 
   accept(update: any): any {
     const claude = update._meta?.claudeCode;
@@ -231,6 +288,9 @@ class ClaudeSubagents {
       if (owner && [...this.agents].some(([key, value]) => value === owner && key !== id)) return;
       if (toolId) task.toolCallId = toolId;
       if (update.taskType) task.taskType = update.taskType;
+      if (update.sessionUpdate === "async_task_spawned" && ["agent", "local_agent", "subagent"].includes(update.taskType)) {
+        task.canStop = update.canStop === true;
+      }
       const state = notification ? taskTag(text, "status") : update.state
         ?? (["async_task_spawned", "async_task_progress"].includes(update.sessionUpdate) ? "running" : undefined);
       // A level-derived stopped edge can be corrected by the final task event.
@@ -254,16 +314,18 @@ class ClaudeSubagents {
     const response = claude?.toolResponse;
     if (!receipt && response?.isAsync !== true && response?.status !== "async_launched") return;
     const id = response?.agentId ?? response?.taskId ?? /^agentId:\s*(\S+)/m.exec(output || "")?.[1];
-    if (typeof id === "string" && id) this.agents.set(id, callId);
+    const mapped = this.agents.get(id);
+    if (typeof id === "string" && id && !mapped) this.agents.set(id, callId);
     // Nothing from the model-facing receipt belongs in either output channel.
     const task = this.tasks.get(id);
-    return { ...update, ...this.snapshot(callId, task?.toolCallId && task.toolCallId !== callId ? {} : task || {}), sessionUpdate: update.sessionUpdate };
+    const ownTask = (!mapped || mapped === callId) && (!task?.toolCallId || task.toolCallId === callId) ? task : undefined;
+    return { ...update, ...this.snapshot(callId, ownTask ?? {}), sessionUpdate: update.sessionUpdate };
   }
 
-  private snapshot(toolCallId: string, task: any): any {
-    // The installed adapter omits local_agent task events. A receipt alone
-    // settles as background, with no claim that work is still running.
-    return { sessionUpdate: "tool_call_update", toolCallId,
+  private snapshot(toolCallId: string, task: ClaudeSubagentTask): any {
+    // A receipt alone supplies neither liveness nor permission to stop.
+    return { sessionUpdate: "tool_call_update", toolCallId, child_session_id: toolCallId,
+      ...(task.canStop && !taskTerminal(task.state) ? { stopAvailable: true } : {}),
       status: task.state === "completed" ? "completed" : task.state === "failed" ? "failed"
         : task.state === "stopped" || task.state === "cancelled" ? "cancelled" : task.state ? "in_progress" : "background",
       rawOutput: { output: task.output || "" }, content: [],
@@ -275,6 +337,13 @@ class ClaudeSubagents {
 
 export function normalizeClaudeUpdate(update: any, meta?: any, subagents = new ClaudeSubagents()): BackendUpdate {
   if (!update || typeof update !== "object") return { update, meta };
+  const childSessionId = subagents.childStreamId(update);
+  if (childSessionId !== undefined) {
+    // The child has its own prompt and accounting. Send only the activity the
+    // stream can display, without the parent's context-usage envelope.
+    const visible = ["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"].includes(update.sessionUpdate);
+    return { update: visible ? update : undefined, childSessionId };
+  }
   const subagent = subagents.accept(update);
   const text = update.content?.type === "text" ? update.content.text : undefined;
   if (update.sessionUpdate === "user_message_chunk" && typeof text === "string"
@@ -282,12 +351,15 @@ export function normalizeClaudeUpdate(update: any, meta?: any, subagents = new C
     const status = /<status>([^<]*)<\/status>/.exec(text)?.[1];
     // This is a system wake-up, not a user prompt. Never expose its XML,
     // paths or diagnostic instructions as a user bubble on resume.
-    return { update: subagent, meta, notice: `Background task ${status && /^(completed|failed|cancelled|stopped)$/.test(status) ? status : "updated"}.` };
+    const stoppedOnCard = /^(stopped|cancelled)$/.test(status ?? "") && subagents.isStoppableTask(taskTag(text, "task-id"));
+    return { update: subagent, meta, notice: stoppedOnCard ? undefined
+      : `Background task ${status && /^(completed|failed|cancelled|stopped)$/.test(status) ? status : "updated"}.` };
   }
   if (subagent) return { update: subagent, meta };
   const claude = update._meta?.claudeCode;
-  if (claude?.toolName === "Agent" || claude?.subagent === true) {
-    const response = claude.toolResponse;
+  if (subagents.calls.has(update.toolCallId) && (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")) {
+    update = { ...update, child_session_id: update.toolCallId };
+    const response = claude?.toolResponse;
     const raw = update.rawOutput;
     let output = claudeText(raw);
     if (output !== undefined && update.status === "failed") output = cleanClaudeError(output);
@@ -443,12 +515,19 @@ export class ClaudeBackend implements AcpBackend {
 
   spawn(options: BackendSpawnOptions): BackendSpawnSpec {
     const command = this.options.nodePath || process.execPath;
+    const bridgeUrl = pathToFileURL(path.join(__dirname, "claude-async-task-bridge.mjs")).href;
+    // Even a missing or unreadable preload must leave the adapter launchable.
+    const preload = `data:text/javascript;base64,${Buffer.from(
+      `try { await (await import(${JSON.stringify(bridgeUrl)})).installTaskStopBridge(process.argv[1]); } catch {}`,
+    ).toString("base64")}`;
     // Deliberately omit `--hide-claude-auth`. That flag makes the adapter
     // reject Claude subscription accounts that already work in official Claude
     // Code. We never handle the credential either way — Anthropic's CLI does.
     return {
       command,
-      args: [this.adapterPath()],
+      args: this.options.adapterPath || (process.env.NODE_ENV === "test" && process.env.GROK_TEST_CLAUDE_ACP_ADAPTER_PATH?.trim())
+        ? [this.adapterPath()]
+        : ["--import", preload, this.adapterPath()],
       env: {
         ...options.env,
         // User's official Claude Code binary. Without this the adapter looks
@@ -468,15 +547,96 @@ export class ClaudeBackend implements AcpBackend {
   fork = acpForkRequest;
   private readonly workflows = new ClaudeWorkflows();
   private readonly subagents = new ClaudeSubagents();
-  normalizeUpdate(update: any, meta: any): BackendUpdate {
-    this.workflows.toolInput(update);
-    const result = normalizeClaudeUpdate(update, meta, this.subagents);
-    if (["async_task_spawned", "async_task_progress", "async_task_state_update"].includes(update?.sessionUpdate)) {
-      return { update: result.update === update ? undefined : result.update, meta, workflowUpdate: this.workflows.accept(update) };
+  private readonly childDelegation = new Map<string, { workflows: ClaudeWorkflows; subagents: ClaudeSubagents }>();
+  stopDelegatedWork(sessionId: string, kind: DelegatedWorkKind, id: string) {
+    const asyncTaskId = kind === "workflow" ? this.workflows.stopTaskId(id) : this.subagents.stopTaskId(id);
+    if (asyncTaskId) return { method: "_session/async_task/stop", params: { sessionId, asyncTaskId } };
+  }
+  normalizeUpdate(update: any, meta: any, foreignSessionId?: string): BackendUpdate {
+    let workflows = this.workflows;
+    let subagents = this.subagents;
+    // Preserve child routing while keeping child IDs out of the parent's
+    // Stop lookup, even when a child reuses a parent tool or task ID.
+    if (foreignSessionId !== undefined) {
+      let state = this.childDelegation.get(foreignSessionId);
+      if (!state) {
+        state = { workflows: new ClaudeWorkflows(), subagents: new ClaudeSubagents() };
+        this.childDelegation.set(foreignSessionId, state);
+      }
+      ({ workflows, subagents } = state);
     }
-    if (result.workflowUpdate) result.workflowUpdate = this.workflows.launch(update, result.workflowUpdate);
-    if (result.notice) result.workflowUpdate = this.workflows.notification(update.content.text);
+    const result = normalizeClaudeUpdate(update, meta, subagents);
+    if (result.childSessionId !== undefined) return result;
+    workflows.toolInput(update);
+    if (["async_task_spawned", "async_task_progress", "async_task_state_update"].includes(update?.sessionUpdate)) {
+      return { update: result.update === update ? undefined : result.update, meta, workflowUpdate: workflows.accept(update) };
+    }
+    if (result.workflowUpdate) result.workflowUpdate = workflows.launch(update, result.workflowUpdate);
+    if (result.notice) {
+      result.workflowUpdate = workflows.notification(update.content.text);
+      if (result.workflowUpdate?.controlsAvailable === false && result.workflowUpdate?.status === "stopped"
+          && result.workflowUpdate.launchOnly === false) result.notice = undefined;
+    }
     return result;
+  }
+
+  async prepareChildReplay(sessionId: string, cwd: string): Promise<ChildHistoryReplay> {
+    const adapterPath = this.adapterPath();
+    // The host compiles to CommonJS. Use native import for the bundled ESM
+    // dependencies, including in desktop builds with an older Node runtime.
+    const importModule = compileFunction("return import(url)", ["url"], {
+      importModuleDynamically: vmConstants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+    });
+    const sdkPath = createRequire(adapterPath).resolve("@anthropic-ai/claude-agent-sdk");
+    const sdk: typeof import("@anthropic-ai/claude-agent-sdk") = await importModule(pathToFileURL(sdkPath).href);
+    const adapter: typeof import("@agentclientprotocol/claude-agent-acp/dist/lib.js") =
+      await importModule(pathToFileURL(path.join(path.dirname(adapterPath), "lib.js")).href);
+
+    // session/load reads the SDK's parent message chain. Child conversations
+    // live in separate transcripts, linked by the SDK's tool-use metadata.
+    const transcripts = new Map<string, SessionMessage[]>();
+    const unlinked = new Map<string, SessionMessage[]>();
+    for (const agentId of await sdk.listSubagents(sessionId)) {
+      const messages = await sdk.getSubagentMessages(sessionId, agentId);
+      const owner = messages[0]?.parent_tool_use_id;
+      if (owner) transcripts.set(owner, messages);
+      else if (messages.length) unlinked.set(agentId, messages);
+    }
+    const logger = { log() {}, error() {} };
+    const subagents = this.subagents;
+    function* replay(owner: string): Generator<unknown> {
+      let messages = transcripts.get(owner);
+      if (!messages && subagents.calls.has(owner)) {
+        for (const [agentId, candidate] of unlinked) {
+          if (subagents.agentCall(agentId) !== owner) continue;
+          unlinked.delete(agentId);
+          messages = candidate;
+          break;
+        }
+      }
+      if (!messages) return;
+      transcripts.delete(owner);
+      const tools: ToolUseCache = Object.create(null);
+      for (const { message, type } of messages) {
+        if (type !== "assistant" && type !== "user") continue;
+        const content = (message as { content?: unknown })?.content;
+        if (typeof content !== "string" && !Array.isArray(content)) continue;
+        // With hooks disabled the mapper only returns notifications.
+        let frames: ReturnType<typeof adapter.toAcpNotifications>;
+        try {
+          frames = adapter.toAcpNotifications(content, type, sessionId, tools, undefined as unknown as AdapterClient,
+            logger, { registerHooks: false, parentToolUseId: owner, cwd });
+        } catch {
+          // A malformed child record must leave the parent history readable.
+          continue;
+        }
+        for (const { update } of frames) {
+          yield update;
+          if (update.sessionUpdate === "tool_call") yield* replay(update.toolCallId);
+        }
+      }
+    }
+    return replay;
   }
   normalizePermissionParams(params: any): any { return normalizeClaudePermissionParams(params); }
 

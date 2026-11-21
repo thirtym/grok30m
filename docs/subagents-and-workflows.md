@@ -46,27 +46,30 @@ more than it gains. The choice per provider is in `acpClientCapabilities`
 |---|---|---|
 | Grok | none needed | Grok reports subagents and workflows on its own `_x.ai/session_notification` rail, and replays them on `_x.ai/session/update`. |
 | Codex | `subagents: {}` plus the AIR metadata capability `nativeSubagentSessions` (`_meta.jetbrains.air`) | Without it Codex sends only "Start subagent", `wait` and "Complete subagent" rows and never the child's output. With it the child's output streams live and comes back on reopen. The adapter's `initialize` parser drops the plain `subagents` field, so the AIR capability is what actually turns it on. |
-| Claude Code | the AIR capability `asyncTasks` only | It adds task events that carry a workflow's progress. Native subagent sessions stay off: with them on, Claude sends no tool call for the subagent and a reopened conversation loses the subagent entirely. |
+| Claude Code | `_meta["subagent-transcript"]` and the AIR capability `asyncTasks` | Claude sends child activity with the launching tool call ID. The host keeps the `Agent` tool card and uses AIR task events for workflow progress. |
 | Muse Code | none | The bundled adapter reads Muse's own workflow items and forwards them (see below). |
 
 ### Subagents
 
-Muse Code 1.4.0 offered no plain subagent tool: asked for one, its model ran a
-one-agent workflow, which gets a Workflow card. (Muse's protocol defines
-subagent items, but none were sent.)
+Muse Code offers no plain subagent tool: asked for one, its model runs a
+one-agent workflow, which gets a Workflow card (1.4.0, and again 1.4.24). In
+1.4.24 the workflow's agents also arrive as subagent items, each with its own
+card. Those cards have no Stop: stopping one agent ended its whole workflow, so
+the Workflow card's Stop is the control. A subagent Muse spawns natively,
+outside a workflow, would carry Stop on its own card; none has been seen yet.
 
 | | Grok | Codex | Claude Code |
 |---|---|---|---|
 | **Starts with** | a `spawn_subagent` tool call (`Task` on Grok's Composer agent), in the foreground or the background | `subagent_spawned` on the parent session | an `Agent` tool call marked `_meta.claudeCode.subagent: true`, foreground or background |
 | **Lifecycle** | `subagent_spawned` and `subagent_finished` on `_x.ai/session_notification` | `subagent_state_update`; disconnected children show stopped | foreground tool updates; a background receipt settles as “in background”; ID-correlated task events or notifications supply any later outcome |
-| **Child's own output, live** | yes, on the child's own `sessionId`: thinking, tool calls, prose | yes, on the child's own `sessionId` | no |
+| **Child's own output, live** | yes, on the child's own `sessionId`: thinking, tool calls, prose | yes, on the child's own `sessionId` | yes, on the parent session with `parentToolUseId` |
 | **Card name** | the task description | the agent's name (the adapter's task text is a placeholder, not the child's prompt) | the task description |
-| **Open while running** | Activity: the child's thinking, tool rows and prose | Activity | nothing yet, so no chevron |
+| **Open while running** | Activity: the child's thinking, tool rows and prose | Activity | Activity |
 | **Result** | from `subagent_finished`, the tool's completion, or for a background run the `get_command_or_subagent_output` result | the child's last message | cleaned foreground hand-back, or the background task's summary/result when supplied; never the launch receipt |
 | **Time** | reported (`duration_ms`) | not reported; the app measures it while it watches live | reported, or measured while observing live work; no clock for “in background” |
 | **Tokens** | `tokens_used`, at the finish only | not reported | reported, at the finish only |
-| **Controls** | none | none | none |
-| **After reopening** | the card, result and time rebuild from the replayed tool call and lifecycle; the child's activity is not replayed | everything comes back, including the child's activity; no time | foreground hand-back restores result and usage; a background task notification restores only its reported outcome/result, with no invented usage or time |
+| **Controls** | none | none | Stop, while a background task the host has observed is running |
+| **After reopening** | the card, result and time rebuild from the replayed tool call and lifecycle; the child's activity is not replayed | everything comes back, including the child's activity; no time | the host restores linked child transcripts. Foreground hand-backs and correlated background outcomes restore the results and usage Claude reported |
 
 Notes:
 
@@ -79,21 +82,17 @@ Notes:
   replayed. The Codex adapter (1.11.0) gives up waiting on subagents after ten
   minutes and marks those still running as failed; that deadline is the
   adapter's, not ours.
-- Claude's child activity would need native subagent sessions, which the
-  extension leaves off for the reason in the table above.
-- Claude adapter 0.76.0 excludes `local_agent` from its AIR task runtime even
-  with `asyncTasks` enabled. The September 27 background capture contains a
-  receipt and a parent reply, but no subagent task event. The receipt settles
-  the card as **in background**, with no clock, staleness warning, result or
-  empty chevron, on desk, phone and reopen. The answer arrives in Claude's
-  reply. The wake-up's `usage_update` has `_claude/origin.kind` equal to
-  `task-notification`, but no task ID; workflows use the same marker, so it
-  cannot identify a card or finish it. The host maps `async_task_*` events
-  when supplied and `<task-notification>` on replay by task/tool ID. An
-  observed outcome supplies done, failed or stopped, its result and any
-  reported duration/tokens. The smoke accepts a foreground hand-back or an
-  honest “in background” card; receipt text anywhere and done without a
-  result fail. The expected live desktop case on this adapter is “in background”.
+- Claude uses the original `Agent` tool call ID for the stream. A nested
+  agent contributes to the outer card. A child's file edits stay in the
+  transcript with their diffs, as before, and so do a forked skill's tools.
+  On reopen the host reads the bundled SDK's separately stored child
+  transcripts alongside the owning cards.
+- The bundled adapter's AIR registry tracks attributed background Agent
+  tasks through the host preload. An observed task exposes Stop on its card
+  and reports its final state by task and tool ID. A receipt alone settles
+  as **in background**. The wake-up usage marker has no task identity.
+  Foreground hand-backs and replayed task notifications can still supply
+  output and measured usage.
 
 ### Workflows
 
@@ -108,7 +107,7 @@ no command offers one. (`/goal` exists in Codex and is a different feature.)
 | **Agents** | one row per agent, with state and tokens | one row per agent seen in progress; no tokens, because usage is only a run total | `Agent 1`, `Agent 2` and so on, with state, and tokens when reported |
 | **Time** | reported; the card counts on between frames and holds while paused | reported | not reported; the app measures it while it watches live |
 | **Result in the card** | `result_summary`: prose, or the `report`, `summary` or `sentence` field of a JSON object; any other JSON shows as a JSON code block | the task's terminal `summary`, when Claude sends one, as sanitized Markdown; the `outputFilePath` is not shown, and Claude's own reply usually carries the answer too | Muse's final summary; a JSON value shows as a code block |
-| **Controls** | Pause or Resume, and Stop | none | none |
+| **Controls** | Pause or Resume, and Stop | Stop, while the run is live | Stop, while the run is live; its agents stop with it |
 | **Finish** | a terminal `workflow_updated`; the host also checks the run's own state file | a terminal task state; on reopen, the replayed `<task-notification>` | a terminal `workflow` item |
 | **After reopening** | the frames replay and the card is rebuilt where the run happened, with steps, agents, time and result | task events are not replayed; the card comes back from the launch acknowledgement and the task notification, with its name, the declared steps and the outcome | Muse's history carries the finished item: agent dots, agents and result; no time |
 
@@ -144,9 +143,11 @@ Notes:
   1.3.0 offers no public way to resolve, so the card shows only the overall
   result. The `workflow` tool row that launched the run is hidden; the card is
   the record.
-- **No controls for Claude or Muse yet.** Claude's adapter has a stop call and
-  Muse's protocol defines workflow cancel commands; neither is wired, so those
-  cards show no controls rather than controls that do nothing.
+- **Claude and Muse cards offer Stop only.** Claude stops a workflow or a
+  background Agent task through `_session/async_task/stop`; Muse cancels a
+  workflow with `workflow/cancel` and stops a natively spawned subagent with
+  `subagent/stop`. Neither offers Pause or Resume here. A card reopened from
+  history has no Stop.
 
 ### Results that arrive in a turn nobody started
 
@@ -171,16 +172,18 @@ new turn footer. On reopen:
 
 Every provider is mapped onto one of the two cards in the host, before
 anything reaches the webview. No provider adds a host-to-webview message type,
-so a phone mirrors exactly what the desk shows.
+so a phone shows the same cards as the desk. **Stop** on a card needs a
+renderer that reads `stopToken`, so a phone or browser shows it only once the
+relay serves that client.
 
 | Card | Fed by | Provider mapping |
 |---|---|---|
-| Subagent card | a `toolCall` that `isSubagentToolCall` recognizes, then `toolCallUpdate`, `subagentUpdate` (lifecycle) and `childStream` (the child's output) | Grok is native. `normalizeCodexUpdate` turns Codex's `subagent_spawned` and `subagent_state_update` into a synthetic tool call `codex-subagent:<child id>`, tagged with the child's session. `normalizeClaudeUpdate` cleans hand-backs/errors, hides async receipts and maps ID-correlated task outcomes and reported usage onto the original tool update. |
+| Subagent card | a `toolCall` that `isSubagentToolCall` recognizes, then `toolCallUpdate`, `subagentUpdate` (lifecycle) and `childStream` (the child's output) | Grok is native. `normalizeCodexUpdate` turns Codex's `subagent_spawned` and `subagent_state_update` into a synthetic tool call `codex-subagent:<child id>`, tagged with the child's session. `normalizeClaudeUpdate` tags Claude cards, routes child activity, cleans hand-backs, hides async receipts and maps ID-correlated outcomes to the original tool call. |
 | Workflow card | `runProgress`, whose payload is the `RunProgressUpdate` from `parseRunProgressUpdate` | Grok's `workflow_updated` is parsed directly. Claude's receipts and task events (`ClaudeWorkflows`) and Muse's snapshots are rewritten as Grok-shaped `workflow_updated` frames in `BackendUpdate.workflowUpdate` and go through the same parser. |
 
 The only provider-specific flags on a workflow are additive:
-`controlsAvailable: false` (no controls, and no handle an older renderer could
-send), `agentProgressDots` (one dot per agent, for Muse) and `launchOnly` (a
+`controlsAvailable: false` (no Pause/Resume controls, and no handle an older renderer could
+send; Stop comes from a separate `stopToken`), `agentProgressDots` (one dot per agent, for Muse) and `launchOnly` (a
 Claude launch receipt with no live progress, never pinned).
 
 Child output is routed by session ID. While a conversation is being reopened,
@@ -240,8 +243,10 @@ conversation stopped showing its history.
   frames on the replay rail too, so the card is rebuilt at its original place,
   and a completion repair updates that entry instead of appending a new one.
   Before this, finished runs piled up above the message box on every reload.
-- **Controls only where the CLI offers them.** Only Grok's workflows can be
-  paused or stopped from the card. See the notes under [Workflows](#workflows).
+- **Controls only where the CLI offers them.** Grok's workflow commands offer
+  Pause, Resume and Stop. The native Stop button appears on a workflow or
+  subagent card when the host has confirmed a live control target. A workflow
+  roster or an activity row inside a subagent has no separate Stop button.
 - **A live workflow is pinned above the message box.** A workflow keeps
   running after the turn ends, and a card in the transcript scrolls away with
   its controls. The pin sits inside the composer, so the scroll-to-bottom and
@@ -259,9 +264,8 @@ conversation stopped showing its history.
     for that run is in the pin.
   - **Finished, in either mode:** the pin entry goes away and the transcript
     card becomes the closed report, where the workflow started.
-  - Pause, Resume and Stop are on whichever copy is live, never on both and
-    never on the trace line. A Claude launch receipt and the subagent cards
-    are unchanged.
+  - Workflow controls appear on the full live card. A subagent with a verified
+    stop target carries Stop in its own action row.
 
   Showing the full card twice, once in the transcript and once in the pin,
   looked cluttered, so the transcript keeps only a trace until the run ends.

@@ -2,6 +2,10 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { discoverAgySkills, rewriteAgyPrompt } from "./agy-skills";
+import { agyMeterDirectory, type AgyUsageMeter } from "./agy-usage";
+import type { PromptContentBlock, SlashCommand } from "./acp";
+import { isCliFile } from "./cli-path";
 import type { AgyRelayLease } from "./agy-key-relay";
 import type {
   AcpBackend,
@@ -14,11 +18,38 @@ import type {
 } from "./acp-backend";
 
 /**
- * Google's Antigravity ACP server (`agy_acp_server`), spawned directly: it
- * speaks ACP itself, so unlike Codex, Claude and Muse there is no adapter in
- * between. Everything here is measured against server 1.4.0; the evidence is in
- * research/antigravity-acp.md.
+ * Google's `agy acp` CLI and managed `agy_acp_server` speak ACP directly.
+ * A connection has one program and its own model, mode, and turn semantics.
+ * See research/antigravity-acp.md for captures and compatibility limits.
  */
+
+export type AgyProgram = "cli" | "server";
+
+export function locateAgyCli(env = process.env, platform = process.platform, home = os.homedir(), check = isCliFile): string | undefined {
+  const win = platform === "win32";
+  const paths = win ? path.win32 : path.posix;
+  const executable = win ? "agy.exe" : "agy";
+  const installer = win ? paths.join(env.LOCALAPPDATA || paths.join(home, "AppData", "Local"), "agy", "bin")
+    : paths.join(home, ".local", "bin");
+  const pathKey = win ? Object.keys(env).find(key => key.toLowerCase() === "path") : "PATH";
+  const dirs = (env[pathKey ?? "PATH"] ?? "").split(paths.delimiter).map(dir => dir.trim().replace(/^"(.*)"$/, "$1"));
+  return [installer, ...dirs].filter(dir => paths.isAbsolute(dir)).map(dir => paths.join(dir, executable))
+    .find(candidate => check(candidate, platform));
+}
+
+export function agyProgramCandidates(cli?: string, server?: string, history?: AgyProgram, keyMode = false) {
+  const programs: { program: AgyProgram; cliPath: string }[] = [];
+  if (cli && history !== "server" && (!keyMode || history === "cli")) programs.push({ program: "cli", cliPath: cli });
+  if (server && history !== "cli") programs.push({ program: "server", cliPath: server });
+  return programs;
+}
+
+export function agyHistoryProgram(sessionId: string, env = process.env): AgyProgram {
+  if (path.basename(sessionId) !== sessionId || /[\\/]/.test(sessionId)) return "server";
+  const home = agyGeminiHome(env);
+  if (fs.existsSync(path.join(home, "antigravity-acp", "conversations", `${sessionId}.db`))) return "server";
+  return fs.existsSync(path.join(home, "antigravity-cli", "conversations", `${sessionId}.db`)) ? "cli" : "server";
+}
 
 /** `GEMINI_HOME`, else `~/.gemini` -- the same resolution the server uses. */
 export function agyGeminiHome(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
@@ -68,7 +99,11 @@ function optionValue(option: any): unknown {
 }
 
 function optionValues(option: any): any[] {
-  return Array.isArray(option?.options) ? option.options : [];
+  return Array.isArray(option?.options) ? option.options.flatMap((entry: any) => Array.isArray(entry?.options) ? entry.options : [entry]) : [];
+}
+
+function selectValues(option: any): string[] {
+  return optionValues(option).map((entry) => entry?.value).filter((value): value is string => typeof value === "string");
 }
 
 function configOption(configOptions: unknown, id: string): any {
@@ -84,6 +119,12 @@ export const AGY_DEFAULT_CONTEXT_WINDOW = 1_048_576;
 
 /** The server's own order for a thinking-level picker, least thinking first. */
 const LEVEL_ORDER = ["minimal", "low", "medium", "high", "xhigh", "extra_high", "max"];
+const LEGACY_VARIANTS: Readonly<Record<string, [string, string]>> = {
+  "gemini-3.5-flash-extra-low": ["gemini-3.5-flash", "low"],
+  "gemini-3.5-flash-low": ["gemini-3.5-flash", "medium"],
+  "gemini-3-flash-agent": ["gemini-3.5-flash", "high"],
+  "gemini-pro-agent": ["gemini-3.1-pro", "high"],
+};
 
 /**
  * One row per model family, effort as its level. The server lists every
@@ -96,18 +137,21 @@ const LEVEL_ORDER = ["minimal", "low", "medium", "high", "xhigh", "extra_high", 
  */
 export function modelsFromAgyConfigOptions(
   configOptions: unknown,
-  variantIds: readonly string[] = [],
+  variantIds: readonly string[] = [], effortId = "thinking_level",
 ): { currentModelId?: string; availableModels: any[] } {
   const model = configOption(configOptions, "model");
-  const thinking = configOption(configOptions, "thinking_level");
+  const thinking = configOption(configOptions, effortId);
   const currentModelId = typeof optionValue(model) === "string" ? optionValue(model) as string : undefined;
   const currentLevel = typeof optionValue(thinking) === "string" ? optionValue(thinking) as string : undefined;
-  const currentLevels = optionValues(thinking).map((entry) => entry?.value).filter((value): value is string => typeof value === "string");
+  const currentLevels = selectValues(thinking);
   const levelsOf = (family: string): string[] => {
-    const listed = variantIds
-      .filter((id) => id.startsWith(`${family}-`) && LEVEL_ORDER.includes(id.slice(family.length + 1)))
-      .map((id) => id.slice(family.length + 1));
-    if (!listed.length) return family === currentModelId ? currentLevels : [];
+    if (family === currentModelId && thinking) return currentLevels;
+    const listed = variantIds.flatMap((id) => {
+      const legacy = LEGACY_VARIANTS[id];
+      if (legacy) return legacy[0] === family ? [legacy[1]] : [];
+      const suffix = id.slice(family.length + 1);
+      return id.startsWith(`${family}-`) && LEVEL_ORDER.includes(suffix) ? [suffix] : [];
+    });
     return [...new Set(listed)].sort((a, b) => LEVEL_ORDER.indexOf(a) - LEVEL_ORDER.indexOf(b));
   };
   return {
@@ -120,7 +164,7 @@ export function modelsFromAgyConfigOptions(
         modelId,
         name: typeof entry?.name === "string" && entry.name.trim() ? entry.name : modelId,
         _meta: {
-          totalContextTokens: AGY_DEFAULT_CONTEXT_WINDOW,
+          ...(effortId === "thinking_level" ? { totalContextTokens: AGY_DEFAULT_CONTEXT_WINDOW } : {}),
           supportsReasoningEffort: levels.length > 0,
           reasoningEfforts: levels.map((value) => ({ value })),
           ...(modelId === currentModelId && currentLevel ? { reasoningEffort: currentLevel } : {}),
@@ -130,29 +174,24 @@ export function modelsFromAgyConfigOptions(
   };
 }
 
-export function normalizeAgySessionResponse(response: any, keyMode = false): any {
+export function normalizeAgySessionResponse(response: any, keyMode = false, effortId = "thinking_level"): any {
   if (!response || typeof response !== "object") return response;
   const variantIds = Array.isArray(response.models?.availableModels)
     ? response.models.availableModels.map((entry: any) => entry?.modelId).filter((id: unknown): id is string => typeof id === "string")
     : [];
-  const models = modelsFromAgyConfigOptions(response.configOptions, variantIds);
-  models.availableModels = keyMode
-    ? agyKeyChatModels(models.availableModels, models.currentModelId)
-    : models.availableModels.filter((model) => !isAgyGemini2(model.modelId));
+  const models = modelsFromAgyConfigOptions(response.configOptions, variantIds, effortId);
+  if (keyMode) models.availableModels = agyKeyChatModels(models.availableModels, models.currentModelId);
   if (!models.availableModels.length) {
     const listed = response.models?.availableModels;
-    if (!Array.isArray(listed)) return response;
+    if (!keyMode || !Array.isArray(listed)) return response;
     return { ...response, models: { ...response.models, availableModels: listed.filter((model: any) => !isAgyGemini2(String(model?.modelId ?? ""))) } };
   }
   return { ...response, models };
 }
 
 /**
- * Gemini 2 (2.0, 2.5 and their variants) is never offered, in either sign-in
- * mode and not even as the model in use: the owner's call, 2026-10-15. A
- * gateway session can start on the first model it lists, `gemini-2.5-flash`
- * for the key measured, and keeping the model in use kept that row for the
- * whole conversation after the move to Gemini 4 Argon.
+ * A gateway session can start on a Gemini 2 variant. The key picker excludes
+ * those variants and starts on Gemini 4 Argon when available.
  */
 export function isAgyGemini2(modelId: string): boolean {
   return /^gemini-2(?:[.-]|$)/.test(modelId);
@@ -195,15 +234,18 @@ export function agyKeyChatModels<T extends { modelId: string }>(models: readonly
 /** Where a key's conversation starts when nothing is remembered. */
 export const AGY_KEY_DEFAULT_MODEL = "gemini-4-argon";
 
-export function configStateFromAgyOptions(response: any, fallback: BackendConfigState): BackendConfigState {
+export function configStateFromAgyOptions(response: any, fallback: BackendConfigState, effortId = "thinking_level"): BackendConfigState {
   const model = optionValue(configOption(response?.configOptions, "model"));
-  const level = optionValue(configOption(response?.configOptions, "thinking_level"));
+  const level = optionValue(configOption(response?.configOptions, effortId));
   return {
     modelId: typeof model === "string" ? model : fallback.modelId,
     reasoningEffort: typeof level === "string" ? level : fallback.reasoningEffort,
     modeId: fallback.modeId,
   };
 }
+
+const AGY_MODE_IDS = { agent: "default", acceptEdits: "auto_edit", yolo: "yolo" } as const;
+const AGY_CLI_MODE_IDS = { agent: "default", acceptEdits: "accept-edits", auto: "auto", plan: "plan" } as const;
 
 /**
  * Google refusing the credential DURING a turn. The server does not fail the
@@ -553,13 +595,12 @@ export function normalizeAgyPermissionParams(params: any): any {
   return { ...params, toolCall: { ...toolCall, rawInput: agyRendererInput(tool, raw) } };
 }
 
-export function normalizeAgyUpdate(update: any, meta: any, toolCalls: AgyToolCallMerger, shapes = new AgyToolCallShapes()): BackendUpdate {
+export function normalizeAgyUpdate(update: any, meta: any, toolCalls: AgyToolCallMerger, shapes = new AgyToolCallShapes(), cli = false): BackendUpdate {
   if (!update || typeof update !== "object") return { update, meta };
   if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
-    return { update: { ...update, availableCommands: update.availableCommands.filter((command: any) => !HIDDEN_COMMANDS.has(command?.name)) }, meta };
+    return { update: { ...update, availableCommands: update.availableCommands.filter((command: any) => !HIDDEN_COMMANDS.has(command?.name) || (cli && command?.name === "plan")) }, meta };
   }
-  // The server's own approval modes are not this host's modes: Agent and Auto
-  // accept are answered here, so a server mode change has nothing to update.
+  // Native mode state is read from the server's config options.
   if (update.sessionUpdate === "current_mode_update") return { meta };
   if (update.sessionUpdate === "usage_update") {
     return { update, meta, contextUsed: update.used, contextWindow: update.size };
@@ -661,23 +702,27 @@ export interface AgyCatalogOptions {
 /** Every folder's conversations in one directory read: what
  *  {@link listAgySessions} reads, before it keeps one folder's. */
 export function listAgyCatalog(
-  _platform: NodeJS.Platform = process.platform,
+  platform: NodeJS.Platform = process.platform,
   options: AgyCatalogOptions = {},
 ): BackendSessionListEntry[] {
   const io = options.fs ?? realHistoryFs;
   const dir = path.join(agyAcpDir(options.env, options.home), "conversations");
+  const meterDir = agyMeterDirectory(path.dirname(dir));
+  let meterId: unknown;
+  try { meterId = JSON.parse(io.readFile(path.join(meterDir, "session.json")))?.sessionId; } catch { /* meter has not started */ }
   let names: string[];
   try { names = io.readDir(dir); } catch { return []; }
   const sessions: BackendSessionListEntry[] = [];
   for (const name of names) {
     if (!name.endsWith(".db")) continue;
     const sessionId = name.slice(0, -3);
+    if (sessionId === meterId) continue;
     const updatedAt = io.modifiedAt(path.join(dir, name));
     if (options.since !== undefined && updatedAt !== undefined && updatedAt < options.since
       && !options.keepIds?.has(sessionId)) continue;
     let sessionCwd: unknown;
     try { sessionCwd = JSON.parse(io.readFile(path.join(dir, `${sessionId}.meta`)))?.cwd; } catch { continue; }
-    if (typeof sessionCwd !== "string") continue;
+    if (typeof sessionCwd !== "string" || agySessionPathKey(sessionCwd, platform) === agySessionPathKey(meterDir, platform)) continue;
     sessions.push({ sessionId, cwd: sessionCwd, ...(updatedAt !== undefined ? { updatedAt } : {}) });
   }
   return sessions;
@@ -695,6 +740,8 @@ export function agySessionsFor(
 }
 
 export interface AgyBackendOptions {
+  program?: AgyProgram;
+  usageMeter?: AgyUsageMeter;
   /** Signed in with a Gemini API key: the server runs in gateway mode. */
   keyMode?: boolean;
   keyRelay?: AgyRelayLease;
@@ -707,17 +754,36 @@ export interface AgyBackendOptions {
 
 export class AgyBackend implements AcpBackend<"agy"> {
   readonly provider = "agy" as const;
-  readonly processName = "Antigravity ACP server";
+  readonly program: AgyProgram;
+  readonly processName: string;
   readonly usesClientPlanGate = false;
+  readonly backgroundCommands = true;
+  nativeApprovalModes = false;
+  pickerModes?: (keyof typeof AGY_CLI_MODE_IDS)[];
+  private cliHistory = false;
+  rewritePrompt = rewriteAgyPrompt;
   private readonly toolCalls = new AgyToolCallMerger();
   private readonly shapes = new AgyToolCallShapes();
-  /** Whether the server offers `thinking_level`; gateway mode does not. */
-  private thinkingLevels = true;
+  private thinkingLevels?: string[];
+  private geminiHome?: string;
+  private nativeCommands: SlashCommand[] = [];
+  private skills: SlashCommand[] = [];
+  private skillsScan?: Promise<SlashCommand[]>;
 
-  constructor(private readonly options: AgyBackendOptions = {}) {}
+  constructor(private readonly options: AgyBackendOptions = {}) {
+    this.program = options.program ?? "server";
+    this.processName = this.program === "cli" ? "Antigravity CLI" : "Antigravity ACP server";
+  }
+
+  private get effortId() { return this.program === "cli" ? "thought_level" : "thinking_level"; }
+  private get modeIds(): Readonly<Record<string, string>> { return this.program === "cli" ? AGY_CLI_MODE_IDS : AGY_MODE_IDS; }
+  private pickerMode(mode: unknown): string | undefined {
+    return Object.entries(this.modeIds).find(([, native]) => native === mode)?.[0];
+  }
 
   spawn(options: BackendSpawnOptions): BackendSpawnSpec {
-    const args = agyServerArgs(this.options.platform ?? process.platform);
+    this.geminiHome = path.resolve(options.cwd, agyGeminiHome(this.options.env ?? options.env, this.options.home));
+    const args = this.program === "cli" ? ["acp"] : agyServerArgs(this.options.platform ?? process.platform);
     // A script server (the test fixture, or a user's wrapper) runs under Node.
     if (/\.[cm]?js$/i.test(options.cliPath)) {
       return { command: process.execPath, args: [options.cliPath, ...args], env: { ...options.env, ELECTRON_RUN_AS_NODE: "1" }, shell: false };
@@ -725,16 +791,50 @@ export class AgyBackend implements AcpBackend<"agy"> {
     return { command: options.cliPath, args, env: { ...options.env }, shell: false };
   }
 
-  sessionParams(cwd: string): Record<string, unknown> { return agySessionParams(cwd); }
+  sessionParams(cwd: string): Record<string, unknown> {
+    this.nativeCommands = [];
+    this.skills = [];
+    this.skillsScan = undefined;
+    return agySessionParams(cwd);
+  }
+
+  subscriptionCredentialContext(methodId: string | undefined): string | undefined {
+    return this.options.usageMeter?.credentialContext(methodId);
+  }
+
+  readSubscriptionUsage(methodId: string | undefined) {
+    return this.options.usageMeter?.read(methodId) ?? Promise.resolve([]);
+  }
+
+  async availableCommands(cwd: string): Promise<SlashCommand[]> {
+    const scan = this.skillsScan ??= discoverAgySkills(cwd, this.geminiHome ?? agyGeminiHome(this.options.env, this.options.home));
+    const skills = await scan;
+    if (scan === this.skillsScan) this.skills = skills;
+    return this.mergedCommands();
+  }
+
+  private mergedCommands(): SlashCommand[] {
+    const nativeNames = new Set(this.nativeCommands.map(command => command.name.toLowerCase()));
+    return [...this.nativeCommands, ...this.skills.filter(skill => !nativeNames.has(skill.name))];
+  }
 
   async stopProcess(pid: number, command: string): Promise<void> {
-    if ((this.options.platform ?? process.platform) !== "win32" || !/\.exe$/i.test(command)) return;
+    if (this.program !== "server" || (this.options.platform ?? process.platform) !== "win32" || !/\.exe$/i.test(command)) return;
     await stopAgyServerTree(pid, command, this.options.run);
   }
   normalizeSessionResponse(response: any): any {
-    if (Array.isArray(response?.configOptions)) this.thinkingLevels = !!configOption(response.configOptions, "thinking_level");
+    if (Array.isArray(response?.configOptions)) {
+      this.thinkingLevels = selectValues(configOption(response.configOptions, this.effortId));
+    }
+    const modes = selectValues(configOption(response?.configOptions, "mode"));
+    this.nativeApprovalModes = Object.values(AGY_MODE_IDS).every(mode => modes.includes(mode));
+    if (this.program === "cli") {
+      this.pickerModes = (Object.keys(AGY_CLI_MODE_IDS) as (keyof typeof AGY_CLI_MODE_IDS)[])
+        .filter(mode => modes.includes(AGY_CLI_MODE_IDS[mode]));
+      this.nativeApprovalModes = this.pickerModes.includes("agent");
+    }
     const relay = this.options.keyRelay;
-    const normalized = normalizeAgySessionResponse(response, this.options.keyMode === true || !!relay);
+    const normalized = normalizeAgySessionResponse(response, this.options.keyMode === true || !!relay, this.effortId);
     if (relay && normalized?.models?.availableModels) {
       normalized.models.availableModels = normalized.models.availableModels.map((model: any) => {
         const thinking = relay.supportsThinking(model.modelId);
@@ -748,7 +848,18 @@ export class AgyBackend implements AcpBackend<"agy"> {
     return normalized;
   }
   normalizePromptResult(result: any): any { return result; }
-  normalizeUpdate(update: any, meta: any): BackendUpdate { return normalizeAgyUpdate(update, meta, this.toolCalls, this.shapes); }
+  normalizeUpdate(update: any, meta: any): BackendUpdate {
+    if (this.program === "cli" && update?.sessionUpdate === "current_mode_update") {
+      const currentModeId = this.pickerMode(update.currentModeId);
+      return currentModeId ? { update: { ...update, currentModeId }, meta } : { meta };
+    }
+    const normalized = normalizeAgyUpdate(update, meta, this.toolCalls, this.shapes, this.program === "cli");
+    if (normalized.update?.sessionUpdate === "available_commands_update" && Array.isArray(normalized.update.availableCommands)) {
+      this.nativeCommands = normalized.update.availableCommands.filter((command: any) => typeof command?.name === "string");
+      normalized.update.availableCommands = this.mergedCommands();
+    }
+    return normalized;
+  }
   turnEnded(outcome: "completed" | "cancelled" | "failed"): any[] { return this.shapes.settle(outcome); }
   normalizePermissionParams(params: any): any { return normalizeAgyPermissionParams(params); }
 
@@ -765,27 +876,49 @@ export class AgyBackend implements AcpBackend<"agy"> {
   }
 
   setReasoningEffort(sessionId: string, modelId: string | undefined, level: string): { method: string; params: any } | { local: true } | null {
-    const value = agyThinkingLevel(level);
+    const value = this.thinkingLevels?.includes(level) ? level : agyThinkingLevel(level);
     const relay = this.options.keyRelay;
     if (relay) {
-      if (!value || !modelId || !relay.supportsThinking(modelId)) return null;
-      relay.setThinkingLevel(value);
+      const relayLevel = agyThinkingLevel(level);
+      if (!relayLevel || !modelId || !relay.supportsThinking(modelId)) return null;
+      relay.setThinkingLevel(relayLevel);
       return { local: true };
     }
-    if (this.options.keyMode || !this.thinkingLevels) return null;
-    return value ? { method: "session/set_config_option", params: { sessionId, configId: "thinking_level", value } } : null;
+    if (this.options.keyMode || (value && this.thinkingLevels && !this.thinkingLevels.includes(value))) return null;
+    return value ? { method: "session/set_config_option", params: { sessionId, configId: this.effortId, value } } : null;
   }
 
   setMode(sessionId: string, modeId: string): { method: string; params: any } {
-    if (modeId !== "agent" && modeId !== "yolo") throw new Error("Antigravity does not offer Plan mode.");
-    return { method: "session/set_mode", params: { sessionId, modeId: modeId === "agent" ? "default" : "yolo" } };
+    if (!Object.hasOwn(this.modeIds, modeId)) throw new Error("Antigravity does not offer Plan mode.");
+    if (this.pickerModes && !this.pickerModes.some(mode => mode === modeId)) throw new Error("This session does not offer that mode.");
+    if (modeId === "acceptEdits" && !this.nativeApprovalModes) throw new Error("This session does not offer Accept edits.");
+    const value = this.modeIds[modeId];
+    return this.nativeApprovalModes
+      ? { method: "session/set_config_option", params: { sessionId, configId: "mode", value } }
+      : { method: "session/set_mode", params: { sessionId, modeId: value } };
   }
 
-  steeringCapabilities() { return { supported: false, acceptsContent: false }; }
-  interject(): null { return null; }
-  steerDelivered(): boolean { return false; }
+  steeringCapabilities(init: any) {
+    this.cliHistory = this.program === "cli" && !!init?.agentCapabilities?.sessionCapabilities?.list;
+    const version = /^(\d+)\.(\d+)\./.exec(init?.agentInfo?.version ?? "");
+    const supported = this.program === "cli" && !!version && (+version[1] > 1 || (+version[1] === 1 && +version[2] >= 5));
+    return { supported, acceptsContent: false };
+  }
+  get ownsSteeringQueue() { return this.program === "cli"; }
+  get nativeCompactCommand() { return this.program === "cli"; }
+  interject(sessionId: string, text: string, content?: readonly PromptContentBlock[]) {
+    return this.program === "cli" ? { method: "session/prompt", params: { sessionId, prompt: content ?? [{ type: "text", text }] } } : null;
+  }
+  steerDelivered(result: any): boolean { return this.program === "cli" && typeof result?.stopReason === "string"; }
   configState(response: any, fallback: BackendConfigState): BackendConfigState {
-    const state = configStateFromAgyOptions(response, fallback);
+    const state = configStateFromAgyOptions(response, fallback, this.effortId);
+    if (Array.isArray(response?.configOptions)) {
+      this.thinkingLevels = selectValues(configOption(response.configOptions, this.effortId));
+      if (this.thinkingLevels.length === 0) state.reasoningEffort = undefined;
+    }
+    if (this.nativeApprovalModes) {
+      state.modeId = this.pickerMode(optionValue(configOption(response?.configOptions, "mode")) ?? response?.modes?.currentModeId) ?? state.modeId;
+    }
     const relay = this.options.keyRelay;
     if (relay) state.reasoningEffort = state.modelId && relay.supportsThinking(state.modelId) ? relay.thinkingLevel : undefined;
     return state;
@@ -794,11 +927,29 @@ export class AgyBackend implements AcpBackend<"agy"> {
 
   /** From disk, never through the server; see {@link listAgySessions}. */
   async listSessions(
-    _request: (method: string, params: any) => Promise<any>,
+    request: (method: string, params: any) => Promise<any>,
     cwd: string,
     platform: NodeJS.Platform,
   ): Promise<BackendSessionListResult> {
-    return { sessions: listAgySessions(cwd, platform, this.options), nextCursor: null };
+    if (this.program === "server") return { sessions: listAgySessions(cwd, platform, this.options), nextCursor: null };
+    const sessions = new Map<string, BackendSessionListEntry>();
+    if (!this.cliHistory) return { sessions: [], nextCursor: null };
+    const paths = platform === "win32" ? path.win32 : path.posix;
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await request("session/list", { ...(cwd ? { cwd } : {}), ...(cursor ? { cursor } : {}) });
+      for (const row of Array.isArray(page?.sessions) ? page.sessions : []) {
+        const { sessionId, cwd, title, updatedAt } = row ?? {};
+        if (typeof sessionId === "string" && sessionId && typeof cwd === "string" && paths.isAbsolute(cwd)) {
+          sessions.set(sessionId, { sessionId, cwd, agyProgram: "cli", title: typeof title === "string" ? title : undefined,
+            updatedAt: typeof updatedAt === "string" ? updatedAt : undefined });
+        }
+      }
+      cursor = typeof page?.nextCursor === "string" && !cursors.has(page.nextCursor) ? page.nextCursor : undefined;
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return { sessions: [...sessions.values()], nextCursor: null };
   }
 
   isCredentialError(error: unknown): boolean { return isAgyCredentialError(error); }

@@ -337,9 +337,11 @@ export function assertRenderedScenario(scenario) {
 
 export function completeRenderScenarios(scenarios, provider, reason = "not exercised: desktop run stopped", selectedScenario) {
   const result = [...scenarios];
-  for (const name of ["plain reply", "subagent", "workflow", "delivery prompt"]) {
+  const names = /^stop (workflow|subagent)$/.test(selectedScenario) ? [selectedScenario] : ["plain reply", "subagent", "workflow", "delivery prompt"];
+  for (const name of names) {
     if (result.some(s => s.name === name)) continue;
     const na = name === "subagent" && provider === "muse" ? "Muse delegation is a workflow"
+      : name === "stop subagent" && provider === "muse" ? "Muse delegation is a workflow; its agents stop with the workflow"
       : name === "workflow" && provider === "codex" ? "Codex has no workflows"
         : name === "delivery prompt" && provider !== "muse" ? "Muse-specific admission regression" : undefined;
     const excluded = selectedScenario && name !== selectedScenario && !(selectedScenario === "workflow" && name === "delivery prompt");

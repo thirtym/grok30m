@@ -1,5 +1,7 @@
 import * as path from "node:path";
-import type { AcpBackend, BackendConfigState, BackendSpawnOptions } from "./acp-backend";
+import type { AcpBackend, BackendConfigState, BackendSpawnOptions, DelegatedWorkKind } from "./acp-backend";
+import { acpForkRequest } from "./acp-backend";
+import type { PromptContentBlock } from "./acp";
 import type { MusePosture, MuseSandboxUnavailable } from "./mode-prefs";
 import { isMuseModeId } from "./mode-prefs";
 
@@ -40,7 +42,17 @@ export class MuseBackend implements AcpBackend<"muse"> {
 
   normalizeSessionResponse(response: any) { return { ...response, models: response.models ?? response._meta?.models }; }
   normalizePromptResult(result: any) { return result; }
+  stopDelegatedWork(sessionId: string, kind: DelegatedWorkKind, id: string) {
+    return { method: "_muse/stop_delegated_work", params: { sessionId, kind, id } };
+  }
   normalizeUpdate(update: any, meta: any) {
+    if (update?._meta?.["muse/subagent"] === true
+        && (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")) {
+      return { update: { ...update, kind: "subagent",
+        status: update._meta["muse/cancelled"] === true ? "cancelled" : update.status,
+        stopAvailable: update._meta["muse/canStop"] === true,
+      }, meta };
+    }
     if (update?._meta?.["muse/modeNotice"]) {
       return { update, meta, notice: update._meta["muse/modeNotice"] };
     }
@@ -62,9 +74,15 @@ export class MuseBackend implements AcpBackend<"muse"> {
     if (!isMuseModeId(modeId)) throw new Error("Muse does not offer Plan mode or unknown approval modes");
     return { method: "session/set_mode", params: { sessionId, modeId } };
   }
-  steeringCapabilities() { return { supported: false, acceptsContent: false }; }
-  interject() { return null; }
-  steerDelivered() { return false; }
+  steeringCapabilities(init: any) {
+    const supported = init?._meta?.steering?.supported === true;
+    return { supported, acceptsContent: supported };
+  }
+  interject(sessionId: string, text: string, content?: readonly PromptContentBlock[]) {
+    return { method: "_session/steering", params: { sessionId, prompt: content ?? [{ type: "text", text }] } };
+  }
+  steerDelivered(result: any) { return result?.outcome === "injected"; }
+  fork = acpForkRequest;
   configState(response: any, fallback: BackendConfigState) {
     return { ...fallback, modeId: response?.modes?.currentModeId ?? response?._meta?.modes?.currentModeId ?? fallback.modeId };
   }

@@ -705,6 +705,7 @@
     // The host normalizes backend capability at initialize. Grok starts
     // optimistic; Codex requires its advertisement; -32601 latches either off.
     steerSupported: false,
+    steeringOwnsQueue: false,
     steeringProvider: null,
     // Grok thumbs (#114). Off until the host advertises feedbackAvailability.
     // Only the live-process turn that just finished is rateable (not session/load).
@@ -717,6 +718,7 @@
     lastTurnUsage: null, // last prompt's billing split (#53), for the donut popover
     sessionUsage: null, // session-cumulative billing — summed by the host, not grok
     subscriptionWindows: [], // latest account capacity; never part of the transcript
+    subscriptionUsageHideWhenEmpty: false,
     // Whether this HOST has ever sent `subscriptionUsage`. A host property, not
     // a session one, so a new conversation does not un-learn it.
     subscriptionUsageKnown: false,
@@ -1201,6 +1203,7 @@
 
   const MODE_META = {
     agent: { icon: ICON.bot, label: "Agent mode" },
+    acceptEdits: { icon: ICON.shield, label: "Accept edits" },
     // A provider's own Auto mode; only a host that advertises it offers it.
     auto: { icon: ICON.shield, label: "Auto mode" },
     askApproval: { icon: ICON.shieldQuestion, label: "Ask for approval" },
@@ -1511,6 +1514,7 @@
 
   function modeDescription(id) {
     if (offersMuseModes() && Object.hasOwn(MUSE_MODE_META, id)) return MUSE_MODE_META[id].description;
+    if (id === "acceptEdits") return "Automatically approves file edits. Other tools follow the agent’s approval rules.";
     const name = providerDisplayName(state.activeProvider);
     if (state.activeProvider === "muse") {
       if (state.hostCaps && state.hostCaps.museNativeModes) {
@@ -2745,6 +2749,7 @@
       };
     }
     if (globalThis.GrokWebviewHelpers.providerSupports(state.activeProvider, "compact")) lead.appendChild(act);
+    if (state.commands.some(cmd => cmd?.name === "compact" && cmd._meta?.["afk/compact"] === true)) lead.appendChild(act);
     if (state.activeProvider === "deepseek") {
       const note = document.createElement("div");
       note.className = "popover-fineprint";
@@ -2832,7 +2837,9 @@
     // comment further down records what returning early from here cost last
     // time. Building a handful of detached nodes and dropping them is the
     // cheaper mistake.
-    if (state.subscriptionUsageKnown && state.activeProvider !== "deepseek") contextPopover.appendChild(subscription);
+    if (!state.subscriptionUsageHideWhenEmpty || windows.length) {
+      if (state.subscriptionUsageKnown && state.activeProvider !== "deepseek") contextPopover.appendChild(subscription);
+    }
 
     // KNOWLEDGE WORK STOPS HERE: the numbers and the action on them, nothing
     // else. Context occupancy and account capacity both answer "can I keep
@@ -11129,6 +11136,7 @@
     state.feedbackAvailable = false;
     state.turnRating = 0;
     state.steerSupported = false;
+    state.steeringOwnsQueue = false;
     state.steeringProvider = null;
     state.turnForkSessionId = null;
     document.body.classList.remove("turn-fork-supported");
@@ -15196,6 +15204,13 @@ ${fullText}`
     const meta = el.querySelector(".delegation-meta");
     meta.textContent = Number.isFinite(el._subagentTokens) ? `${compactTokens(el._subagentTokens)} tokens` : "";
     wireSubagentExpand(el);
+    if (done || !el._stopToken) {
+      el._stopActions?.remove();
+      el._stopActions = undefined;
+    } else if (!el._stopActions) {
+      el._stopActions = workflowText(el, "run-progress-actions", "");
+      syncDelegatedStop(el._stopActions, "subagent", el._stopCardId, el._stopToken);
+    }
   }
 
   function observeSubagentLive(el) {
@@ -15461,6 +15476,13 @@ ${fullText}`
     if (status === "background") el._liveStartedAt = null;
     const finished = status === "completed" || status === "failed" || status === "cancelled" ||
       (out && out.type === "SubagentCompleted");
+    if (!finished && !el.classList.contains("subagent-done") && typeof call?.stopToken === "string") {
+      el._stopToken = call.stopToken;
+      el._stopCardId = call.toolCallId;
+      if (el._stopActions) syncDelegatedStop(el._stopActions, "subagent", el._stopCardId, el._stopToken);
+    } else if (finished || call?.stopAvailable === false) {
+      el._stopToken = undefined;
+    }
     if (!finished) { observeSubagentLive(el); refreshSubagentCard(el); return; }
     // Output lives in rawOutput.output (SubagentCompleted), rawOutput.text
     // ({type:"Text"} — Composer + background acks), or the content text.
@@ -15631,6 +15653,19 @@ ${fullText}`
     workflowPin = null;
     clearInterval(workflowAgeTimer);
     workflowAgeTimer = null;
+  }
+
+  function syncDelegatedStop(actions, kind, id, stopToken) {
+    const previous = actions.querySelector(".delegated-stop");
+    if (previous?.dataset.stopToken === stopToken) return;
+    previous?.remove();
+    if (!stopToken) return;
+    const button = workflowText(actions, "run-progress-btn delegated-stop", "Stop", "button");
+    button.type = "button";
+    button.title = `Stop ${kind}`;
+    button.dataset.stopToken = stopToken;
+    button.onclick = () => vscode.postMessage({ type: "stopDelegatedWork", kind, id, stopToken });
+    actions.prepend(button);
   }
 
   function workflowText(parent, className, text, tag = "div") {
@@ -16242,6 +16277,9 @@ ${fullText}`
       }
     }
     const expandable = !!(hasPhases || u.agents?.length || !actions.hidden || detailText || outputText || totals.length);
+    if (u.controlsAvailable === false) {
+      syncDelegatedStop(actions, "workflow", u.id, live && u.controlsAvailable === false ? u.stopToken : undefined);
+    }
     setDelegationExpandable(toggle, expandable, reportHeader ? toggle.parentElement.open : expanded);
     if (!reportHeader) toggle.onclick = () => {
       if (!expandable) return;
@@ -20029,7 +20067,7 @@ ${fullText}`
         const msg = { type: "steerSend", text, fromQueue: true };
         if (chips.length) msg.chips = chips;
         vscode.postMessage(msg);
-        vscode.postMessage({ type: "clearQueuedSends" });
+        if (!state.steeringOwnsQueue) vscode.postMessage({ type: "clearQueuedSends" });
       };
       actions.appendChild(steerBtn);
     }
@@ -21638,6 +21676,7 @@ ${fullText}`
       case "initialized": {
         state.steeringProvider = msg.info.provider || "grok";
         state.steerSupported = msg.info.steeringSupported === true;
+        state.steeringOwnsQueue = msg.info.init?.steeringOwnsQueue === true;
         renderQueuedBlocks();
         // The ACP handshake is done, but session/new or session/load may still be
         // running. Keep showing Starting until the startup lock clears.
@@ -21918,9 +21957,18 @@ ${fullText}`
       case "pasteTextSettled":
         settleTextPaste(msg.pasteId);
         break;
-      case "commandsUpdate":
+      case "commandsUpdate": {
+        const refreshCompact = [...state.commands, ...(msg.commands || [])].some(cmd => cmd?._meta?.["afk/compact"] === true);
         state.commands = msg.commands || [];
+        if (msg.steeringOwner) {
+          state.steerSupported = true;
+          state.steeringProvider = msg.steeringOwner;
+          state.steeringOwnsQueue = true;
+          renderQueuedBlocks();
+        }
+        if (refreshCompact && !contextPopover.hidden) renderContextPopover();
         break;
+      }
       case "mentionResults": {
         // Only render rows that answer the token still under the caret — the
         // popover may have closed (query null) or the user typed further (query
@@ -22500,6 +22548,7 @@ ${fullText}`
         break;
       case "subscriptionUsage":
         state.subscriptionUsageKnown = true;
+        state.subscriptionUsageHideWhenEmpty = msg.hideWhenEmpty === true;
         state.subscriptionWindows = Array.isArray(msg.windows) ? msg.windows : [];
         if (!contextPopover.hidden) renderContextPopover();
         break;
@@ -22819,6 +22868,7 @@ ${fullText}`
         addSessionContextBanner();
         break;
       case "clearMessages":
+        state.commands = state.commands.filter(cmd => !cmd?._meta?.["afk/compact"] && !cmd?._meta?.["muse/skill"]);
         recalledPrompt = null;
         removeProjectPrompt();
         for (const el of document.querySelectorAll(".confirm-overlay[data-confirm-req-id]")) {

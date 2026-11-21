@@ -39,6 +39,7 @@ export function permissionSmokeNotApplicable(provider) {
 
 export const SUBAGENT_PROMPT = "This is a delegation plumbing test. You MUST actually invoke your subagent/Agent tool exactly once, even though the task is trivial; answering yourself does not test it. Its only job: reply with the single word ok. Wait for the child to finish, then tell me what it said. Keep it minimal and do nothing else. Use the cheapest available model and lowest supported reasoning effort for the subagent.";
 export const WORKFLOW_PROMPT = "This is a workflow plumbing test. You MUST actually invoke your workflow tool, even though the task is trivial; answering yourself or launching ordinary subagents does not test it. Run exactly 2 steps, one agent per step. Step one: reply with the single word one. Step two: reply with the single word two. Declare both steps in the script's metadata before starting, wait for completion and report the result. Keep it minimal and do nothing else. Use the cheapest available model and lowest supported reasoning effort for both agents.";
+export const STOP_SCENARIOS = ["stop workflow", "stop subagent"];
 // Grok 1.0.41+ rejects an explicit per-agent model ("Explicit subagent model selection is unavailable for
 // this catalog"): asked for the cheapest model, the model names one, every step fails in 0 ms and it relaunches
 // the workflow. The session is already on the cheapest selectable model, so Grok is told not to set one.
@@ -147,7 +148,7 @@ export function delegationAttempted(frames, kind) {
     ? raw?._meta?.claudeCode?.toolName === "Workflow" || raw?._meta?.["muse/workflow"]
       || raw?.sessionUpdate === "workflow_updated" || raw?.taskType === "workflow"
       || /^workflow$/i.test(raw?.title ?? "") || raw?._meta?.["x.ai/tool"]?.name === "workflow"
-    : raw?.sessionUpdate?.startsWith("subagent_") || raw?._meta?.claudeCode?.subagent === true
+    : raw?.sessionUpdate?.startsWith("subagent_") || raw?._meta?.["muse/subagent"] === true || raw?._meta?.claudeCode?.subagent === true
       || raw?._meta?.claudeCode?.toolName === "Agent" || raw?._meta?.codex?.subagent
       || (["tool_call", "tool_call_update"].includes(raw?.sessionUpdate)
         && (raw.kind === "subagent" || /^(Agent|spawn_subagent|Start subagent\b.*)$/i.test(raw.title ?? ""))));
@@ -157,7 +158,7 @@ export function delegationAttempted(frames, kind) {
 export function checkSubagents(frames, sessionId, isSubagentToolCall) {
   assert(!frames.some(f => hasClaudeAgentReceipt(f.update)), "Claude launch receipt is not a subagent result or reply");
   const calls = new Map();
-  for (const frame of frames.filter(f => f.sessionId === sessionId)) {
+  for (const frame of frames.filter(f => f.sessionId === sessionId && f.childSessionId === undefined)) {
     const u = frame.update;
     if (!["tool_call", "tool_call_update"].includes(u?.sessionUpdate)) continue;
     if (u.sessionUpdate === "tool_call" && isSubagentToolCall(u)) {
@@ -186,11 +187,34 @@ export function checkSubagents(frames, sessionId, isSubagentToolCall) {
     assert.equal(call.status, "completed", `subagent ${call.toolCallId} did not complete successfully`);
     const content = !background && (call.content ?? []).some(b => nonempty(b.content?.text));
     const child = call.child_session_id;
-    const childOutput = nonempty(child) && frames.some(f => f.sessionId === child
+    const childOutput = nonempty(child) && frames.some(f => (f.childSessionId ?? f.sessionId) === child
       && f.update?.sessionUpdate === "agent_message_chunk" && nonempty(f.update.content?.text));
     assert(nonempty(output) || content || childOutput, `subagent ${call.toolCallId} has no non-empty normalized result/child output`);
   }
   return `${calls.size} normalized subagent card(s): ${backgroundCount} in background (completion not reported), ${calls.size - backgroundCount} completed with non-empty result`;
+}
+
+export function checkClaudeSubagentText(frames, sessionId, expectedCards) {
+  const cards = frames.filter(f => f.sessionId === sessionId && f.childSessionId === undefined
+    && f.update?.sessionUpdate === "tool_call" && f.update._meta?.claudeCode?.subagent === true);
+  const ids = expectedCards ?? [...new Set(cards.map(f => f.update.toolCallId))];
+  assert(ids.length, "no normalized Claude subagent card");
+  assert(!frames.some(f => f.sessionId === sessionId && f.raw?._meta?.claudeCode?.parentToolUseId
+    && f.childSessionId === undefined && ["agent_message_chunk", "user_message_chunk"].includes(f.update?.sessionUpdate)),
+  "Claude child text leaked into the parent transcript");
+  for (const id of ids) {
+    const card = cards.find(f => f.update.toolCallId === id && f.update.child_session_id === id);
+    assert(card, `Claude card ${id} lacks its child stream ID`);
+    const sent = frames.slice(frames.indexOf(card) + 1).filter(f => f.sessionId === sessionId && f.childSessionId === id);
+    if (sent.some(f => f.update?.sessionUpdate === "agent_message_chunk" && nonempty(f.update.content?.text))) continue;
+    // The hand-off is a child's last act, so a child that answered only through
+    // it will send no text: an unproven check, not a broken stream.
+    if (sent.some(f => f.update?._meta?.claudeCode?.toolName === "SubagentHandback")) {
+      throw inconclusive("NOT_OBSERVED", `Claude card ${id}: the child answered only through SubagentHandback, so no live child text was sent`);
+    }
+    assert.fail(`Claude card ${id} received no child text`);
+  }
+  return ids;
 }
 
 /** All snapshots are parsed by the shipped parseRunProgressUpdate before this check. */
@@ -384,6 +408,26 @@ export class Peer {
       stream.on("error", (e) => this.fail(new Error(`adapter ${name}: ${e.message}`)));
     }
     this.proc.stderr.on("data", (data) => this.record("stderr", data.toString()));
+    this.load = async (sessionId) => {
+      this.childReplay = await backend.prepareChildReplay?.(sessionId, cwd);
+      try { return await this.request("session/load", { sessionId, cwd, mcpServers: [] }); }
+      finally { this.childReplay = undefined; }
+    };
+    const recordUpdate = (sessionId, raw, meta) => {
+      const normalized = backend.normalizeUpdate(raw, meta);
+      const seed = raw?._meta?.claudeCode?.toolName === "Workflow"
+        ? seedBackend.normalizeUpdate(raw, meta).workflowUpdate : undefined;
+      // Normalizers own mutable workflow buffers. Retain each instant, not
+      // references that a later completed snapshot could retroactively fill.
+      const frame = structuredClone({ sessionId, raw, update: normalized.update, childSessionId: normalized.childSessionId,
+        workflow: parseProgress(normalized.workflowUpdate ?? normalized.update), seedWorkflow: parseProgress(seed),
+        ignored: !Object.entries(normalized).some(([key, value]) => key !== "meta" && value !== undefined) });
+      this.normalized.push(frame);
+      this.record("normalized", frame);
+      if (this.childReplay && normalized.childSessionId === undefined && typeof normalized.update?.child_session_id === "string") {
+        for (const child of this.childReplay(normalized.update.child_session_id)) recordUpdate(sessionId, child, undefined);
+      }
+    };
     this.rl = createInterface({ input: this.proc.stdout });
     this.rl.on("error", (e) => this.fail(e));
     this.rl.on("line", (line) => {
@@ -393,16 +437,7 @@ export class Peer {
         this.record("receive", message);
         if (["session/update", "_x.ai/session_notification", "x.ai/session_notification", "_x.ai/session/update", "x.ai/session/update"].includes(message.method)) {
           const { update: raw, sessionId, _meta } = message.params;
-          const normalized = backend.normalizeUpdate(raw, _meta);
-          const seed = raw?._meta?.claudeCode?.toolName === "Workflow"
-            ? seedBackend.normalizeUpdate(raw, _meta).workflowUpdate : undefined;
-          // Normalizers own mutable workflow buffers. Retain each instant, not
-          // references that a later completed snapshot could retroactively fill.
-          const frame = structuredClone({ sessionId, raw, update: normalized.update,
-            workflow: parseProgress(normalized.workflowUpdate ?? normalized.update), seedWorkflow: parseProgress(seed),
-            ignored: !Object.entries(normalized).some(([key, value]) => key !== "meta" && value !== undefined) });
-          this.normalized.push(frame);
-          this.record("normalized", frame);
+          recordUpdate(sessionId, raw, _meta);
         }
         if (message.method && message.id !== undefined) {
           // Handle concurrently: an outstanding permission or terminal request
@@ -618,16 +653,20 @@ function probeCli(cli, args, cwd) {
 
 async function main() {
   const selected = process.argv.slice(2);
-  const scenario = smokeScenario(selected, ["plain reply", "subagent", "workflow", "fork"]);
+  const scenario = smokeScenario(selected, ["plain reply", "subagent", "workflow", "fork", ...STOP_SCENARIOS]);
   assert(selected.every(a => /^--provider=(codex|claude|muse|agy)$/.test(a) || a.startsWith("--scenario="))
-    && selected.filter(a => a.startsWith("--provider=")).length <= 1, "usage: npm run smoke:acp -- --provider=codex|claude|muse|agy [--scenario=plain-reply|subagent|workflow|fork]");
+    && selected.filter(a => a.startsWith("--provider=")).length <= 1, "usage: npm run smoke:acp -- --provider=codex|claude|muse|agy [--scenario=plain-reply|subagent|workflow|fork|stop-workflow|stop-subagent]");
   const chosenProvider = selected.find(a => a.startsWith("--provider="))?.slice(11);
-  assert(scenario !== "fork" || !chosenProvider || ["codex", "claude"].includes(chosenProvider),
-    "the fork scenario supports Claude and Codex");
-  const requested = capability => {
+  const stopScenario = STOP_SCENARIOS.includes(scenario);
+  assert(!stopScenario || ["claude", "muse"].includes(chosenProvider), "select --provider=claude or --provider=muse for card Stop");
+  assert(scenario !== "fork" || !chosenProvider || ["codex", "claude", "muse"].includes(chosenProvider),
+    "the fork scenario supports Claude, Codex and Muse Code");
+  const requested = (capability, provider) => {
+    if (stopScenario) return ["initialize", "session/new", "model", "render", "boundary audit"].includes(capability);
     if (scenario === "fork") return ["initialize", "session/new", "model", "fork", "boundary audit"].includes(capability);
     return !scenario || ["initialize", "session/new", "model", "render", "boundary audit"].includes(capability)
       || capability === (scenario === "plain reply" ? "streaming" : scenario)
+      || (scenario === "subagent" && provider === "claude" && capability === "resume")
       || (scenario === "workflow" && capability === "delivery prompt");
   };
   const rpcMs = timeoutMs(process.env.ACP_SMOKE_RPC_TIMEOUT_MS, 90_000);
@@ -681,10 +720,11 @@ async function main() {
     catch (error) { record("setup", "FAIL", errorText(error)); }
   }
   for (const [provider, Backend, locate] of [["codex", CodexBackend, locateCodexCli], ["claude", ClaudeBackend, locateClaudeCli], ["muse", MuseBackend, locateMuseCli]]) {
-    if ((chosenProvider && chosenProvider !== provider) || (scenario === "fork" && provider === "muse")) continue;
-    const steers = provider === "codex" || provider === "claude";
+    if (chosenProvider && chosenProvider !== provider) continue;
+    const muse = provider === "muse";
+    const steers = muse || provider === "codex" || provider === "claude";
     const required = [...capabilities, "model", "steering", "subagent", "workflow", "render",
-      ...(scenario === "fork" ? ["fork"] : []), ...(provider === "muse" ? ["delivery prompt"] : [])];
+      ...(scenario === "fork" || muse ? ["fork"] : []), ...(muse ? ["delivery prompt", "skills", "compact"] : [])];
     let scratch;
     let peer;
     let sessionId;
@@ -700,7 +740,7 @@ async function main() {
     if (provider === "muse") record("subagent", "N/A", "Muse delegation is a workflow; no plain subagent feature");
     if (permissionSmokeNotApplicable(provider)) record("permission", "N/A", permissionSmokeNotApplicable(provider));
     const check = async (capability, fn, ms = Math.min(2_147_483_647, turnMs * 2 + rpcMs)) => {
-      if (!requested(capability)) { record(capability, "NOT RUN", "excluded by --scenario; not release validation"); return false; }
+      if (!requested(capability, provider)) { record(capability, "NOT RUN", "excluded by --scenario; not release validation"); return false; }
       say(`${provider}: checking ${capability}`);
       try {
         assert(!interrupted, "smoke interrupted");
@@ -752,7 +792,7 @@ async function main() {
       assert.equal(manifest.version, require("../package.json").dependencies[packageName], "installed adapter differs from the pinned bump; install dependencies before interpreting this smoke");
       const adapterPath = provider === "muse" ? path.join(root, "out", "muse-adapter", "main.mjs")
         : path.resolve(path.dirname(require.resolve(`${packageName}/package.json`)), typeof manifest.bin === "string" ? manifest.bin : Object.values(manifest.bin)[0]);
-      assert.equal(fs.realpathSync(spec.args[0]), fs.realpathSync(adapterPath), "spawn spec did not select the installed real adapter");
+      assert.equal(fs.realpathSync(spec.args.at(-1)), fs.realpathSync(adapterPath), "spawn spec did not select the installed real adapter");
       if (provider === "muse") {
         assert.equal(spec.env.MUSE_CODE_EXECUTABLE, cli);
         assert.equal(spec.env.ELECTRON_RUN_AS_NODE, "1");
@@ -760,16 +800,17 @@ async function main() {
       }
       say(`${provider} adapter: ${manifest.version}; spawn=${JSON.stringify({ command: spec.command, args: spec.args, shell: spec.shell, cli, ELECTRON_RUN_AS_NODE: spec.env.ELECTRON_RUN_AS_NODE })}`);
       let connection = 0;
+      const createPeer = () => new Peer(spec, scratch, path.join(output, `${provider}-${++connection}.jsonl`), rpcMs, turnMs, TerminalManager,
+        new Backend(), new Backend(), parseRunProgressUpdate);
       const connect = () => {
-        peer = new Peer(spec, scratch, path.join(output, `${provider}-${++connection}.jsonl`), rpcMs, turnMs, TerminalManager,
-          new Backend(), new Backend(), parseRunProgressUpdate);
+        peer = createPeer();
         active = peer;
       };
-      const initialize = async () => {
-        const result = await peer.request("initialize", { protocolVersion: 1, clientCapabilities: acpClientCapabilities(provider) });
+      const initialize = async (target = peer) => {
+        const result = await target.request("initialize", { protocolVersion: 1, clientCapabilities: acpClientCapabilities(provider) });
         assert.equal(result.protocolVersion, 1, "initialize.protocolVersion must be 1");
         if (steers) assert.equal(result._meta?.steering?.supported, true, "initialize._meta.steering.supported must be true");
-        if (scenario === "fork") assert(advertisedFork(result), "initialize did not advertise sessionCapabilities.fork");
+        if (scenario === "fork" || muse) assert(advertisedFork(result), "initialize did not advertise sessionCapabilities.fork");
         return result;
       };
       connect();
@@ -783,7 +824,17 @@ async function main() {
         return `sessionId=${sessionId}`;
       });
       if (!created) throw new Error("session/new failed; no session available for remaining checks");
-      const selectedModel = await check("model", async () => {
+      if (muse) await check("skills", async () => {
+        const commands = peer.received(0, "session/update", sessionId)
+          .map(p => p.update).findLast(u => u?.sessionUpdate === "available_commands_update")?.availableCommands;
+        assert(Array.isArray(commands), "no command catalog on Muse session start");
+        const skills = commands.filter(c => c?._meta?.["muse/skill"] === true);
+        if (!skills.length) throw inconclusive("NOT_OBSERVED", "No invocable Muse skills were advertised in this workspace");
+        assert(skills.every(c => /^[a-z0-9][\w.:-]*$/i.test(c.name) && typeof c.description === "string"), "invalid skill menu row");
+        assert.equal(new Set(skills.map(c => c.name)).size, skills.length, "duplicate skill shortcuts");
+        return `${skills.length} unique invocable skill shortcut(s) advertised before the first prompt`;
+      });
+      const configureModel = async () => {
         const selection = selectSmokeModel(sessionResponse, process.env[`ACP_SMOKE_${provider.toUpperCase()}_MODEL`]);
         const call = backend.setModel(sessionId, selection.modelId);
         const response = await peer.request(call.method, call.params);
@@ -798,9 +849,11 @@ async function main() {
           await peer.request(effort.method, effort.params);
         }
         return `model=${selection.modelId}; effort=${selection.effort ?? "N/A (not advertised)"}; ${selection.basis}`;
-      });
+      };
+      const selectedModel = await check("model", configureModel);
       if (!selectedModel) throw new Error("model selection failed; refusing paid prompts with an unknown/default model");
       let completedPrompt = false;
+      let claudeChildCards;
       const updates = (turn) => {
         const events = peer.events.slice(turn.from);
         const response = events.findIndex((e) => e.direction === "receive" && e.message.id === turn.id && !e.message.method);
@@ -877,6 +930,15 @@ async function main() {
         assert(updates(recovery).some((u) => u?.sessionUpdate === "agent_message_chunk" && nonempty(u.content?.text)), "post-cancel prompt returned without an agent message");
         return "live turn cancelled; same session completed a subsequent prompt";
       });
+      if (muse) await check("compact", async () => {
+        const commands = peer.received(0, "session/update", sessionId)
+          .map(p => p.update).findLast(u => u?.sessionUpdate === "available_commands_update")?.availableCommands;
+        assert(commands?.some(c => c.name === "compact" && c._meta?.["afk/compact"] === true), "Compact was not advertised");
+        const result = await finish(peer.prompt(sessionId, "/compact"));
+        if (result._meta?.compactOutcome === "noop") throw inconclusive("NOT_OBSERVED", "Muse accepted Compact but had no compactable history");
+        assert.equal(result._meta?.compactOutcome, "compacted", "compact did not reach a successful terminal outcome");
+        return "the advertised /compact reached a successful Muse terminal outcome";
+      });
       if (provider !== "muse") await check("subagent", async () => {
         if (provider === "codex") {
           const mode = backend.setMode(sessionId, "agent");
@@ -891,11 +953,22 @@ async function main() {
             && !frames().some(f => isSubagentToolCall(f.update))) {
           return checkSubagents(frames(), sessionId, isSubagentToolCall);
         }
+        let unproven;
         await peer.waitUntil(() => {
-          try { checkSubagents(frames(), sessionId, isSubagentToolCall); return true; }
-          catch { return false; }
-        }, "normalized subagent completion and result", workflowMs);
-        return checkSubagents(frames(), sessionId, isSubagentToolCall);
+          try {
+            checkSubagents(frames(), sessionId, isSubagentToolCall);
+            if (provider === "claude") claudeChildCards = checkClaudeSubagentText(frames(), sessionId);
+            return true;
+          }
+          catch (error) {
+            if (error?.code !== "NOT_OBSERVED") return false;
+            unproven = error;
+            return true;
+          }
+        }, provider === "claude" ? "normalized Claude subagent completion and live child text" : "normalized subagent completion and result", workflowMs);
+        if (unproven) throw unproven;
+        const result = checkSubagents(frames(), sessionId, isSubagentToolCall);
+        return claudeChildCards ? `${result}; live child text received` : result;
       }, Math.min(2_147_483_647, turnMs + workflowMs + rpcMs));
 
       if (provider !== "codex") {
@@ -946,19 +1019,32 @@ async function main() {
         connect();
         await initialize();
         const from = peer.events.length;
-        await peer.request("session/load", { sessionId, cwd: scratch, mcpServers: [] });
+        await peer.load(sessionId);
         const replay = peer.received(from, "session/update", sessionId).map((p) => p.update);
         const users = replay.filter((u) => u?.sessionUpdate === "user_message_chunk" && u.content?.type === "text" && nonempty(u.content.text));
         const agents = replay.filter((u) => u?.sessionUpdate === "agent_message_chunk" && u.content?.type === "text" && nonempty(u.content.text));
         assert(users.length > 0 && agents.length > 0, `session/load returned without conversation replay (user=${users.length}, agent=${agents.length})`);
+        if (scenario === "subagent" && !claudeChildCards) throw inconclusive("MODEL_DID_NOT_DELEGATE", "live child text was not verified");
+        if (claudeChildCards) checkClaudeSubagentText(peer.normalized, sessionId, claudeChildCards);
+        if (scenario === "subagent") return "fresh adapter replayed child text on the same Claude subagent card";
         // A reopened Muse 1.4.0 conversation cannot launch workflows. Exercise
         // ordinary prompt admission here; workflow coverage uses the fresh one.
         const recovery = peer.prompt(sessionId, "Do not use tools. Reply with the single word ok.");
         await finish(recovery);
         assert(updates(recovery).some(u => u?.sessionUpdate === "agent_message_chunk" && nonempty(u.content?.text)), "reopened session returned no answer");
-        return `fresh adapter replayed ${users.length} user and ${agents.length} agent chunks for ${sessionId}`;
+        return `fresh adapter replayed ${users.length} user and ${agents.length} agent chunks for ${sessionId}${claudeChildCards ? "; same subagent cards received child text" : ""}`;
       });
-      if (scenario === "fork") await check("fork", async () => {
+      if (scenario === "fork" || muse) await check("fork", async () => {
+        if (muse && !scenario) {
+          await peer.stop();
+          connect();
+          await initialize();
+          const result = await peer.request("session/new", { cwd: scratch, mcpServers: [] });
+          assert(nonempty(result.sessionId), "fork probe returned no new source ID");
+          sessionId = result.sessionId;
+          sessionResponse = backend.normalizeSessionResponse(result);
+          await configureModel();
+        }
         const words = ["APPLE", "BANANA", "CHERRY"];
         const replyIds = frames => [...new Set(frames.filter(u =>
           u?.sessionUpdate === "agent_message_chunk" && nonempty(u.content?.text),
@@ -971,10 +1057,10 @@ async function main() {
           assert(ids.length && ids.every(nonempty), "live reply is missing its message ID");
           live.push(...ids);
         }
-        const load = async id => {
-          const from = peer.events.length;
-          await peer.request("session/load", { sessionId: id, cwd: scratch, mcpServers: [] });
-          return peer.received(from, "session/update", id).map(p => p.update);
+        const load = async (id, target = peer) => {
+          const from = target.events.length;
+          await target.request("session/load", { sessionId: id, cwd: scratch, mcpServers: [] });
+          return target.received(from, "session/update", id).map(p => p.update);
         };
         const userWords = frames => {
           const texts = frames.filter(u => u?.sessionUpdate === "user_message_chunk").map(u => u.content?.text).join("\n");
@@ -995,18 +1081,35 @@ async function main() {
         const firstTurnIds = replyIds(replay.slice(0, nextPrompt));
         const point = firstTurnIds.at(-1);
         assert(nonempty(point), "replay did not show the first turn's last reply");
-        const { method, params } = backend.fork(sessionId, scratch, point);
-        const { sessionId: forkId } = await peer.request(method, params);
-        assert(nonempty(forkId) && forkId !== sessionId, "fork did not return a new session ID");
-        const fork = await load(forkId);
+        const forkAt = async messageId => {
+          const { method, params } = backend.fork(sessionId, scratch, messageId);
+          const { sessionId: forkId } = await peer.request(method, params);
+          assert(nonempty(forkId) && forkId !== sessionId, "fork did not return a new session ID");
+          if (!muse) return load(forkId);
+          const copy = createPeer();
+          try {
+            await initialize(copy);
+            const loaded = await load(forkId, copy);
+            const listing = await backend.listSessions((method, params) => copy.request(method, params), scratch);
+            assert(listing.sessions.some(s => s.sessionId === forkId && s.cwd === scratch), "fork is missing from Muse workspace history");
+            return loaded;
+          } finally { await copy.stop(); }
+        };
+        if (muse) {
+          const whole = await forkAt(undefined);
+          assert.deepEqual(userWords(whole), words, "whole fork is missing source prompts");
+          assert.deepEqual(replyIds(whole), live, "whole fork did not preserve stable reply IDs");
+        }
+        const fork = await forkAt(point);
         assert.deepEqual(userWords(fork), [words[0]], "fork must stop before turn 2");
         assert.equal(replyIds(fork).length, firstTurnIds.length, "fork replay contains replies beyond turn 1");
+        if (muse) assert.deepEqual(replyIds(fork), firstTurnIds, "reply fork did not preserve stable reply IDs");
         await reopen();
         const original = await load(sessionId);
         assert.deepEqual(replyIds(original), live, "fork changed the original replies");
         assert.deepEqual(userWords(original), words, "fork changed the original prompts");
         return "stable live and replayed IDs; fork replay stops at turn 1; original still has all three turns";
-      }, 3 * turnMs + 8 * rpcMs);
+      }, 3 * turnMs + (muse ? 16 : 8) * rpcMs);
       await peer.stop();
       peer = undefined;
       active = undefined;

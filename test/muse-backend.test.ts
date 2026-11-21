@@ -7,6 +7,15 @@ import { locateMuseCli } from "../src/muse-cli-locator";
 import { ACP_PROVIDERS, INTERNAL_PROVIDERS, isAcpProvider, isInternalProvider, supportsAutoAccept, supportsSessionDeletion, supportsModeSwitching, usesPerCallContextOccupancy } from "../src/acp-backend";
 
 describe("Muse backend boundary", () => {
+  it("enables structured steering only when the adapter advertises it", () => {
+    const backend = new MuseBackend();
+    expect(backend.steeringCapabilities(undefined)).toEqual({ supported: false, acceptsContent: false });
+    expect(backend.steeringCapabilities({ _meta: { steering: { supported: true } } }))
+      .toEqual({ supported: true, acceptsContent: true });
+    expect(backend.steerDelivered({ outcome: "injected" })).toBe(true);
+    expect(backend.steerDelivered({ outcome: "refused" })).toBe(false);
+  });
+
   it("spawns the installed ESM entry under Node with the user's executable", () => {
     const backend = new MuseBackend();
     const spec = backend.spawn({ cliPath: "/bin/muse", cwd: "/workspace", env: { TEST: "kept" } });
@@ -65,7 +74,7 @@ describe("Muse backend boundary", () => {
 
 
 it("keeps legacy wire ids frozen while internal capabilities distinguish Muse", () => {
-  for (const provider of INTERNAL_PROVIDERS) expect(supportsApprovalModeSwitching(provider)).toBe(provider === "muse");
+  for (const provider of INTERNAL_PROVIDERS) expect(supportsApprovalModeSwitching(provider)).toBe(provider === "muse" || provider === "agy");
   expect(ACP_PROVIDERS).toEqual(["grok", "codex", "claude"]);
   expect(INTERNAL_PROVIDERS).toEqual(["grok", "codex", "claude", "muse", "agy", "deepseek"]);
   expect(isAcpProvider("muse")).toBe(false);
